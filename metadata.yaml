@@ -1,0 +1,30 @@
+name: astrbot_plugin_video_vision
+display_name: 基米看得见视频
+desc: 让 AstrBot 把视频作为原生模态直接交给 Gemini 理解，而不是抽取关键帧；支持体积自动压缩、时长截断与全链路失败降级。
+description: |
+  为 AstrBot 提供 Gemini 原生视频输入能力。
+
+  AstrBot 核心目前只把视频当作一行文本占位符（`[Video Attachment: name ..., path ...]`）
+  传给模型，模型看不到任何画面。本插件在 `on_llm_request` 阶段把视频转成内容块
+  追加进请求，使 Gemini 以 inline_data 的形式真正收到视频，从而获得完整的画面、
+  动作、字幕与时间轴理解能力。
+
+  特性：
+  - 原生视频理解（非抽帧）
+  - 兼容 QQ/NapCat 把视频当作「文件」投递的情况（`[File Attachment: ...]`）
+  - 超出体积闸门时自动用 ffmpeg 压缩
+  - 超长视频自动截断
+  - 压缩结果按内容哈希缓存，重试不重复压缩
+  - 注入后抹除占位文本里的本机路径，避免诱导模型自己去解析文件
+  - 全链路失败降级：视频处理出错绝不影响正常文字对话
+  - 与「我会永远陪着你」陪伴体系兼容
+  - 附带 /videotest 调试指令，可逐步查看处理耗时
+version: 0.1.0
+author: JosephTian876
+repo: https://github.com/JosephTian876/astrbot_plugin_video_vision
+category: AI 增强
+tags:
+  - 视频理解
+  - 多模态
+  - Gemini
+  - AI 增强

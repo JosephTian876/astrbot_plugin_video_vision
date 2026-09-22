@@ -1,0 +1,114 @@
+{
+  "enable": {
+    "description": "启用视频原生输入",
+    "type": "bool",
+    "default": true,
+    "hint": "总开关。关闭后插件完全不介入请求。"
+  },
+  "require_gemini_provider": {
+    "description": "仅在 Gemini 系 provider 上注入",
+    "type": "bool",
+    "default": true,
+    "hint": "强烈建议保持开启。本插件借道 audio_url 内容块传输视频，依赖 Gemini provider 的「按 MIME 构造媒体 Part」行为；其他 provider 会把视频当音频处理。除非你确认目标 provider 行为一致，否则不要关闭。"
+  },
+  "max_size_mb": {
+    "description": "体积闸门（MB）",
+    "type": "float",
+    "default": 13.0,
+    "hint": "超过此体积的视频会被压缩。实测经中转站上传约 7-9 秒/MB，13MB 对应约 60-90 秒，需留在 provider timeout 之内。"
+  },
+  "compress_max_mb": {
+    "description": "压缩体积上限（MB，保险丝）",
+    "type": "float",
+    "default": 8.0,
+    "hint": "压缩产物的体积上限。实际体积主要由「压缩画质」决定并随画面复杂度自适应；此值只作为上限保险丝。必须小于体积闸门。"
+  },
+  "compress_crf": {
+    "description": "压缩画质（主控体积）",
+    "type": "int",
+    "default": 30,
+    "hint": "H.264 CRF：数值越小画质越好、体积越大。18 接近无损，23 高质量，30 均衡（默认，实测可将 19.6MB/10s 压到 1.4MB），35 以上画质损失可见。这是控制压缩程度的主要旋钮。"
+  },
+  "compress_preset": {
+    "description": "压缩速度预设",
+    "type": "string",
+    "options": ["ultrafast", "veryfast", "faster", "fast", "medium", "slow"],
+    "labels": ["最快", "很快", "较快", "快", "中等", "慢（体积最小）"],
+    "default": "veryfast",
+    "hint": "越慢压缩率越高但耗时越久。压缩耗时会计入 provider 超时预算，建议保持较快档位。"
+  },
+  "max_duration_sec": {
+    "description": "最长时长（秒）",
+    "type": "float",
+    "default": 60.0,
+    "hint": "超过此长度的视频会被截断。设 0 表示不限制。"
+  },
+  "oversize_action": {
+    "description": "超限处理方式",
+    "type": "string",
+    "options": ["compress", "reject", "truncate"],
+    "labels": ["压缩到目标体积", "拒绝并提示", "截断前 N 秒"],
+    "default": "compress",
+    "hint": "压缩最稳妥；拒绝最省事；截断会丢失后段内容。"
+  },
+  "max_video_count": {
+    "description": "单条消息最多处理视频数",
+    "type": "int",
+    "default": 2,
+    "hint": "防止一条消息带多个大视频导致总耗时爆炸。"
+  },
+  "handle_quoted_video": {
+    "description": "处理引用消息中的视频",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，回复一条含视频的消息也会让模型看到该视频。"
+  },
+  "treat_file_as_video": {
+    "description": "把视频文件附件也当作视频处理",
+    "type": "bool",
+    "default": true,
+    "hint": "实测重要：QQ/NapCat 会把用户发的视频当作「文件」而不是「视频」投递，此时核心产出的是 [File Attachment: ...] 占位符而非 [Video Attachment: ...]。关闭此项后，这类视频将不会被本插件处理。仅当扩展名属于常见视频格式时才生效，普通文件不受影响。"
+  },
+  "hide_local_path": {
+    "description": "注入后抹除占位文本中的本机路径",
+    "type": "bool",
+    "default": true,
+    "hint": "实测重要：核心的占位文本形如 [File Attachment: name X, path C:\\...\\X.mp4]，会把本机绝对路径直接喂给模型。模型看到路径后会自己跑 astrbot_execute_python + cv2 抽帧、grep 知识库、web search —— 而它本来已经拿到视频了。开启此项后，成功注入的视频占位文本会被改写成 [Video: X.mp4]（不含路径）。注入失败的仍保留原样。"
+  },
+  "notify_on_failure": {
+    "description": "视频处理失败时告知模型",
+    "type": "bool",
+    "default": true,
+    "hint": "视频被跳过（超限、缺 ffmpeg、文件损坏等）时，追加一句简短说明，避免模型以为用户没发视频而答非所问。详细原因只写进日志，不会泄露本机路径。"
+  },
+  "max_compress_seconds": {
+    "description": "压缩耗时上限（秒）",
+    "type": "float",
+    "default": 45.0,
+    "hint": "压缩超过此耗时则放弃压缩并降级为拒绝，避免把 provider 超时预算全部吃掉。"
+  },
+  "ffmpeg_path": {
+    "description": "ffmpeg 路径",
+    "type": "string",
+    "default": "",
+    "hint": "留空则自动从 PATH 查找 ffmpeg 与 ffprobe。也可填所在目录。"
+  },
+  "cache_enabled": {
+    "description": "启用压缩缓存",
+    "type": "bool",
+    "default": true,
+    "hint": "按源文件内容哈希缓存压缩结果，重试或重复发送同一视频时不重复压缩。"
+  },
+  "cache_max_mb": {
+    "description": "缓存上限（MB）",
+    "type": "int",
+    "default": 512,
+    "hint": "超出后按最久未使用淘汰。"
+  },
+  "debug_log": {
+    "description": "详细调试日志",
+    "type": "bool",
+    "default": false,
+    "hint": "输出每个视频的探测、压缩、注入耗时与体积，排障时开启。"
+  }
+}

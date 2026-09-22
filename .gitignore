@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 插件运行时产物
+video_vision_cache/
+*.log
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+
+# 本地私有配置（不应提交）
+config.local.yaml
+.env

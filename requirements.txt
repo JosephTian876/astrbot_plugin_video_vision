@@ -1,0 +1,7 @@
+# astrbot_plugin_video_vision
+#
+# 本插件不引入任何第三方 Python 依赖。
+# ffmpeg / ffprobe 为外部可执行程序，需在系统 PATH 中或于插件配置里指定路径。
+#
+# 说明：AstrBot 本体已依赖 astrbot / google-genai / httpx 等，插件直接复用，
+# 无需在此重复声明，以免版本冲突。
