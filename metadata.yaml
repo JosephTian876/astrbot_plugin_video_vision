@@ -19,7 +19,7 @@ description: |
   - 全链路失败降级：视频处理出错绝不影响正常文字对话
   - 与「我会永远陪着你」陪伴体系兼容
   - 附带 /videotest 调试指令，可逐步查看处理耗时
-version: 0.1.0
+version: 0.1.1
 author: JosephTian876
 repo: https://github.com/JosephTian876/astrbot_plugin_video_vision
 short_desc: 让 Gemini 直接看懂视频，而非抽帧

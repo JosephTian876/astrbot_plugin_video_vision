@@ -1,5 +1,20 @@
 # 更新日志
 
+## 0.1.1
+
+按插件市场自动安全检查（LLM Guard）意见修复日志规范。**无功能变更。**
+
+- `hooks/llm_request.py`：`from astrbot import logger` → `from astrbot.api import logger`
+- `core/injector.py`：移除 `import logging` 与 `logging.getLogger(__name__)`，
+  改为 `from astrbot.api import logger as _log`
+- `main.py`：移除 `except ImportError` 回退到内置 `logging` 的分支，直接使用
+  `astrbot.api` 的 logger
+
+规范要求日志记录器**必须且只能**从 `astrbot.api` 导入，严禁使用 Python 内置
+`logging` 模块。现已全插件无任何内置 logging 引用，并新增测试断言防止回归。
+
+安全检查结论为 `malicious=0, suspicious=0` —— 功能实现本身干净，仅日志规范问题。
+
 ## 0.1.0
 
 首个版本。
@@ -14,21 +29,6 @@
 - 压缩结果按源文件内容哈希缓存；超长视频自动截断
 - 全链路失败降级：视频处理出错**绝不影响**正常文字对话
 - 附带 `/videotest` 诊断指令，逐步输出体积、时长、压缩动作与预计上传耗时
-
-### 审核修复（0.1.0 送审后按 LLM Guard 意见修改）
-
-插件市场自动安全检查未通过，原因是日志记录器来源不符合规范。已全部修正：
-
-- `hooks/llm_request.py`：`from astrbot import logger` → `from astrbot.api import logger`
-- `core/injector.py`：移除 `import logging` 与 `logging.getLogger(__name__)`，
-  改为 `from astrbot.api import logger as _log`
-- `main.py`：移除 `except ImportError` 回退到内置 `logging` 的分支，直接使用
-  `astrbot.api` 的 logger
-
-规范要求日志记录器**必须且只能**从 `astrbot.api` 导入，严禁使用 Python 内置
-`logging` 模块。现已全插件无任何内置 logging 引用。
-
-安全检查结论为 `malicious=0, suspicious=0` —— 功能实现本身干净，仅日志规范问题。
 
 ### 兼容性
 
