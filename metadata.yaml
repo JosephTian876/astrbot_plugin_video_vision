@@ -22,6 +22,11 @@ description: |
 version: 0.1.0
 author: JosephTian876
 repo: https://github.com/JosephTian876/astrbot_plugin_video_vision
+short_desc: 让 Gemini 直接看懂视频，而非抽帧
+astrbot_version: ">=4.26,<5"
+support_platforms:
+  - aiocqhttp
+social_link: https://github.com/JosephTian876
 category: AI 增强
 tags:
   - 视频理解
