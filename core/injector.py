@@ -18,13 +18,14 @@
 
 from __future__ import annotations
 
-import logging
 import os
 import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from astrbot.api import logger as _log
 
 from .config import VideoConfig
 from .media import (
@@ -39,8 +40,6 @@ from .media import (
     resolve_ffmpeg_tools,
 )
 from .placeholder import VideoPlaceholder
-
-_log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)

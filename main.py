@@ -15,15 +15,9 @@ from __future__ import annotations
 import os
 import time
 
+from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
-
-try:
-    from astrbot.api import logger
-except ImportError:  # pragma: no cover - 极端兼容
-    import logging
-
-    logger = logging.getLogger(__name__)
 
 try:
     from astrbot.api.message_components import File, Video

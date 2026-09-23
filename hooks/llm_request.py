@@ -35,7 +35,7 @@ import asyncio
 import os
 from typing import Any
 
-from astrbot import logger
+from astrbot.api import logger
 
 from ..core.config import VideoConfig
 from ..core.injector import prepare_video
