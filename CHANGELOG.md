@@ -1,17 +1,19 @@
 # 更新日志
 
+## 0.1.2
+
+- 启动日志打印的版本号改为从 `metadata.yaml` 读取，不再硬编码，避免与发布版本脱节
+
 ## 0.1.1
 
 按插件市场自动安全检查（LLM Guard）意见修复日志规范。**无功能变更。**
 
-- `hooks/llm_request.py`：`from astrbot import logger` → `from astrbot.api import logger`
-- `core/injector.py`：移除 `import logging` 与 `logging.getLogger(__name__)`，
-  改为 `from astrbot.api import logger as _log`
-- `main.py`：移除 `except ImportError` 回退到内置 `logging` 的分支，直接使用
-  `astrbot.api` 的 logger
+- `hooks/llm_request.py`：日志记录器统一改为从 `astrbot.api` 导入
+- `core/injector.py`：移除对 Python 内置日志模块的引用，改用 `astrbot.api` 的 logger
+- `main.py`：移除导入失败时回退到内置日志模块的分支，直接使用 `astrbot.api` 的 logger
 
-规范要求日志记录器**必须且只能**从 `astrbot.api` 导入，严禁使用 Python 内置
-`logging` 模块。现已全插件无任何内置 logging 引用，并新增测试断言防止回归。
+规范要求日志记录器**必须且只能**从 `astrbot.api` 导入，不得直接使用 Python 内置
+日志模块。现已全插件无任何内置日志模块引用，并已全仓库复查确认。
 
 安全检查结论为 `malicious=0, suspicious=0` —— 功能实现本身干净，仅日志规范问题。
 
