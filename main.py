@@ -37,8 +37,24 @@ from .core.placeholder import VIDEO_SUFFIXES, VideoPlaceholder
 from .hooks.llm_request import handle_llm_request
 
 PLUGIN_NAME = "astrbot_plugin_video_vision"
-PLUGIN_VERSION = "0.1.0"
 PLUGIN_REPO = "https://github.com/JosephTian876/astrbot_plugin_video_vision"
+
+
+def _read_plugin_version() -> str:
+    """从 metadata.yaml 读取版本号，避免与发布版本脱节。"""
+    try:
+        from pathlib import Path
+
+        text = (Path(__file__).parent / "metadata.yaml").read_text(encoding="utf-8")
+        for line in text.splitlines():
+            if line.startswith("version:"):
+                return line.split(":", 1)[1].strip().strip("\"'")
+    except Exception:  # noqa: BLE001 - 读不到就用占位值，不影响功能
+        pass
+    return "unknown"
+
+
+PLUGIN_VERSION = _read_plugin_version()
 
 #: 比其他插件都晚执行（数值越小越晚），确保陪伴插件改写完请求后我们再追加。
 HOOK_PRIORITY = -300000
