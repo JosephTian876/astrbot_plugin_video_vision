@@ -5,3 +5,4 @@
 #
 # 说明：AstrBot 本体已依赖 astrbot / google-genai / httpx 等，插件直接复用，
 # 无需在此重复声明，以免版本冲突。
+# openai_compat 模式的 HTTP 客户端使用 AstrBot 自带的 httpx（google-genai 的依赖）。

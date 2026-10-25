@@ -1,17 +1,23 @@
 # 基米看得见视频 · astrbot_plugin_video_vision
 
-让 AstrBot 把视频作为**原生模态**直接交给 Gemini 理解，而不是抽取关键帧。
+让模型真正**看见视频**，而不是抽取关键帧。支持两种模式：
+
+- **openai_compat（默认）**：插件把视频发给你配置的 **OpenAI 兼容视觉服务**做理解，结果以文字注入对话 —— 主对话模型**可以是任意模型**
+- **gemini_native**：把视频作为**原生模态**内容块注入当前请求，由 Gemini 主 provider 亲眼看（旧路径，完全保留）
 
 > AstrBot 核心目前只把视频写成一行文本占位符
 > （`[Video Attachment: name X, path Y]`）交给模型，**模型看不到任何画面**。
-> 本插件在 `on_llm_request` 阶段把视频转成内容块注入请求，
-> 使模型获得完整的画面、动作、字幕与时间轴理解能力。
+> 本插件在 `on_llm_request` 阶段接管视频附件：要么转成内容块注入请求让
+> Gemini 亲眼看（gemini_native），要么先发给自定义的 OpenAI 兼容视觉服务
+> 做理解、再把结果以文字随请求带给主模型（openai_compat）。
 
 ---
 
 ## 特性
 
-- **原生视频理解**，非抽帧 —— 模型真的"看"视频
+- **双模式**：`openai_compat` 自定义 OpenAI 兼容视觉服务商（base_url/key/model 全可配），`gemini_native` 原生注入 Gemini，随时切换
+- **原生视频理解**，非抽帧 —— 模型真的"看"视频，画面、动作、字幕、时间轴都在
+- **带问题理解**：用户发视频时附带的文字会一起发给视觉模型，得到针对性回答
 - **自动压缩**：超过体积闸门时用 ffmpeg 压缩，画质随画面复杂度自适应
 - **体积上限保险丝**：即使画质档位拉满也不会压出超预算的文件
 - **压缩缓存**：按源文件内容哈希缓存，重试/重复发送不重复压缩
@@ -22,12 +28,40 @@
 
 ---
 
+## 两种模式怎么选
+
+| | openai_compat（默认） | gemini_native |
+|---|---|---|
+| 主对话 provider 要求 | 任意 | 必须是 Gemini 系 |
+| 视频谁来看 | 配置里的视觉模型 | 主对话模型本人 |
+| 主模型拿到 | 视觉模型的文字理解 | 原生视频画面 |
+| 额外配置 | base_url / key / model | 无（要求 audio 模态） |
+
+openai_compat 的主模型上下文是「文字转述」，适合主聊天模型看不了视频的场景；
+gemini_native 的理解上限更高（画面细节、时间轴追问），但要求 provider 支持。
+
+### OpenAI 兼容接口的视频格式坑（实测 2026-09-29，Gemini 系中转站）
+
+视频在 OpenAI 兼容 chat/completions 上**只有这一种形态有效**：
+
+```json
+{"type": "image_url", "image_url": {"url": "data:video/mp4;base64,..."}}
+```
+
+名字叫 image_url，但 MIME 由 data URI 头部决定，端点会按视频处理（实测 prompt token 262 → 416，模型能正确描述画面）。而`video_url` / `file` /
+`input_video` 三种「看起来更标准」的形态全部 **HTTP 200 但视频被静默丢弃**（prompt token 不变、模型报 NO_VIDEO）。本插件按实测结论实现。
+
+Responses API（`/responses`）同样实测支持：视频用 `input_image` + data URI 有效（`input_file` 会被静默丢弃），插件按地址结尾自动构造对应协议的请求。
+
+---
+
 ## 安装
 
 1. 把本插件目录放进 AstrBot 的 `data/plugins/`
 2. 重启 AstrBot 或在 WebUI 插件页重载
-3. 在 WebUI 插件配置里按需调整参数
-4. 确认目标模型**勾选了「音频」模态**（见下方"为什么需要 audio 模态"）
+3. 在 WebUI 插件配置里选择模式并调整参数：
+   - **openai_compat（默认）**：填 `openai_base_url` / `openai_api_key` / `openai_model`（模型须支持视频，如 gemini-3.x-flash 系）。主对话 provider 任意。
+   - **gemini_native**：主对话 provider 必须是 Gemini 系，且目标模型**勾选了「音频」模态**（见下方"为什么需要 audio 模态"）
 
 ### 依赖
 
@@ -42,8 +76,18 @@
 | 键 | 默认 | 说明 |
 |---|---|---|
 | `enable` | `true` | 总开关 |
-| `require_gemini_provider` | `true` | 仅在 Gemini 系 provider 上注入。**建议保持开启** |
-| `additional_provider_types` | `[]` | 在默认 Gemini 系白名单外额外放行的 provider type（如走 OpenAI 协议的 Gemini 代理）。填错可能被上游 422 拒收 |
+| `provider_mode` | `openai_compat` | `openai_compat`（默认）/ `gemini_native`。视觉服务三项没配齐时**自动降级为 `gemini_native`**，因此老配置直接升级不会失效 |
+| `openai_base_url` | `""` | 视觉服务**完整接口地址**，写全到 `/chat/completions` 或 `/responses`（按结尾自动选协议）；只填到 `/v1` 兜底前者 |
+| `openai_api_key` | `""` | 视觉服务密钥 |
+| `openai_model` | `gemini-3.8-flash-high` | 视觉模型，须支持视频 |
+| `openai_timeout_sec` | `180` | 视觉服务超时（上传约 7-9s/MB）。既是单阶段超时，也是单个视频的整体硬上限 |
+| `openai_max_tokens` | `2048` | 视觉回答 token 上限 |
+| `vision_with_question` | `true` | 把用户随视频附带的文字一起发给视觉模型 |
+| `vision_describe_prompt` | 见 schema | 无附带文字时的通用描述提示词 |
+| `vision_qa_prompt` | 见 schema | 带问题提示词模板，`{question}` 会被替换 |
+| `vision_verify_ssl` | `true` | 校验视觉服务证书；中转站证书有问题时可关（自担风险） |
+| `require_gemini_provider` | `true` | **仅 gemini_native 模式生效**，建议保持开启 |
+| `additional_provider_types` | `[]` | **仅 gemini_native 模式生效**：在默认 Gemini 系白名单外额外放行的 provider type（如走 OpenAI 协议的 Gemini 代理）。填错可能被上游 422 拒收 |
 | `max_size_mb` | `13.0` | 体积闸门，超过则按 `oversize_action` 处理 |
 | `compress_max_mb` | `8.0` | 压缩产物体积**上限**（保险丝），必须小于闸门 |
 | `compress_crf` | `30` | **主控压缩程度**：越小画质越好、体积越大 |
@@ -177,6 +221,8 @@ return types.Part.from_bytes(data=..., mime_type=mime_type)
 
 或回复一条含视频的消息，直接发送 `/videotest`。
 
+openai_compat 模式下会**真实调用一次视觉服务**并回显回复节选，可端到端验证 base_url / key / 模型 / 网络 / 证书是否可用。
+
 输出示例：
 
 ```
@@ -232,16 +278,15 @@ QQ 收到视频消息
 本插件 on_llm_request 钩子
    ├─ 扫描 extra_user_content_parts 里的视频占位符
    ├─ 探测体积/时长 → 超限则 ffmpeg 压缩（带缓存）
-   ├─ 读文件 → base64 → data:video/mp4 URI
-   └─ 追加 AudioURLPart(url=<data uri>).mark_as_temp()
-   ↓
-ProviderRequest.assemble_context()      ← 真实主链路
-   ↓
-provider.text_chat(contexts=[...], prompt=None)
-   ↓
-_prepare_conversation → process_audio_url → Part.from_bytes(mime="video/mp4")
-   ↓
-Gemini 原生视频理解
+   └─ 读文件 → base64 → data:video/mp4 URI
+   ↓ 分支 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+   ┃ gemini_native                  ┃ openai_compat
+   ┃ 追加 AudioURLPart.mark_as_temp() ┃ POST {base_url}/chat/completions
+   ┃ ↓                               ┃   image_url=data:video/*;base64,...
+   ┃ provider → process_audio_url     ┃ ↓ 视觉模型返回文字理解
+   ┃ → Part.from_bytes(video/mp4)     ┃ 追加 TextPart(分析结果).mark_as_temp()
+   ┃ ↓                               ┃ ↓
+   ┗━━━► 主对话请求带上视频/理解结果，模型作答
 ```
 
 ### 为什么不用 provider 适配器
@@ -267,6 +312,7 @@ astrbot_plugin_video_vision/
 │   ├── config.py           配置模型与容错
 │   ├── media.py            ffmpeg/ffprobe 封装、压缩、缓存
 │   ├── injector.py         体积闸门决策与压缩编排
+│   ├── openai_vision.py    OpenAI 兼容视觉服务客户端（实测格式见模块说明）
 │   └── placeholder.py      占位文本解析
 └── hooks/
     └── llm_request.py      on_llm_request 注入逻辑
@@ -278,12 +324,16 @@ astrbot_plugin_video_vision/
 
 ## 已知限制
 
-- 视频以 **inline base64** 传输，因此体积受 provider 超时预算约束；
+- 视频以 **inline base64** 传输，体积受超时预算约束（约 7-9s/MB 上行）；
   中转站若提供 File API 可显著放宽（当前实测的中转站没有）。
-- 默认仅支持 **Gemini 系** provider（依赖其按 MIME 构造媒体 Part 的行为）；
-  走 OpenAI 协议的 Gemini 代理需在 `additional_provider_types` 中显式放行。
-- 模型必须声明 **audio** 模态（见上文）。
-- 不支持多视频并行压缩；单条消息的视频串行处理。
+- openai_compat 模式：视觉模型必须是**真能看视频**的模型（如 gemini-3.x-flash 系）；
+  主模型拿到的是视觉模型的文字理解而非原片。
+- gemini_native 模式：仅支持 **Gemini 系** provider（依赖其按 MIME 构造媒体 Part 的行为），
+  且模型必须声明 **audio** 模态；走 OpenAI 协议的 Gemini 代理需在
+  `additional_provider_types` 中显式放行。
+- 不支持多视频并行压缩；单条消息的视频串行处理（openai_compat 的视觉调用是并发的）。
+- 注入给模型的内容（原生视频块 / 视觉分析文字）都标记为**非持久化**，不会写进对话历史；
+  因此隔一轮再追问视频细节时，模型手上已经没有上一轮的素材。
 
 ## 许可
 

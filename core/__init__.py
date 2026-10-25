@@ -18,6 +18,12 @@ from .media import (
     read_as_data_uri,
     resolve_ffmpeg_tools,
 )
+from .openai_vision import (
+    VisionResult,
+    analyze_video,
+    analyze_videos,
+    build_vision_prompt,
+)
 from .placeholder import (
     VIDEO_SUFFIXES,
     VideoPlaceholder,
@@ -34,6 +40,10 @@ __all__ = [
     "VideoInfo",
     "VideoInjection",
     "VideoPlaceholder",
+    "VisionResult",
+    "analyze_video",
+    "analyze_videos",
+    "build_vision_prompt",
     "compress_video",
     "file_size_mb",
     "guess_video_mime",

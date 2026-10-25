@@ -5,12 +5,14 @@
 
 from .llm_request import (
     GEMINI_PROVIDER_TYPES,
+    PreparedVideo,
     build_video_blocks,
     handle_llm_request,
 )
 
 __all__ = [
     "GEMINI_PROVIDER_TYPES",
+    "PreparedVideo",
     "build_video_blocks",
     "handle_llm_request",
 ]

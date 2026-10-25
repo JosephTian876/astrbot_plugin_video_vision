@@ -5,24 +5,92 @@
     "default": true,
     "hint": "总开关。关闭后插件完全不介入请求。"
   },
+  "provider_mode": {
+    "description": "视频理解模式",
+    "type": "string",
+    "options": [
+      "openai_compat",
+      "gemini_native"
+    ],
+    "labels": [
+      "OpenAI 兼容视觉服务（推荐）",
+      "Gemini 原生注入（旧路径）"
+    ],
+    "default": "openai_compat",
+    "hint": "openai_compat：插件自己调用下方配置的 OpenAI 兼容接口做视频理解，结果以文字注入对话，主对话模型任意。gemini_native：把视频原生注入当前请求，要求主对话 provider 是 Gemini 系。注意：选 openai_compat 但下面 base_url / api_key / model 没配齐时，运行时会自动降级为 gemini_native（只告警一次），因此老配置直接升级不会失效。"
+  },
+  "openai_base_url": {
+    "description": "视觉服务接口地址（写全路径）",
+    "type": "string",
+    "default": "",
+    "hint": "填到完整端点：以 /chat/completions 结尾走 Chat Completions 协议，以 /responses 结尾走 Responses 协议（插件自动按结尾选择）。只填到 /v1 时兜底按 /chat/completions 处理。两种协议下视频都以 image_url/input_image + data:video/*;base64 发送（实测唯一有效形态）。"
+  },
+  "openai_api_key": {
+    "description": "视觉服务 API Key",
+    "type": "string",
+    "default": "",
+    "hint": "视觉服务的密钥。仅 openai_compat 模式使用。"
+  },
+  "openai_model": {
+    "description": "视觉模型",
+    "type": "string",
+    "default": "gemini-3.8-flash-high",
+    "hint": "必须能看懂视频（Gemini 系等）。视频以 image_url + data:video/*;base64 形态发送（实测 Gemini 系中转站唯一有效格式）。"
+  },
+  "openai_timeout_sec": {
+    "description": "视觉服务超时（秒）",
+    "type": "float",
+    "default": 180.0,
+    "hint": "实测中转站上传约 7-9 秒/MB；闸门 13MB 约需 60-120 秒。超时调太低会导致大视频失败。该值同时是单个视频的**整体**硬上限（不只是分阶段超时），慢速滴灌的端点也会被切断。"
+  },
+  "openai_max_tokens": {
+    "description": "视觉回答 token 上限",
+    "type": "int",
+    "default": 2048,
+    "hint": "视觉模型输出的最大 token 数。描述类任务 1024-4096 比较合适。"
+  },
+  "vision_with_question": {
+    "description": "把用户问题一起发给视觉模型",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后：用户发视频时附带的文字（如「这视频讲了什么」）会一起发给视觉模型，得到针对性回答；关闭则固定输出通用详细描述。"
+  },
+  "vision_describe_prompt": {
+    "description": "通用描述提示词",
+    "type": "string",
+    "default": "请详细描述这段视频：场景、人物/物体、动作、画面中的文字、字幕与关键时间点。你的描述会被转交给另一个看不到视频的模型，请客观具体、保留关键细节。",
+    "hint": "用户没有附带文字问题时使用的提示词。"
+  },
+  "vision_qa_prompt": {
+    "description": "带问题提示词模板",
+    "type": "string",
+    "default": "用户发来一段视频，并问：「{question}」\n请认真观看视频后直接、具体地回答用户的问题。如果问题与视频内容无关，请简要说一句，再描述视频的主要内容。",
+    "hint": "用户附带文字问题时使用的模板，{question} 会被替换为用户原话。"
+  },
+  "vision_verify_ssl": {
+    "description": "校验视觉服务 SSL 证书",
+    "type": "bool",
+    "default": true,
+    "hint": "保持开启更安全。某些中转站证书过期或链不完整会导致 Python 报错 certificate verify failed（即使浏览器/PowerShell 正常）——确认你信任该端点后可关闭本项绕过。"
+  },
   "require_gemini_provider": {
     "description": "仅在 Gemini 系 provider 上注入",
     "type": "bool",
     "default": true,
-    "hint": "强烈建议保持开启。本插件借道 audio_url 内容块传输视频，依赖 Gemini provider 的「按 MIME 构造媒体 Part」行为；其他 provider 会把视频当音频处理。除非你确认目标 provider 行为一致，否则不要关闭。"
+    "hint": "仅 gemini_native 模式生效。强烈建议保持开启。本模式借道 audio_url 内容块传输视频，依赖 Gemini provider 的「按 MIME 构造媒体 Part」行为；其他 provider 会把视频当音频处理。openai_compat 模式不关心主对话 provider。"
   },
   "additional_provider_types": {
     "description": "额外允许注入视频的 provider type",
     "type": "list",
     "items": { "type": "string" },
     "default": [],
-    "hint": "在默认 Gemini 系白名单之外，额外放行哪些 provider type。例如把走 OpenAI 协议的 Gemini 代理（openai_chat_completion）填进来；填错可导致上游 422（OpenAI 端点会把视频块序列化成 input_audio 并拒收）。留空时行为与旧版完全一致，仅在 require_gemini_provider 开启时作为补充白名单。"
+    "hint": "仅 gemini_native 模式生效。在默认 Gemini 系白名单之外，额外放行哪些 provider type。例如把走 OpenAI 协议的 Gemini 代理（openai_chat_completion）填进来；填错可导致上游 422（OpenAI 端点会把视频块序列化成 input_audio 并拒收）。留空时行为与旧版完全一致，仅在 require_gemini_provider 开启时作为补充白名单。"
   },
   "max_size_mb": {
     "description": "体积闸门（MB）",
     "type": "float",
     "default": 13.0,
-    "hint": "超过此体积的视频会被压缩。实测经中转站上传约 7-9 秒/MB，13MB 对应约 60-90 秒，需留在 provider timeout 之内。"
+    "hint": "超过此体积的视频会被压缩。base64 后约为 1.33 倍：13MB 视频会产生约 17MB 的请求体。实测经中转站上传约 7-9 秒/MB，需留在超时预算之内。"
   },
   "compress_max_mb": {
     "description": "压缩体积上限（MB，保险丝）",
@@ -39,10 +107,24 @@
   "compress_preset": {
     "description": "压缩速度预设",
     "type": "string",
-    "options": ["ultrafast", "veryfast", "faster", "fast", "medium", "slow"],
-    "labels": ["最快", "很快", "较快", "快", "中等", "慢（体积最小）"],
+    "options": [
+      "ultrafast",
+      "veryfast",
+      "faster",
+      "fast",
+      "medium",
+      "slow"
+    ],
+    "labels": [
+      "最快",
+      "很快",
+      "较快",
+      "快",
+      "中等",
+      "慢（体积最小）"
+    ],
     "default": "veryfast",
-    "hint": "越慢压缩率越高但耗时越久。压缩耗时会计入 provider 超时预算，建议保持较快档位。"
+    "hint": "越慢压缩率越高但耗时越久。压缩耗时会计入超时预算，建议保持较快档位。"
   },
   "max_duration_sec": {
     "description": "最长时长（秒）",
@@ -53,8 +135,16 @@
   "oversize_action": {
     "description": "超限处理方式",
     "type": "string",
-    "options": ["compress", "reject", "truncate"],
-    "labels": ["压缩到目标体积", "拒绝并提示", "截断前 N 秒"],
+    "options": [
+      "compress",
+      "reject",
+      "truncate"
+    ],
+    "labels": [
+      "压缩到目标体积",
+      "拒绝并提示",
+      "截断前 N 秒"
+    ],
     "default": "compress",
     "hint": "压缩最稳妥；拒绝最省事；截断会丢失后段内容。"
   },
@@ -62,7 +152,7 @@
     "description": "单条消息最多处理视频数",
     "type": "int",
     "default": 2,
-    "hint": "防止一条消息带多个大视频导致总耗时爆炸。"
+    "hint": "防止一条消息带多个大视频导致总耗时爆炸。openai_compat 模式下每个视频各发一次视觉请求。"
   },
   "handle_quoted_video": {
     "description": "处理引用消息中的视频",
@@ -80,19 +170,19 @@
     "description": "注入后抹除占位文本中的本机路径",
     "type": "bool",
     "default": true,
-    "hint": "实测重要：核心的占位文本形如 [File Attachment: name X, path C:\\...\\X.mp4]，会把本机绝对路径直接喂给模型。模型看到路径后会自己跑 astrbot_execute_python + cv2 抽帧、grep 知识库、web search —— 而它本来已经拿到视频了。开启此项后，成功注入的视频占位文本会被改写成 [Video: X.mp4]（不含路径）。注入失败的仍保留原样。"
+    "hint": "实测重要：核心的占位文本形如 [File Attachment: name X, path C:\\...\\X.mp4]，会把本机绝对路径直接喂给模型。模型看到路径后会自己跑 astrbot_execute_python + cv2 抽帧、grep 知识库、web search —— 而它本来已经拿到内容了。开启此项后，成功处理的视频占位文本会被改写为不含路径的说明。处理失败的仍保留原样。"
   },
   "notify_on_failure": {
     "description": "视频处理失败时告知模型",
     "type": "bool",
     "default": true,
-    "hint": "视频被跳过（超限、缺 ffmpeg、文件损坏等）时，追加一句简短说明，避免模型以为用户没发视频而答非所问。详细原因只写进日志，不会泄露本机路径。"
+    "hint": "视频被跳过（超限、缺 ffmpeg、文件损坏、视觉服务报错等）时，追加一句简短说明，避免模型以为用户没发视频而答非所问。详细原因只写进日志，不会泄露本机路径。"
   },
   "max_compress_seconds": {
     "description": "压缩耗时上限（秒）",
     "type": "float",
     "default": 45.0,
-    "hint": "压缩超过此耗时则放弃压缩并降级为拒绝，避免把 provider 超时预算全部吃掉。"
+    "hint": "压缩超过此耗时则放弃压缩并降级为拒绝，避免把超时预算全部吃掉。"
   },
   "ffmpeg_path": {
     "description": "ffmpeg 路径",

@@ -16,6 +16,26 @@ DEFAULT_MAX_SIZE_MB = 13.0
 VALID_OVERSIZE_ACTIONS = ("compress", "reject", "truncate")
 VALID_PRESETS = ("ultrafast", "veryfast", "faster", "fast", "medium", "slow")
 
+#: 视频走哪条路送给模型：
+#: - ``gemini_native``：注入 AstrBot 当前的 Gemini 系 provider（借道 audio_url，
+#:   由 provider 侧 process_audio_url 按 MIME 构造媒体 Part）；
+#: - ``openai_compat``：由插件直接调用配置里的 OpenAI 兼容接口做视觉理解，
+#:   再把理解结果以文字注入对话。主对话 provider 可以是任意模型。
+VALID_PROVIDER_MODES = ("openai_compat", "gemini_native")
+
+#: 用户没附带文字问题时，视觉服务用的通用描述提示词。
+DEFAULT_DESCRIBE_PROMPT = (
+    "请详细描述这段视频：场景、人物/物体、动作、画面中的文字、字幕与关键时间点。"
+    "你的描述会被转交给另一个看不到视频的模型，请客观具体、保留关键细节。"
+)
+
+#: 用户附带了文字问题时用的提示词模板，``{question}`` 会被替换为用户原话。
+DEFAULT_QA_PROMPT = (
+    "用户发来一段视频，并问：「{question}」\n"
+    "请认真观看视频后直接、具体地回答用户的问题。"
+    "如果问题与视频内容无关，请简要说一句，再描述视频的主要内容。"
+)
+
 
 def _as_bool(value: Any, default: bool) -> bool:
     if isinstance(value, bool):
@@ -94,6 +114,38 @@ class VideoConfig:
     cache_max_mb: int = 512
     debug_log: bool = False
 
+    # -------- 视觉服务商（provider_mode=openai_compat 时生效）--------
+    provider_mode: str = "openai_compat"
+    openai_base_url: str = ""
+    openai_api_key: str = ""
+    openai_model: str = "gemini-3.8-flash-high"
+    openai_timeout_sec: float = 180.0
+    openai_max_tokens: int = 2048
+    vision_with_question: bool = True
+    vision_describe_prompt: str = DEFAULT_DESCRIBE_PROMPT
+    vision_qa_prompt: str = DEFAULT_QA_PROMPT
+    vision_verify_ssl: bool = True
+
+    @property
+    def openai_service_ready(self) -> bool:
+        """OpenAI 兼容视觉服务三要素是否齐全。"""
+        return bool(
+            self.openai_base_url and self.openai_api_key and self.openai_model
+        )
+
+    @property
+    def effective_provider_mode(self) -> str:
+        """实际生效的模式。
+
+        ``provider_mode=openai_compat`` 但三要素没配齐时降级为 ``gemini_native``。
+        原因见 ``hooks/llm_request._effective_mode``：老配置文件里没有
+        ``provider_mode`` 键，落到默认值后如果直接跳过注入，升级即等于视频功能
+        静默失效。钩子、启动日志、``/videotest`` 都读这个属性，保证三处一致。
+        """
+        if self.provider_mode == "openai_compat" and not self.openai_service_ready:
+            return "gemini_native"
+        return self.provider_mode
+
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> VideoConfig:
         """从 WebUI 配置字典构造，容错处理缺失/非法值。"""
@@ -134,6 +186,32 @@ class VideoConfig:
             cache_enabled=_as_bool(data.get("cache_enabled"), True),
             cache_max_mb=_as_int(data.get("cache_max_mb"), 512, minimum=16),
             debug_log=_as_bool(data.get("debug_log"), False),
+            provider_mode=_as_choice(
+                data.get("provider_mode"), "openai_compat", VALID_PROVIDER_MODES
+            ),
+            openai_base_url=str(data.get("openai_base_url") or "")
+            .strip()
+            .rstrip("/"),
+            openai_api_key=str(data.get("openai_api_key") or "").strip(),
+            openai_model=str(
+                data.get("openai_model") or "gemini-3.8-flash-high"
+            ).strip(),
+            openai_timeout_sec=_as_float(
+                data.get("openai_timeout_sec"), 180.0, minimum=10.0
+            ),
+            openai_max_tokens=_as_int(
+                data.get("openai_max_tokens"), 2048, minimum=64
+            ),
+            vision_with_question=_as_bool(
+                data.get("vision_with_question"), True
+            ),
+            vision_describe_prompt=str(
+                data.get("vision_describe_prompt") or DEFAULT_DESCRIBE_PROMPT
+            ),
+            vision_qa_prompt=str(
+                data.get("vision_qa_prompt") or DEFAULT_QA_PROMPT
+            ),
+            vision_verify_ssl=_as_bool(data.get("vision_verify_ssl"), True),
         )
 
     def normalized(self) -> tuple[VideoConfig, list[str]]:

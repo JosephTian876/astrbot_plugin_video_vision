@@ -1,8 +1,11 @@
 """「基米看得见视频」—— AstrBot 插件入口。
 
-AstrBot 核心目前只把视频写成一行文本占位符（``[Video Attachment: name ..., path ...]``）
-交给模型，模型看不到任何画面。本插件在 ``on_llm_request`` 阶段把视频转成内容块
-追加进请求，使 Gemini 真正"看见"画面。
+两种工作模式（由 ``provider_mode`` 配置切换）：
+
+- ``gemini_native``：在 ``on_llm_request`` 阶段把视频转成内容块注入当前请求，
+  让 Gemini 原生"看见"画面（要求主对话 provider 是 Gemini 系）。
+- ``openai_compat``：插件直接把视频发给配置里的 OpenAI 兼容视觉服务做理解，
+  再把理解结果以文字注入对话 —— 主对话模型可以是任意模型。
 
 为什么不覆写 provider 的 ``assemble_context``：主对话轮次的上下文由
 ``ProviderRequest.assemble_context()`` 组装，runner 传 ``contexts=`` 且
@@ -33,6 +36,7 @@ except ImportError:  # pragma: no cover
 from .core.config import VideoConfig
 from .core.injector import prepare_video
 from .core.media import file_size_mb, probe_duration, resolve_ffmpeg_tools
+from .core.openai_vision import analyze_video, build_vision_prompt
 from .core.placeholder import VIDEO_SUFFIXES, VideoPlaceholder
 from .hooks.llm_request import handle_llm_request
 
@@ -84,7 +88,7 @@ def _resolve_cache_root() -> str:
 @register(
     PLUGIN_NAME,
     "JosephTian876",
-    "让 AstrBot 把视频作为原生模态直接交给 Gemini 理解，而不是抽取关键帧。",
+    "让模型真正看见视频：Gemini 原生注入 / 任意 OpenAI 兼容视觉服务理解，双模式。",
     PLUGIN_VERSION,
     PLUGIN_REPO,
 )
@@ -125,6 +129,33 @@ class VideoVisionPlugin(Star):
             ffprobe or "未找到",
             self.cache_root if self.config.cache_enabled else "已关闭",
         )
+        effective_mode = self.config.effective_provider_mode
+        if effective_mode == "openai_compat":
+            key = self.config.openai_api_key
+            # 只露后 4 位。密钥是敏感信息，日志经常被贴到 issue 里，
+            # 前 6 位足以还原出「sk-xxx」这类前缀，没必要泄露。
+            masked = f"…{key[-4:]}" if len(key) >= 8 else ""
+            if not masked:
+                masked = "已配置" if key else "未配置"
+            logger.info(
+                "[VideoVision] 模式=openai_compat | 视觉服务=%s | 模型=%s | key=%s | 超时=%.0fs",
+                self.config.openai_base_url or "未配置",
+                self.config.openai_model,
+                masked,
+                self.config.openai_timeout_sec,
+            )
+        else:
+            logger.info(
+                "[VideoVision] 模式=gemini_native | 仅 Gemini provider=%s",
+                self.config.require_gemini_provider,
+            )
+        if self.config.provider_mode != effective_mode:
+            logger.warning(
+                "[VideoVision] provider_mode=openai_compat 但 openai_base_url / "
+                "openai_api_key / openai_model 未配齐，已降级为 gemini_native "
+                "（老配置零改动仍可继续用）。要使用 OpenAI 兼容视觉服务，"
+                "请把这三项补齐。"
+            )
         if not ffmpeg:
             logger.warning(
                 "[VideoVision] 未找到 ffmpeg：超限视频将无法压缩，会被直接跳过。"
@@ -160,7 +191,7 @@ class VideoVisionPlugin(Star):
             return
 
         try:
-            report = self._diagnose(target)
+            report = await self._diagnose(target)
         except Exception as exc:  # noqa: BLE001
             logger.error("[VideoVision] /videotest 诊断异常: %s", exc, exc_info=True)
             report = f"❌ 诊断过程异常: {type(exc).__name__}: {exc}"
@@ -211,8 +242,9 @@ class VideoVisionPlugin(Star):
                     return str(path)
         return ""
 
-    def _diagnose(self, target: str) -> str:
-        """跑一遍完整链路并输出逐步报告（不真正发起模型请求）。"""
+    async def _diagnose(self, target: str) -> str:
+        """跑一遍完整链路并输出逐步报告。
+        gemini_native 模式不发请求；openai_compat 模式会真实调用视觉服务。"""
         cfg = self.config
         lines: list[str] = ["🔍 视频链路诊断"]
 
@@ -236,6 +268,13 @@ class VideoVisionPlugin(Star):
             f"配置   : 闸门={cfg.max_size_mb:.1f}MB 上限={cfg.compress_max_mb:.1f}MB "
             f"CRF={cfg.compress_crf} "
             f"策略={_ACTION_LABELS.get(cfg.oversize_action, cfg.oversize_action)}"
+        )
+        # 用与钩子完全相同的判定，避免 /videotest 说的和实际跑的不一样
+        effective_mode = cfg.effective_provider_mode
+        degraded = cfg.provider_mode != effective_mode
+        lines.append(
+            f"模式   : {effective_mode}"
+            + ("（openai_compat 三项未配齐，运行时降级）" if degraded else "")
         )
 
         oversize = size_mb > cfg.max_size_mb
@@ -269,7 +308,9 @@ class VideoVisionPlugin(Star):
         inj = outcome.injection
         uri_mb = len(inj.block["audio_url"]["url"]) / 1024 / 1024
         est_upload = inj.size_mb * 8  # 实测约 7-9 秒/MB
-        budget = 180.0
+        is_openai = effective_mode == "openai_compat"
+        budget = cfg.openai_timeout_sec if is_openai else 180.0
+        budget_name = "视觉服务预算" if is_openai else "provider 预算"
 
         lines.append(f"✅ 准备成功（{elapsed:.2f}s）")
         lines.append(f"动作: {_ACTION_LABELS.get(inj.action, inj.action)}")
@@ -278,11 +319,38 @@ class VideoVisionPlugin(Star):
         if inj.note:
             lines.append(f"说明: {inj.note}")
         lines.append("")
-        lines.append(f"预计上传耗时: 约 {est_upload:.0f}s（provider 预算 {budget:.0f}s）")
+        lines.append(
+            f"预计上传耗时: 约 {est_upload:.0f}s（{budget_name} {budget:.0f}s）"
+        )
         if est_upload > budget:
-            lines.append("⚠️ 可能超时，建议调低体积闸门或提高 provider timeout")
+            hint = "openai_timeout_sec" if is_openai else "provider timeout"
+            lines.append(f"⚠️ 可能超时，建议调低体积闸门或提高 {hint}")
         else:
             lines.append("✅ 在预算内")
+
+        # openai_compat：真实调用一次视觉服务，端到端验证配置与网络
+        if is_openai:
+            lines.append("")
+            prompt = build_vision_prompt(cfg, "")
+            result = await analyze_video(
+                inj.data_uri,
+                os.path.basename(target),
+                prompt,
+                config=cfg,
+                logger=logger,
+            )
+            if result.ok:
+                lines.append(
+                    f"✅ 视觉调用成功（{result.elapsed_sec:.1f}s | "
+                    f"token {result.prompt_tokens}+{result.completion_tokens}）"
+                )
+                excerpt = result.analysis[:400] + (
+                    "…" if len(result.analysis) > 400 else ""
+                )
+                lines.append("— 视觉模型回复节选 —")
+                lines.append(excerpt)
+            else:
+                lines.append(f"❌ 视觉调用失败: {result.reason}")
         return "\n".join(lines)
 
     async def terminate(self) -> None:
