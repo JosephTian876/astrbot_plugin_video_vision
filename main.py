@@ -39,7 +39,9 @@ from .core.config import VideoConfig
 from .core.injector import prepare_video
 from .core.media import (
     MAX_DATA_URI_BYTES,
+    OUTPUT_MIME,
     file_size_mb,
+    guess_video_mime,
     probe_duration,
     resolve_ffmpeg_tools,
 )
@@ -139,6 +141,45 @@ def _encoding_limit_note(raw_mb: float) -> str:
     )
 
 
+def _suffix_of(path: str) -> str:
+    """小写扩展名（含点）；没有扩展名时是空串。"""
+    return os.path.splitext(path or "")[1].lower()
+
+
+def _unknown_container_note(path: str) -> str:
+    """显式路径 + 未知后缀时的警示句；后缀是已知视频容器时返回空串。
+
+    ``/videotest`` 走的是**显式路径**，刻意跳过闸门 ⓪ 的「File 组件扩展名
+    筛选」；而 ``guess_video_mime`` 对未知后缀回落到 ``video/mp4``。于是
+    ``/videotest anim.gif`` 会显示「未超限，直接送 / ✅ 准备成功 /
+    mime: video/mp4」—— 诊断说一切正常，真发出去却是假 MIME，provider 侧才
+    会炸（真机证据见 LIVE-TEST §10.2③）。
+
+    这里只把事实写进报告，**不改任何行为**：正常消息流仍由闸门 ⓪ 负责筛选。
+    """
+    suffix = _suffix_of(path)
+    if suffix in VIDEO_SUFFIXES:
+        return ""
+    return (
+        f"⚠️ 扩展名 {suffix or '（无）'} 不在已知视频容器内：显式路径不校验扩展名，"
+        f"将以 {OUTPUT_MIME} 发送，provider 可能拒绝"
+    )
+
+
+def _mime_line(path: str, action: str) -> str:
+    """``MIME   :`` 行：报告实际声明给 provider 的 MIME。
+
+    - 压缩/截断产物一定是 ffmpeg 产出的 ``.mp4``，MIME 是确定的；
+    - 直接送时 MIME 由源文件后缀决定；后缀不在已知容器里就只能回落到
+      ``video/mp4``，这一行必须标 ``(推断)``，不能和真实探测结果混为一谈。
+    """
+    if action != "as-is":
+        return f"MIME   : {OUTPUT_MIME}（压缩产物，固定为 mp4）"
+    if _suffix_of(path) in VIDEO_SUFFIXES:
+        return f"MIME   : {guess_video_mime(path)}"
+    return f"MIME   : {OUTPUT_MIME} (推断)"
+
+
 @register(
     PLUGIN_NAME,
     "JosephTian876",
@@ -158,6 +199,13 @@ class VideoVisionPlugin(Star):
         resolved, notices = VideoConfig.from_mapping_detailed(self.raw_config)
         resolved, warnings = resolved.normalized()
         self.config: VideoConfig = resolved
+        #: 启动时记下的两类提示，``/videotest`` 会原样带出来 —— 用户看诊断时才
+        #: 知道自己写的 ``compress_max_mb=15.0`` 被夹成了多少（LIVE-TEST §10.2①）。
+        #: 两类分开存：``notices`` 是"你的输入被收敛/被忽略"（提示），
+        #: ``warnings`` 是"normalized() 改了值"（修正）—— 混成一个前缀会把
+        #: "忽略未知配置键"也说成"已修正"。
+        self.config_notices: list[str] = list(notices)
+        self.config_warnings: list[str] = list(warnings)
         for notice in notices:
             logger.warning("[VideoVision] 配置提示: %s", notice)
         for warning in warnings:
@@ -367,6 +415,11 @@ class VideoVisionPlugin(Star):
             f"CRF={cfg.compress_crf} "
             f"策略={_ACTION_LABELS.get(cfg.oversize_action, cfg.oversize_action)}"
         )
+        # 配置被自动修正过时，把"你写的原值 → 生效值"一起打出来。
+        for notice in getattr(self, "config_notices", []):
+            lines.append(f"配置提示: {notice}")
+        for warning in getattr(self, "config_warnings", []):
+            lines.append(f"配置修正: {warning}")
         # 与体积闸门无关的第二道体积限制：data URI 编码上限。
         lines.append(
             f"编码上限: data URI {_URI_LIMIT_MB:.0f}MB ≈ 原始 {_URI_LIMIT_RAW_MB:.1f}MB"
@@ -389,13 +442,28 @@ class VideoVisionPlugin(Star):
         # ---- provider 与三道闸门（0.2.0 完全不诊断，而这正是最常见的失败点）----
         lines.extend(await self._diagnose_gates(cfg, event, effective_mode))
 
+        # ---- 显式路径的扩展名风险（闸门 ⓪ 在本指令里不适用）----
+        container_note = _unknown_container_note(target)
+        if container_note:
+            lines.append(f"提醒   : {container_note}")
+
         # ---- 体积 / 时长判定（与钩子完全相同的判定）----
         # 判定行必须把 data URI 编码上限一起算进来：闸门放到 200MB 时若只写
         # "未超限，直接送"，紧接着就是 too_large 失败 —— 诊断自相矛盾。
         oversize = size_mb > cfg.max_size_mb
         overlong = cfg.max_duration_sec > 0 and duration > cfg.max_duration_sec
+        # injector 的 corrupt 规则：有 ffprobe 能力却读不出时长 + 后缀是视频容器
+        # -> 直接 kind="corrupt"。判定行必须与它一致，否则"未超限，直接送"的
+        # 下一行就是"❌ 准备失败 分类: corrupt"（真机证据见 LIVE-TEST §10.2②）。
+        unreadable = (
+            bool(self.ffprobe)
+            and duration <= 0
+            and _suffix_of(target) in VIDEO_SUFFIXES
+        )
         if size_mb <= 0:
             lines.append("判定   : 体积 0.00MB（空文件）→ 会以 empty 失败")
+        elif unreadable:
+            lines.append("判定   : 无法解析（时长读取失败）→ 会以 corrupt 失败")
         elif not oversize and not overlong:
             limit_note = _encoding_limit_note(size_mb)
             if limit_note:
@@ -452,6 +520,9 @@ class VideoVisionPlugin(Star):
         lines.append(f"动作: {_ACTION_LABELS.get(inj.action, inj.action)}")
         lines.append(f"产物: {inj.size_mb:.2f} MB / {inj.duration_sec:.1f} s")
         lines.append(f"编码: data URI {uri_mb:.2f} MB")
+        # 声明给 provider 的 MIME：未知后缀回落 video/mp4 时标 (推断)，
+        # 免得"✅ 准备成功 + video/mp4"被读成"这个 gif 真的会以视频发出去"。
+        lines.append(_mime_line(inj.used_path, inj.action))
         if inj.note:
             lines.append(f"说明: {inj.note}")
         lines.append("")

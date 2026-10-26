@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import shutil
+import subprocess
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -288,6 +289,132 @@ def test_diagnose_refuses_non_video_extension_honestly(
 
     # 有 ffprobe 却读不出时长、扩展名不是视频 -> 不被"损坏"规则拦，照样送
     assert "准备失败" in report or "直接送" in report
+    # 但必须提前说明"后缀未知、MIME 是猜的"，不能再装作一切正常
+    assert "不在已知视频容器内" in report
+    assert "(推断)" in report
+
+
+def test_diagnose_corrupt_judgement_matches_the_outcome(
+    media_tools, ffmpeg_dir, tmp_path, stub_logger
+):
+    """回归：判定行写"未超限，直接送"，紧接着"❌ 准备失败 分类: corrupt"。
+
+    真机证据见 LIVE-TEST §10.2②（broken.mp4：2MB 随机字节）。
+    """
+    broken = tmp_path / "broken.mp4"
+    broken.write_bytes(b"\x00\x01\x02not a video" * 500)
+    plugin = make_plugin(
+        _Context(), ffmpeg_path=ffmpeg_dir, provider_mode="gemini_native"
+    )
+    plugin.cache_root = str(tmp_path / "cache")
+
+    report = run(plugin._diagnose(str(broken), event=_Event()))
+
+    assert "判定   : 无法解析（时长读取失败）→ 会以 corrupt 失败" in report
+    assert "未超限，直接送" not in report
+    # 判定行必须和随后的真实结果一致
+    assert "分类: corrupt" in report
+
+
+def test_diagnose_corrupt_judgement_stays_silent_without_ffprobe(
+    tmp_path, stub_logger
+):
+    """没有 ffprobe 时不误伤：injector 不判 corrupt，判定行也不能提前说 corrupt。"""
+    broken = tmp_path / "broken.mp4"
+    broken.write_bytes(b"\x00\x01\x02not a video" * 500)
+    plugin = make_plugin(
+        _Context(),
+        ffmpeg_path=str(tmp_path / "missing-dir"),
+        provider_mode="gemini_native",
+    )
+    plugin.cache_root = str(tmp_path / "cache")
+    plugin.ffprobe = None
+
+    report = run(plugin._diagnose(str(broken), event=_Event()))
+
+    assert "corrupt" not in report
+    assert "未超限，直接送" in report
+
+
+def test_diagnose_flags_the_guessed_mime_for_unknown_suffixes(
+    media_tools, tmp_path, stub_logger
+):
+    """回归：`/videotest anim.gif` 说"✅ 准备成功 / video/mp4"，真发出去是假 MIME。
+
+    ``guess_video_mime`` 对未知后缀回落 ``OUTPUT_MIME``，而显式路径跳过闸门 ⓪
+    （真机证据见 LIVE-TEST §10.2③）。这里只要求诊断把话说清楚，行为不变。
+    """
+    ffmpeg = media_tools[0]
+    gif = tmp_path / "anim.gif"
+    subprocess.run(
+        [
+            ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+            "-f", "lavfi", "-i", "testsrc2=s=32x32:d=1:r=5", str(gif),
+        ],
+        check=True,
+        capture_output=True,
+        timeout=120,
+    )
+    plugin = make_plugin(
+        _Context(), ffmpeg_path=str(Path(media_tools[0]).parent),
+        provider_mode="gemini_native",
+    )
+    plugin.cache_root = str(tmp_path / "cache")
+
+    report = run(plugin._diagnose(str(gif), event=_Event()))
+
+    # ① 一行明确警示（就放在判定行上方）
+    assert (
+        "提醒   : ⚠️ 扩展名 .gif 不在已知视频容器内：显式路径不校验扩展名，"
+        "将以 video/mp4 发送，provider 可能拒绝"
+    ) in report
+    # ② mime 行标注"推断"
+    assert "MIME   : video/mp4 (推断)" in report
+    # ③ 正常消息流的行为没变：它照样准备成功（闸门 ⓪ 负责筛选，这里不拦）
+    assert "✅ 准备成功" in report
+
+
+def test_diagnose_echoes_config_corrections_with_the_raw_value(
+    media_tools, tiny_video, tmp_path, stub_logger
+):
+    """真实配置那种「15.0 配 13.0 闸门」，/videotest 必须打出用户写的 15.0。
+
+    真机证据见 LIVE-TEST §10.2①：用户只能看到「上限=7.8MB」，看不到 15.0 被夹过。
+    """
+    plugin = make_plugin(
+        _Context(),
+        ffmpeg_path=str(Path(media_tools[0]).parent),
+        provider_mode="gemini_native",
+        max_size_mb=13.0,
+        compress_max_mb=15.0,
+    )
+    plugin.cache_root = str(tmp_path / "cache")
+
+    report = run(plugin._diagnose(tiny_video, event=_Event()))
+
+    assert "配置   : 闸门=13.0MB 上限=11.7MB" in report
+    assert "配置提示: compress_max_mb=15.0 高于上限 13.0" in report
+    assert (
+        "配置修正: compress_max_mb(15.0) 必须小于 max_size_mb(13.0)，"
+        "已自动下调为 11.7"
+    ) in report
+
+
+def test_diagnose_does_not_flag_known_video_suffixes(
+    media_tools, tiny_video, tmp_path, stub_logger
+):
+    """已知视频容器不得出现扩展名警示，MIME 行也不带"推断"。"""
+    plugin = make_plugin(
+        _Context(), ffmpeg_path=str(Path(media_tools[0]).parent),
+        provider_mode="gemini_native",
+    )
+    plugin.cache_root = str(tmp_path / "cache")
+
+    report = run(plugin._diagnose(tiny_video, event=_Event()))
+
+    assert "提醒   :" not in report
+    assert "(推断)" not in report
+    assert "MIME   : video/mp4\n" in report or report.endswith("MIME   : video/mp4")
 
 
 # -------------------------------------------------------------- 命令层

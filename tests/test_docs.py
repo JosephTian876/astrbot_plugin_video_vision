@@ -73,11 +73,21 @@ def test_videotest_example_matches_the_new_report():
         "provider: type=",
         "闸门   :",
         "编码上限:",
+        "MIME   :",
         "凭据   : 视觉服务",
         "prompt :",
     ):
         assert needle in README, needle
     assert "l10_probe.mp4" not in README
+
+
+def test_videotest_honesty_lines_are_documented():
+    """0.2.1 新增的三类"说清楚"：corrupt 判定、未知后缀警示、配置修正回显。"""
+    assert "无法解析（时长读取失败）→ 会以 corrupt 失败" in README
+    assert "不在已知视频容器内" in README
+    assert "(推断)" in README
+    assert "配置修正:" in README
+    assert "配置提示:" in README
 
 
 def test_degradation_warning_promise_is_precise():
