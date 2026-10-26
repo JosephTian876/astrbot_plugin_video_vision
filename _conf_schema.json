@@ -17,7 +17,7 @@
       "Gemini 原生注入（旧路径）"
     ],
     "default": "openai_compat",
-    "hint": "openai_compat：插件自己调用下方配置的 OpenAI 兼容接口做视频理解，结果以文字注入对话，主对话模型任意。gemini_native：把视频原生注入当前请求，要求主对话 provider 是 Gemini 系。注意：选 openai_compat 但下面 base_url / api_key / model 没配齐时，运行时会自动降级为 gemini_native（只告警一次），因此老配置直接升级不会失效。"
+    "hint": "openai_compat：插件自己调用下方配置的 OpenAI 兼容接口做视频理解，结果以文字注入对话，主对话模型任意。gemini_native：把视频原生注入当前请求，要求主对话 provider 是 Gemini 系。注意：选 openai_compat 但下面 base_url / api_key / model 没配齐时，运行时会自动降级为 gemini_native，启动日志里告警一次（钩子不再重复告警），因此老配置直接升级不会失效。"
   },
   "openai_base_url": {
     "description": "视觉服务接口地址（写全路径）",
@@ -90,13 +90,13 @@
     "description": "体积闸门（MB）",
     "type": "float",
     "default": 13.0,
-    "hint": "超过此体积的视频会被压缩。base64 后约为 1.33 倍：13MB 视频会产生约 17MB 的请求体。实测经中转站上传约 7-9 秒/MB，需留在超时预算之内。"
+    "hint": "超过此体积的视频会被压缩。base64 后约为 1.33 倍：13MB 视频会产生约 17MB 的请求体。实测经中转站上传约 7-9 秒/MB，需留在超时预算之内。上下界 0.5-2000；编码后的 data URI 另有 18MB 硬上限（约 13.5MB 原始体积），超过会直接拒绝并说明原因。"
   },
   "compress_max_mb": {
-    "description": "压缩体积上限（MB，保险丝）",
+    "description": "压缩体积上限（MB，硬上限）",
     "type": "float",
     "default": 8.0,
-    "hint": "压缩产物的体积上限。实际体积主要由「压缩画质」决定并随画面复杂度自适应；此值只作为上限保险丝。必须小于体积闸门。"
+    "hint": "压缩产物的体积**硬上限**，通过 ffmpeg 的 -fs 按字节数截断实现（旧版只用 -maxrate，实测会超 1.3-3.2 倍）。必须小于体积闸门。预算极小时 ffmpeg 会提前封口，产物**时长会变短**，/videotest 的说明里会写明。"
   },
   "compress_crf": {
     "description": "压缩画质（主控体积）",
@@ -130,7 +130,7 @@
     "description": "最长时长（秒）",
     "type": "float",
     "default": 60.0,
-    "hint": "超过此长度的视频会被截断。设 0 表示不限制。"
+    "hint": "超过此长度的视频会被截断（传 ffmpeg -t）。设 0 表示不限制 —— 此时 oversize_action=truncate 会退化成压缩，启动日志会告警提示。"
   },
   "oversize_action": {
     "description": "超限处理方式",
@@ -143,10 +143,10 @@
     "labels": [
       "压缩到目标体积",
       "拒绝并提示",
-      "截断前 N 秒"
+      "按体积预算截断"
     ],
     "default": "compress",
-    "hint": "压缩最稳妥；拒绝最省事；截断会丢失后段内容。"
+    "hint": "压缩最稳妥；拒绝最省事；截断会丢失后段内容。truncate 按体积预算估算时长（truncate_to ≈ duration × max_size_mb ÷ size_mb，留 10% 余量、最小 1 秒），再与 max_duration_sec 取较小值 —— 只有真的传了 -t 才会把动作标成「已截断」。"
   },
   "max_video_count": {
     "description": "单条消息最多处理视频数",
@@ -182,7 +182,7 @@
     "description": "压缩耗时上限（秒）",
     "type": "float",
     "default": 45.0,
-    "hint": "压缩超过此耗时则放弃压缩并降级为拒绝，避免把超时预算全部吃掉。"
+    "hint": "压缩的**墙钟**上限（1-600 秒），超时则终止整棵子进程树并降级为拒绝，避免把超时预算全部吃掉。"
   },
   "ffmpeg_path": {
     "description": "ffmpeg 路径",
@@ -200,7 +200,7 @@
     "description": "缓存上限（MB）",
     "type": "int",
     "default": 512,
-    "hint": "超出后按最久未使用淘汰。"
+    "hint": "超出后按最久未使用淘汰（16-65536）。注意：**单个产物大于本值时不会进缓存**（放进去也会被自己挤掉），这类视频每次都会重新压缩。"
   },
   "debug_log": {
     "description": "详细调试日志",

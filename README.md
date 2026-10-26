@@ -19,11 +19,12 @@
 - **原生视频理解**，非抽帧 —— 模型真的"看"视频，画面、动作、字幕、时间轴都在
 - **带问题理解**：用户发视频时附带的文字会一起发给视觉模型，得到针对性回答
 - **自动压缩**：超过体积闸门时用 ffmpeg 压缩，画质随画面复杂度自适应
-- **体积上限保险丝**：即使画质档位拉满也不会压出超预算的文件
+- **体积硬上限**：压缩用 `-fs` 按字节数硬截断，产物不会显著超过 `compress_max_mb`
+  （极小预算时会牺牲**时长**，见下方「两个体积旋钮怎么配合」）
 - **压缩缓存**：按源文件内容哈希缓存，重试/重复发送不重复压缩
 - **全链路失败降级**：视频处理出错**绝不影响**正常文字对话
 - **不污染对话历史**：注入的视频块标记为非持久化，不会在后续轮次被重发
-- **`/videotest` 诊断指令**：逐步查看处理耗时与体积，排障一目了然
+- **`/videotest` 诊断指令**：逐步查看处理耗时、体积、provider 与三道闸门
 - **与「我会永远陪着你」陪伴体系兼容**（见下方兼容性说明）
 
 ---
@@ -67,7 +68,10 @@ Responses API（`/responses`）同样实测支持：视频用 `input_image` + da
 
 - **ffmpeg / ffprobe**：压缩功能需要。请在系统 PATH 中提供，或在插件配置里填 `ffmpeg_path`。
   - 没有 ffmpeg 时插件仍可工作，但超限视频会被跳过而不是压缩。
-- 无第三方 Python 依赖。
+- 无第三方 Python 依赖（`openai_compat` 复用 AstrBot 自带的 `httpx`，它随
+  `google-genai` 一起安装；若删掉那条依赖会走 ImportError 兜底并给出提示）。
+- AstrBot **>= 4.24.1**（`mark_as_temp` 自 4.24.1 起；占位符与 `modalities`
+  清洗自 4.23.5 起）。
 
 ---
 
@@ -88,29 +92,36 @@ Responses API（`/responses`）同样实测支持：视频用 `input_image` + da
 | `vision_verify_ssl` | `true` | 校验视觉服务证书；中转站证书有问题时可关（自担风险） |
 | `require_gemini_provider` | `true` | **仅 gemini_native 模式生效**，建议保持开启 |
 | `additional_provider_types` | `[]` | **仅 gemini_native 模式生效**：在默认 Gemini 系白名单外额外放行的 provider type（如走 OpenAI 协议的 Gemini 代理）。填错可能被上游 422 拒收 |
-| `max_size_mb` | `13.0` | 体积闸门，超过则按 `oversize_action` 处理 |
-| `compress_max_mb` | `8.0` | 压缩产物体积**上限**（保险丝），必须小于闸门 |
+| `max_size_mb` | `13.0` | 体积闸门，超过则按 `oversize_action` 处理（上限 2000） |
+| `compress_max_mb` | `8.0` | 压缩产物体积**硬上限**（传给 `-fs`），必须小于闸门；极小预算时产物会提前封口、**时长变短** |
 | `compress_crf` | `30` | **主控压缩程度**：越小画质越好、体积越大 |
 | `compress_preset` | `veryfast` | x264 速度预设 |
-| `max_duration_sec` | `60.0` | 最长时长，超出则截断。`0` 表示不限 |
-| `oversize_action` | `compress` | `compress` / `reject` / `truncate` |
+| `max_duration_sec` | `60.0` | 最长时长，超出则截断。`0` 表示不限（此时 `oversize_action=truncate` 会退化成压缩，启动会告警） |
+| `oversize_action` | `compress` | `compress` / `reject` / `truncate`。`truncate` 按**体积预算**估算截断时长（见下） |
 | `max_video_count` | `2` | 单条消息最多处理几个视频 |
 | `handle_quoted_video` | `true` | 是否处理引用消息里的视频 |
 | `treat_file_as_video` | `true` | **把视频文件附件也当作视频处理**（见下方「QQ 把视频当文件发」） |
 | `hide_local_path` | `true` | **注入后抹除占位文本中的本机路径**（见下方「别把路径喂给模型」） |
 | `notify_on_failure` | `true` | 失败时追加一句简短说明给模型 |
-| `max_compress_seconds` | `45.0` | 压缩耗时上限，超时则降级 |
+| `max_compress_seconds` | `45.0` | 压缩耗时**墙钟**上限（超时终止整棵进程树），超时则降级 |
 | `ffmpeg_path` | `""` | 留空则从 PATH 查找；也可填所在目录 |
 | `cache_enabled` | `true` | 启用压缩缓存 |
-| `cache_max_mb` | `512` | 缓存上限，超出按 LRU 淘汰 |
+| `cache_max_mb` | `512` | 缓存上限，超出按 LRU 淘汰（下限 16；**单个产物大于此值时不进缓存**） |
 | `debug_log` | `false` | 详细调试日志 |
 
 ### 两个体积旋钮怎么配合
 
 - **`compress_crf` 决定实际体积**，且随画面复杂度自适应：
   静态画面压得极小、上传更快；高熵画面自动保留更多细节。
-- **`compress_max_mb` 只是上限**。实测：CRF 18 想产出 5.23MB，
-  上限设 1MB 时会被 `maxrate` 压到 0.83MB。
+- **`compress_max_mb` 是硬上限**，通过 ffmpeg 的 `-fs <字节数>` 实现：写满即
+  停止复用。实测把上限设 0.5MB 得到 532KB（溢出不到一个 GOP），而不再像 0.2.0
+  那样只靠 `-maxrate`/`-bufsize`（实测会超 1.3–3.2 倍）。
+  代价：预算极小时 ffmpeg 会**提前封口**，产物时长比预期短 —— 此时
+  `/videotest` 的「说明」里会写明「受 -fs 体积硬上限约束，产物比预期更短」。
+- **`oversize_action=truncate` 现在真的按体积截断**：估算
+  `truncate_to ≈ duration × max_size_mb ÷ size_mb`（留 10% 余量、最小 1 秒），
+  再与 `max_duration_sec` 取较小值。所以 19MB/10s 的视频配 13MB 闸门，
+  会被截到约 6 秒，而不是原样整段上传。
 
 ---
 
@@ -182,14 +193,24 @@ Responses API（`/responses`）同样实测支持：视频用 `input_image` + da
 **模型明明已经拿到视频，却还是去跑 cv2 抽帧、grep 知识库、web search** ——
 一次回复拖了十几分钟，用户看到的就是"截完帧查知识库然后开始 web search"。
 
-开启 `hide_local_path`（默认）后，**成功注入**的视频占位文本会被改写成：
+开启 `hide_local_path`（默认）后，**成功注入**的视频占位文本会被改写成
+（按模式二选一，都是整句中文/英文说明，不再包含任何路径）：
 
 ```
-[Video: fileseg_xxx.mp4]
+[视频内容已随本消息直接提供（文件名 fileseg_xxx.mp4）。你已经在本次请求中看到了
+这段视频，无需再用任何工具去查找或读取该文件。]
+```
+
+```
+[视频 fileseg_xxx.mp4 已交给视觉模型分析，分析结果已随本消息以文字形式提供。
+你无需、也无法读取该视频文件，不要尝试用代码工具去解析它。]
 ```
 
 模型仍然知道"有个视频、叫什么名字"，但不再被路径诱导去自己解析。
 **注入失败时占位文本保持原样**（那时路径反而有用）。
+
+> 改写的是**文本内容本身**，不是"删除占位符"。如果下游插件依赖
+> `[Video Attachment` 这个前缀做判断，请关闭 `hide_local_path`。
 
 ---
 
@@ -223,27 +244,47 @@ return types.Part.from_bytes(data=..., mime_type=mime_type)
 
 openai_compat 模式下会**真实调用一次视觉服务**并回显回复节选，可端到端验证 base_url / key / 模型 / 网络 / 证书是否可用。
 
-输出示例：
+输出示例（gemini_native，真跑 21.79MB / 20s 的测试片）：
 
 ```
 🔍 视频链路诊断
-文件: l10_probe.mp4
-体积: 19.61 MB
-时长: 10.0 s
+文件: demo.mp4
+体积: 21.79 MB
+时长: 20.0 s
 
-ffmpeg : ✅ C:\path\to\ffmpeg.exe
-ffprobe: ✅ C:\path\to\ffprobe.exe
+ffmpeg : ✅ D:\ffmpeg\bin\ffmpeg.exe
+ffprobe: ✅ D:\ffmpeg\bin\ffprobe.exe
 配置   : 闸门=13.0MB 上限=8.0MB CRF=30 策略=压缩
-判定   : 体积 19.6MB > 闸门 13.0MB → 压缩
+模式   : gemini_native
+凭据   : 视觉服务 ❌ 缺 openai_base_url、openai_api_key
+provider: type=googlegenai_chat_completion id=gemini-2.5-flash modalities=[text, image, audio]
+闸门   : ⓪ File 组件扩展名筛选 → 本指令用显式路径，不适用
+         ① 类型 googlegenai_chat_completion ✅ 在允许列表
+         ② modalities 含 audio ✅
+         ③ 视觉服务凭据 ❌ 缺 openai_base_url、openai_api_key（本模式不使用）
+判定   : 体积 21.8MB > 闸门 13.0MB → 压缩
+prompt : （gemini_native 不调用视觉服务，无 prompt）
 
-✅ 准备成功（0.62s）
+✅ 准备成功（0.64s）
 动作: 已压缩
-产物: 1.35 MB / 10.0 s
-编码: data URI 1.80 MB
+产物: 1.79 MB / 20.0 s
+编码: data URI 2.38 MB
+说明: 体积 21.8MB > 闸门 13.0MB -> 1.8MB
 
-预计上传耗时: 约 11s（provider 预算 180s）
+预计上传耗时: 约 14s（provider 预算 180s）
 ✅ 在预算内
 ```
+
+几处读法：
+
+- **凭据**只在 openai_compat 模式有意义；gemini_native 下显示为缺失是正常的
+  （第 ③ 行也标了"本模式不使用"）。
+- **provider / 闸门** 三行是 0.2.1 新增的：`provider type`、`modalities`、以及
+  ⓪①②③ 四道判定的结果，与钩子里的判定代码完全一致。
+- **prompt** 是 openai_compat 模式下真正会发给视觉服务的提示词（压成一行、
+  截断 200 字符）。若 `vision_qa_prompt` 里没有 `{question}`，这里会提示。
+- **action** 现在只由"是否真的传了 `-t`"决定：`策略=压缩` 但 `max_duration_sec`
+  真的触发了截断时，动作会显示"已截断"而不是"已压缩"。
 
 ---
 
@@ -256,7 +297,7 @@ ffprobe: ✅ C:\path\to\ffprobe.exe
 | **不碰** `image_urls` / `audio_urls` | 陪伴插件主动管理这两个字段，核心还会据此切换 provider |
 | **不碰** `prompt` / `system_prompt` | 陪伴插件大量读写 |
 | **不替换** `extra_user_content_parts` 列表 | 只就地 `append`，且每次重新读取属性（陪伴插件会替换整个列表） |
-| **不删除** `[Video Attachment: ...]` 占位文本 | 陪伴插件与核心都不删它，保留最安全 |
+| **不删除** `[Video Attachment: ...]` 占位文本 | 默认 `hide_local_path=true` 时会把它**改写成不含路径的说明**（等价于替换）；若下游插件依赖这个前缀做判断，请关闭 `hide_local_path` |
 | **不调用** `event.stop_event()` | 会中断所有更低优先级的钩子（含陪伴插件整条富化链） |
 | **注入块标记** `_no_save` | 否则多兆 base64 会写进对话历史并在每轮重发 |
 | **用** `AudioURLPart` 对象而非裸 dict | provider 侧 `assemble_context` 对裸 dict 会 `raise ValueError` |
@@ -318,7 +359,10 @@ astrbot_plugin_video_vision/
     └── llm_request.py      on_llm_request 注入逻辑
 ```
 
-`core/` 下**不允许**出现 `import astrbot`，以便日后把这套逻辑搬进 AstrBot 核心。
+`core/` 下除 `injector.py` 从 `astrbot.api` 取 `logger` 之外**不依赖** AstrBot 的
+任何符号（插件市场安全检查要求日志记录器必须且只能来自 `astrbot.api`，所以这一处
+是有意保留的）。其余纯逻辑（`config` / `media` / `openai_vision` / `placeholder`）
+可以直接搬进 AstrBot 核心。
 
 ---
 
@@ -326,12 +370,19 @@ astrbot_plugin_video_vision/
 
 - 视频以 **inline base64** 传输，体积受超时预算约束（约 7-9s/MB 上行）；
   中转站若提供 File API 可显著放宽（当前实测的中转站没有）。
+- 编码后的 data URI 有 **18MB 硬上限**（对应约 13.5MB 原始体积），超过会直接
+  拒绝并给出原因，不会静默截断，也不会把上百 MB 的 base64 塞进请求。
 - openai_compat 模式：视觉模型必须是**真能看视频**的模型（如 gemini-3.x-flash 系）；
   主模型拿到的是视觉模型的文字理解而非原片。
 - gemini_native 模式：仅支持 **Gemini 系** provider（依赖其按 MIME 构造媒体 Part 的行为），
   且模型必须声明 **audio** 模态；走 OpenAI 协议的 Gemini 代理需在
   `additional_provider_types` 中显式放行。
 - 不支持多视频并行压缩；单条消息的视频串行处理（openai_compat 的视觉调用是并发的）。
+- 压缩缓存按源文件内容哈希做 key，**单个产物大于 `cache_max_mb` 时不会进缓存**
+  （放进去也会被自己挤掉，还会连带清空其它条目），这类视频每次都会重新压缩。
+- `/videotest` 只检查"路径存在且是文件"，**不校验扩展名**：给什么文件它就把什么
+  按视频编码并发送（openai_compat 下会真的 POST 出去）。仅管理员可用，请勿在
+  生产环境拿它测试非视频文件。
 - 注入给模型的内容（原生视频块 / 视觉分析文字）都标记为**非持久化**，不会写进对话历史；
   因此隔一轮再追问视频细节时，模型手上已经没有上一轮的素材。
 
