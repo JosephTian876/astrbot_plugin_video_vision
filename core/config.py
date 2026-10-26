@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields, replace
 from typing import Any
@@ -165,7 +166,16 @@ def _mb_text(value: float) -> str:
     告警里要出现**用户写的那个数**，``str(15.0)`` / ``f"{15.0:g}"`` 分别是
     "15.0" 与 "15" —— 两种都跟 ``11.7`` 这种一位小数的最终值不好对齐，
     所以统一成"最短但至少一位小数"。
+
+    **非有限值单独处理**：JSON 里的 ``1e999`` 会变成 ``inf``，手写 ``Infinity``
+    会变成 ``nan``/``inf``。旧实现把 ``inf`` 当成"没有小数点"补成 ``inf.0``，
+    于是提示写成 ``compress_max_mb=inf.0 超过体积闸门 …``（VERIFY2 P3-4）。
+    现在分别输出 ``∞`` / ``-∞`` / ``非数值``。
     """
+    if not math.isfinite(value):
+        if math.isnan(value):
+            return "非数值"
+        return "∞" if value > 0 else "-∞"
     text = f"{value:g}"
     if "." in text or "e" in text or "E" in text:
         return text

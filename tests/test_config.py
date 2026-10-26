@@ -424,6 +424,34 @@ def test_private_helpers_are_not_public_api():
     assert final == pytest.approx(11.7) and "11.7" in notice
 
 
+def test_non_finite_megabyte_values_stay_readable():
+    """回归（VERIFY2 P3-4）：``_mb_text(inf)`` 曾输出 ``"inf.0"``。
+
+    ``1e999`` 是**合法 JSON**，所以 ``compress_max_mb=1e999`` 真的会走到提示里。
+    旧实现把 ``inf`` 当作"没有小数点"再补一位小数，于是用户看到
+    ``compress_max_mb=inf.0 超过体积闸门 …`` —— 既不是数字也不是中文。
+    """
+    assert config_mod._mb_text(float("inf")) == "∞"
+    assert config_mod._mb_text(float("-inf")) == "-∞"
+    assert config_mod._mb_text(float("nan")) == "非数值"
+    # 有限值那几条不能因为 inf 分支而改变（常用路径）
+    assert config_mod._mb_text(15.0) == "15.0"
+    assert config_mod._mb_text(11.700000000000001) == "11.7"
+    assert config_mod._mb_text(0.75) == "0.75"
+
+    # 端到端：闸门 2000（上界）+ 预算 1e999 → 一条提示，且数字可读
+    raw = json.loads('{"max_size_mb": 1e999, "compress_max_mb": 1e999}')
+    cfg, notices = VideoConfig.from_mapping_detailed(raw)
+    budget = [item for item in notices if "compress_max_mb" in item]
+    assert len(budget) == 1, notices
+    assert "inf" not in budget[0], budget[0]
+    assert budget[0] == (
+        "compress_max_mb=∞ 超过体积闸门 max_size_mb=2000.0，"
+        "已按闸门的 90% 收敛为 1800.0"
+    )
+    assert cfg.compress_max_mb == pytest.approx(MAX_SIZE_MB_CEILING * 0.9)
+
+
 # ------------------------------------------------------------- 向后兼容
 
 

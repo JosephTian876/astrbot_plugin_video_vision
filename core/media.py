@@ -12,6 +12,7 @@ import base64
 import hashlib
 import os
 import shutil
+import signal
 import subprocess
 import threading
 from pathlib import Path
@@ -240,9 +241,23 @@ def _looks_corrupt(stderr: str | None) -> bool:
 def _kill_process_tree(proc: subprocess.Popen) -> None:
     """终止子进程**及其后代**。
 
-    Windows 上 ``proc.kill()`` 只杀直接子进程；指向 ``.cmd`` 包装器时，真正的
+    Windows: ``proc.kill()`` 只杀直接子进程；指向 ``.cmd`` 包装器时，真正的
     ffmpeg 是 cmd.exe 的孙进程，会继续持有管道。``taskkill /T`` 才是唯一可靠的
     整棵树终止手段，``proc.kill()`` 留作兜底。
+
+    POSIX: ``proc.kill()`` 同样只杀直接子进程。包装脚本（``ffmpeg.sh`` 之类）的
+    孙进程会活下来并继续持有管道，于是"超时"仍然要等到孙进程结束才返回 ——
+    正是 Windows 上修过的那个 bug。所以 ``_run_ffmpeg`` 用
+    ``start_new_session=True`` 让子进程自成进程组，这里对**整个进程组**
+    发 ``SIGKILL``（``os.killpg(os.getpgid(pid), SIGKILL)``）。
+
+    .. warning::
+       本项目的开发/验证机是 Windows，**没有 WSL 也没有 docker**，所以
+       POSIX 这条分支**无法在本机实测** —— 它是"按 POSIX 语义实现 + 源码守卫
+       测试"（``tests/test_injector.py::test_kill_process_tree_covers_posix``），
+       不是"跑通过"的代码。CI 的 ubuntu lane 会执行 ``start_new_session`` 与
+       ``killpg`` 的真实调用（超时用例在 Linux 上不 skip 的部分），但那个结果
+       只能由 CI 给出，本地不能替它背书。
     """
     if os.name == "nt":
         try:
@@ -252,6 +267,12 @@ def _kill_process_tree(proc: subprocess.Popen) -> None:
                 timeout=5,
             )
         except Exception:  # noqa: BLE001 - 兜底手段失败也不能影响主流程
+            pass
+    else:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            # 进程已退出 / 没有权限 / 不是组长：都退回下面的 proc.kill()
             pass
     try:
         proc.kill()
@@ -270,6 +291,10 @@ def _run_ffmpeg(args: list[str], timeout: float) -> None:
     这里改为 ``Popen`` + ``communicate(timeout)``，超时后终止整棵进程树，再做
     **有界**的二次 ``communicate``（最多 :data:`_KILL_GRACE_SEC` 秒），保证
     "超时" 真的按时返回。
+
+    POSIX 上 ``start_new_session=True`` 让子进程自成进程组，:func:`_kill_process_tree`
+    才能用 ``killpg`` 把包装脚本的孙进程一起杀掉（Windows 忽略该参数，
+    那边靠 ``taskkill /T``）。
 
     Args:
         args: 完整命令行（argv[0] 为 ffmpeg 可执行文件）。
@@ -290,10 +315,13 @@ def _run_ffmpeg(args: list[str], timeout: float) -> None:
             text=True,
             encoding="utf-8",
             errors="replace",
+            # POSIX：自成进程组，超时时整组 SIGKILL（见 _kill_process_tree）。
+            # Windows 上该参数被忽略（默认 False），杀树仍靠 taskkill /T。
+            start_new_session=(os.name != "nt"),
         )
     except FileNotFoundError as exc:
         raise MediaToolError(f"ffmpeg 无法启动: {exc}", kind="not_found") from exc
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise MediaToolError(f"ffmpeg 调用失败: {exc}", kind="other") from exc
 
     try:

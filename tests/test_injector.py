@@ -566,3 +566,29 @@ def test_run_ffmpeg_uses_popen_instead_of_run():
     killer = textwrap.dedent(inspect.getsource(media._kill_process_tree))
     assert "taskkill" in killer
     assert "/T" in killer
+
+
+def test_kill_process_tree_covers_posix():
+    """POSIX 分支的存在性守卫 —— 本机（Windows）**跑不了**这条路径。
+
+    为什么需要它：Windows 上是 ``.cmd`` 包装器的孙进程要靠 ``taskkill /T``；
+    POSIX 上 ``proc.kill()`` 同样只杀直接子进程，``ffmpeg.sh`` 的孙进程会继续
+    持有管道。修法是 ``start_new_session=True`` + 整组
+    ``os.killpg(os.getpgid(pid), SIGKILL)``。
+
+    为什么只能守源码：开发/验证机没有 WSL 也没有 docker，POSIX 分支**无法实测**
+    （见 :func:`core.media._kill_process_tree` 的 warning）。所以这条只保证
+    "实现还在、形状没退回去"，不声称跑通；真跑的结果只能由 CI 的 ubuntu lane 给。
+    """
+    import inspect
+    import textwrap
+
+    killer = textwrap.dedent(inspect.getsource(media._kill_process_tree))
+    assert "os.name" in killer
+    assert "taskkill" in killer and "/T" in killer
+    assert "os.killpg" in killer
+    assert "os.getpgid" in killer
+    assert "signal.SIGKILL" in killer
+
+    runner = textwrap.dedent(inspect.getsource(media._run_ffmpeg))
+    assert "start_new_session" in runner
