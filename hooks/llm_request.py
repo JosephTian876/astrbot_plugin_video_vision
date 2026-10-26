@@ -618,7 +618,7 @@ async def _handle(plugin: Any, event: Any, req: Any) -> None:
                 _warned_modality.add(key)
                 logger.warning(
                     "[VideoVision] 模型 %s 的 modalities 未包含 audio，"
-                    "视频块会被清洗成文本。"
+                    "视频块会被替换成文本。"
                     "请在 WebUI 给该模型勾选「音频」模态后重试。",
                     provider_config.get("id") or provider_type,
                 )

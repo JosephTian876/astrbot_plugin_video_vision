@@ -506,7 +506,7 @@ class VideoConfig:
             if candidate < MIN_COMPRESS_MB:
                 warnings.append(
                     f"max_size_mb({self.max_size_mb:g}) 过小：compress_max_mb "
-                    f"必须小于它，而下限是 {MIN_COMPRESS_MB:g}，无法自动修正，"
+                    f"必须小于它，而下限是 {MIN_COMPRESS_MB:g}，插件不会自动修正，"
                     "请把体积闸门调到 1.0 以上"
                 )
             else:

@@ -19,7 +19,7 @@ API 面，其余（``astrbot.core.*`` / ``Context`` / ``AstrMessageEvent``）一
 判决本身（闸门、oversize_action、截断估算、缓存资格、失败分类）全在
 ``core/decide.py``：本模块里不再出现任何 ``if size_mb > config.max_size_mb``。
 0.2.1 这些知识在本文件与 ``main._diagnose`` 各写了一遍，于是产出了"诊断说谎"
-那一族 bug（判定行说「未超限，直接送」，下一行却是「❌ 分类: corrupt」）。
+那一族 bug（结论行说「未超限，直接送」，下一行却是「❌ 分类: corrupt」）。
 
 任何一步失败都返回 ``ok=False`` 的结果，**绝不抛异常打断对话**。
 """
@@ -201,7 +201,7 @@ def _prepare_video(
         has_ffprobe=bool(ffprobe),
     )
     dbg(
-        "判定 超体积=%s 超时长=%s | 闸门=%.1fMB 时长上限=%.1fs 策略=%s | "
+        "结论 超体积=%s 超时长=%s | 闸门=%.1fMB 时长上限=%.1fs 策略=%s | "
         "plan=%s/%s 截断到=%.1fs 可缓存=%s",
         plan.oversize,
         plan.overlong,

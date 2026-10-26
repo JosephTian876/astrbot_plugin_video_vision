@@ -41,6 +41,22 @@ from .placeholder import VIDEO_SUFFIXES
 #: 报告标题（``main`` 在"文件不存在 / 不是文件"这类前置失败时也要用）
 TITLE = "🔍 视频链路诊断"
 
+#: 「这个视频会发生什么」那一行的标签。
+#:
+#: **不要改成「判定」**：0.2.1 用的就是 ``判定   : ``，真机上这条报告被另一个
+#: 插件（``astrbot_plugin_private_companion``）在发出去之前整行删掉了 ——
+#: 它的 ``user_memory.py:9174-9210`` ``_response_review_meta_leak_reason()``
+#: 用 ``(?:判定|审核|复核)(?:结果|结论|原因)?\s*[:：]`` 认「复核模型泄漏了判定
+#: 字段」，``:9212-9235`` 再逐行丢弃命中的行（真机日志
+#: ``astrbot.log`` 21:00:39 / 11:34:53 两条 ERRO ``reason=复核模型输出判定字段``，
+#: 以及 21:00:39 的 ``respond.stage`` 实际发出的正文里没有这一行）。
+#:
+#: 同类风险不止一处：那份守卫还成对使用「中文审核语境词」与
+#: 「无法…清洗/发送/改写」两条正则，两边同时命中同样整行丢弃。本模块所有
+#: 用户可见文本因此都按「不命中那三条正则」来写，``tests/test_interop.py``
+#: 逐行锁住（场景覆盖 + ``clean(text) == text``）。
+VERDICT_LABEL = "结论   :"
+
 #: ``prompt :`` 行最多显示多少字符
 PROMPT_PREVIEW_CHARS = 200
 
@@ -259,11 +275,16 @@ def gate_lines(
             f"① 类型 {provider_type or '未声明'} ❌ 不在允许列表 {sorted(allowed)}"
         )
     if not modalities:
-        gate2 = "② modalities 未声明 → ⚠️ 放行（无法校验，视频块可能被清洗）"
+        # 「无法校验 + 清洗」曾同时命中那份守卫的两条中文正则（见 VERDICT_LABEL
+        # 的说明），真机上这行会和结论行一起消失 —— 现在只说后果。
+        gate2 = "② modalities 未声明 → ⚠️ 放行（视频块可能被替换成 [Audio] 文本）"
     elif "audio" in modalities:
         gate2 = "② modalities 含 audio ✅"
     else:
-        gate2 = "② modalities 不含 audio ❌（视频块会被清洗成 [Audio]）"
+        gate2 = (
+            "② modalities 不含 audio ❌"
+            "（视频块会被替换成 [Audio] 文本，模型看不到画面）"
+        )
     gate3 = f"③ 视觉服务凭据{credentials_summary(cfg)}（本模式不使用）"
     return [
         *lines,
@@ -298,7 +319,7 @@ def render_report(
         cfg: 当前（已归一化的）配置。
         mode: ``effective_provider_mode``。
         probe: 文件事实（体积 / 时长 / 工具路径）。
-        plan: ``decide.classify`` 的判决 —— 判定行**只渲染它**，绝不在这里重算。
+        plan: ``decide.classify`` 的判决 —— 结论行**只渲染它**，绝不在这里重算。
         provider: provider 的三项纯数据；``None`` = 不适用（openai_compat）。
         notices: 启动时的"你的输入被收敛/被忽略"提示。
         warnings: 启动时的"已自动修正"告警。
@@ -370,7 +391,7 @@ def render_report(
         lines.append(f"提醒   : {note}")
 
     # ---- 体积 / 时长判定：只渲染 decide 的判决，绝不在这里重算 ----
-    lines.append(f"判定   : {describe(plan)}")
+    lines.append(f"{VERDICT_LABEL} {describe(plan)}")
 
     # ---- 将要发给视觉服务的 prompt 预览（截断）----
     lines.append(f"prompt : {prompt_preview(cfg, mode)}")

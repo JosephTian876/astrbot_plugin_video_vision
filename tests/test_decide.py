@@ -6,7 +6,7 @@
    ``oversize_action`` 三值、截断估算、corrupt / empty、data URI 上限、无 ffmpeg、
    幂等与不可变；
 2. **判决 vs 真实执行**（最后两条）：拿真 ffmpeg 跑一遍 ``prepare_video``，断言
-   「判定」行说的就是真实发生的（``action`` / ``kind`` 完全一致）。ARCH-REVIEW
+   「结论」行说的就是真实发生的（``action`` / ``kind`` 完全一致）。ARCH-REVIEW
    §6.2-1 把这条列为最该补的测试 —— 本轮重构之后它不再是"两份实现刚好一致"，
    而是"同一份判决"。
 """
@@ -297,14 +297,14 @@ def test_reject_does_not_print_a_compress_target_note():
 
 
 def test_missing_ffmpeg_keeps_the_intended_action_but_blocks():
-    """判决仍是"压缩"（判定行因此不变），失败由 reason_code 说明。"""
+    """判决仍是"压缩"（结论行因此不变），失败由 reason_code 说明。"""
     plan = classify(size_mb=20.0, duration_sec=2.0, config=BASE, has_ffmpeg=False)
 
     assert plan.action == "compress"
     assert plan.reason_code == "no_ffmpeg"
     assert plan.kind == "not_found" and plan.blocked is True
     assert plan.needs_ffmpeg is True
-    # 判定行与 0.2.1 一致：超限就报策略标签，不在诊断里预告"没装 ffmpeg"
+    # 结论行与 0.2.1 一致：超限就报策略标签，不在诊断里预告"没装 ffmpeg"
     assert describe(plan) == "体积 20.0MB > 闸门 13.0MB → 压缩"
 
 
@@ -559,7 +559,7 @@ def _decide_and_run(cfg, path, cache_root=None):
 def test_gate_matrix_matches_the_real_execution(
     label, options, media_tools, ffmpeg_dir, noisy_video, stub_logger
 ):
-    """判定行说什么，``prepare_video`` 就必须做什么（ARCH-REVIEW §6.2-1）。"""
+    """结论行说什么，``prepare_video`` 就必须做什么（ARCH-REVIEW §6.2-1）。"""
     cfg = VideoConfig(
         ffmpeg_path=ffmpeg_dir, cache_enabled=False, **options
     )
@@ -576,14 +576,14 @@ def test_gate_matrix_matches_the_real_execution(
     injection = outcome.injection
     assert injection is not None
     assert injection.action == plan.outcome_action, f"{label}: {injection.action}"
-    if plan.note:  # 压缩/截断产物的说明必须包含判定行的触发条件
+    if plan.note:  # 压缩/截断产物的说明必须包含结论行的触发条件
         assert injection.note.startswith(plan.note), f"{label}: {injection.note}"
 
 
 def test_failure_matrix_matches_the_real_execution(
     media_tools, ffmpeg_dir, tmp_path, stub_logger
 ):
-    """空 / 损坏 / 没装 ffmpeg：判定行的分类必须等于真实 ``kind``。"""
+    """空 / 损坏 / 没装 ffmpeg：结论行的分类必须等于真实 ``kind``。"""
     empty = tmp_path / "empty.mp4"
     empty.write_bytes(b"")
     broken = tmp_path / "broken.mp4"

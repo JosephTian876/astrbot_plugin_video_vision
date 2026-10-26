@@ -1,8 +1,8 @@
 """「一个视频会发生什么」的**唯一真相源**。
 
 0.2.1 把同一份判定写了三遍：``injector`` 执行时算一遍，``main._diagnose`` 为了打印
-「判定」行再算一遍（注释写着"必须与 injector 完全一致"），``hooks`` 又按字符串猜
-一遍失败原因。改一条规则要动三个文件，漏一处就产出"诊断说谎"——判定行说
+「结论」行再算一遍（注释写着"必须与 injector 完全一致"），``hooks`` 又按字符串猜
+一遍失败原因。改一条规则要动三个文件，漏一处就产出"诊断说谎"——结论行说
 「未超限，直接送」，下一行却是「❌ 分类: corrupt」（真机复现两次）。
 
 这里只有一个**纯函数** :func:`classify`：吃事实（体积 / 时长 / 配置 / 工具能力），
@@ -165,7 +165,7 @@ class MediaPlan:
 
     ``action`` 与 ``reason_code`` 是两个维度：``action="compress", reason_code=
     "no_ffmpeg"`` 表示"本该压，但没有 ffmpeg，执行会以 not_found 失败"；折成
-    ``action="reject"`` 会让判定行从「→ 压缩」变成「→ 拒绝」，那是行为变化。
+    ``action="reject"`` 会让结论行从「→ 压缩」变成「→ 拒绝」，那是行为变化。
     """
 
     action: str  # as-is | compress | truncate | reject（后三者同 oversize_action）
@@ -240,7 +240,11 @@ def classify(
     }
 
     if size_mb <= 0:  # 0 字节 / 读不到体积：当"未超限"等于喂给模型空内容
-        empty_note = "文件是 0 字节（或无法读取体积），拒绝发送"
+        # 这行会原样出现在 ``/videotest`` 的「原因:」行里，因此同样受
+        # ``tests/test_interop.py`` 的跨插件兼容约束：不能出现
+        # 「拒绝…发送」这种会被守卫当成复核评语的中文搭配（见
+        # ``core/diagnostics.VERDICT_LABEL`` 的说明）。
+        empty_note = "文件是 0 字节（或读不出体积），不会发送"
         return MediaPlan(action="reject", **facts, reason_code="empty", note=empty_note)
     # 有 ffprobe 却读不出时长 + 后缀是视频容器 -> 损坏；没有 ffprobe 时不误伤
     if has_ffprobe and duration_sec <= 0 and _looks_like_video(mime_or_suffix):
@@ -311,7 +315,7 @@ def classify(
 
 
 def describe(plan: MediaPlan) -> str:
-    """把判决渲染成 ``/videotest`` 的「判定」行正文（不含 ``判定   : `` 前缀）。
+    """把判决渲染成 ``/videotest`` 的「结论」行正文（不含 ``结论   : `` 前缀）。
 
     只做渲染：文案是真机验证过的契约（README 与 ``tests/test_docs.py`` 逐字引用），
     任何"改一句更好懂"都算行为变化，必须单独提交。

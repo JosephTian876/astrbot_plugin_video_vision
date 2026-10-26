@@ -183,11 +183,11 @@ def test_resolving_the_compress_budget_is_idempotent():
             )
             again, warnings = cfg.normalized()
             assert again == cfg, (gate, asked, cfg)
-            # 压缩预算这条不变量必须已经满足：不会再"自动下调"或"无法修正"
+            # 压缩预算这条不变量必须已经满足：不会再"自动下调"或"不会自动修正"
             assert not [
                 item
                 for item in warnings
-                if "已自动下调" in item or "无法自动修正" in item
+                if "已自动下调" in item or "不会自动修正" in item
             ], (gate, asked, warnings)
             # 再走一遍 from_mapping 也必须零提示（同一个值进、同一个值出）
             recycled, notices = VideoConfig.from_mapping_detailed(
@@ -222,12 +222,16 @@ def test_normalized_tiny_gate_stays_solvable_and_under_the_gate():
 
 
 def test_normalized_reports_unsolvable_tiny_gate():
-    """0.5MB 闸门下 compress_max_mb 无解：必须显式告警，不能假装修好。"""
+    """0.5MB 闸门下 compress_max_mb 无解：必须显式告警，不能假装修好。
+
+    措辞是「插件不会自动修正」而**不是**「无法自动修正」：后者会被陪伴插件的
+    复核评语守卫判成「无法…修正」那种审核评语（`tests/test_interop.py`）。
+    """
     cfg, warnings = VideoConfig(
         max_size_mb=0.5, compress_max_mb=0.5
     ).normalized()
     assert cfg.compress_max_mb == 0.5
-    assert any("无法自动修正" in item for item in warnings)
+    assert any("不会自动修正" in item for item in warnings)
 
 
 def test_normalized_clamps_crf():

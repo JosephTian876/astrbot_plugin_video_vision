@@ -116,7 +116,7 @@ def test_render_report_is_byte_exact_for_the_documented_example():
         "         ② modalities 含 audio ✅\n"
         "         ③ 视觉服务凭据 ❌ 缺 openai_base_url、openai_api_key"
         "（本模式不使用）\n"
-        "判定   : 体积 21.8MB > 闸门 13.0MB → 压缩\n"
+        "结论   : 体积 21.8MB > 闸门 13.0MB → 压缩\n"
         "prompt : （gemini_native 不调用视觉服务，无 prompt）\n"
         "\n"
         "✅ 准备成功（0.64s）\n"
@@ -150,7 +150,7 @@ def test_render_report_reports_the_failure_kind_and_reason():
     )
 
     assert "时长: 读取失败" in report
-    assert "判定   : 无法解析（时长读取失败）→ 会以 corrupt 失败" in report
+    assert "结论   : 无法解析（时长读取失败）→ 会以 corrupt 失败" in report
     assert report.endswith(
         "❌ 准备失败（0.08s）\n"
         "分类: corrupt\n"
@@ -349,7 +349,9 @@ def test_gate_lines_render_each_gate1_branch():
         gate_lines(cfg, provider_type="openai_chat_completion", modalities=["text"])
     )
     assert "① 类型 openai_chat_completion ❌ 不在允许列表" in blocked
-    assert "② modalities 不含 audio ❌（视频块会被清洗成 [Audio]）" in blocked
+    assert (
+        "② modalities 不含 audio ❌（视频块会被替换成 [Audio] 文本，模型看不到画面）"
+    ) in blocked
 
     no_modalities = "\n".join(
         gate_lines(cfg, provider_type=allowed, modalities=None)
@@ -358,7 +360,9 @@ def test_gate_lines_render_each_gate1_branch():
         "provider: type=googlegenai_chat_completion "
         "id=未声明 modalities=[未声明]"
     ) in no_modalities
-    assert "② modalities 未声明 → ⚠️ 放行（无法校验，视频块可能被清洗）" in no_modalities
+    assert (
+        "② modalities 未声明 → ⚠️ 放行（视频块可能被替换成 [Audio] 文本）"
+    ) in no_modalities
 
     unresolved = "\n".join(gate_lines(cfg, error="no-context"))
     assert "provider: type=未声明 id=未声明 modalities=[未声明]" in unresolved

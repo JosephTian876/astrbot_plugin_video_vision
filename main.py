@@ -375,7 +375,7 @@ class VideoVisionPlugin(Star):
             ffmpeg=self.ffmpeg or "",
             ffprobe=self.ffprobe or "",
         )
-        # 判定与实际执行吃同一个 MediaPlan（``core/decide.py``）：判定行结构上
+        # 判决与实际执行吃同一个 MediaPlan（``core/decide.py``）：结论行结构上
         # 不可能再与下面的真实结果分叉（真机证据见 LIVE-TEST §10.2②）。
         plan = classify(
             size_mb=size_mb,

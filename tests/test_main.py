@@ -297,7 +297,7 @@ def test_diagnose_refuses_non_video_extension_honestly(
 def test_diagnose_corrupt_judgement_matches_the_outcome(
     media_tools, ffmpeg_dir, tmp_path, stub_logger
 ):
-    """回归：判定行写"未超限，直接送"，紧接着"❌ 准备失败 分类: corrupt"。
+    """回归：结论行写"未超限，直接送"，紧接着"❌ 准备失败 分类: corrupt"。
 
     真机证据见 LIVE-TEST §10.2②（broken.mp4：2MB 随机字节）。
     """
@@ -310,16 +310,16 @@ def test_diagnose_corrupt_judgement_matches_the_outcome(
 
     report = run(plugin._diagnose(str(broken), event=_Event()))
 
-    assert "判定   : 无法解析（时长读取失败）→ 会以 corrupt 失败" in report
+    assert "结论   : 无法解析（时长读取失败）→ 会以 corrupt 失败" in report
     assert "未超限，直接送" not in report
-    # 判定行必须和随后的真实结果一致
+    # 结论行必须和随后的真实结果一致
     assert "分类: corrupt" in report
 
 
 def test_diagnose_corrupt_judgement_stays_silent_without_ffprobe(
     tmp_path, stub_logger
 ):
-    """没有 ffprobe 时不误伤：injector 不判 corrupt，判定行也不能提前说 corrupt。"""
+    """没有 ffprobe 时不误伤：injector 不判 corrupt，结论行也不能提前说 corrupt。"""
     broken = tmp_path / "broken.mp4"
     broken.write_bytes(b"\x00\x01\x02not a video" * 500)
     plugin = make_plugin(
@@ -363,7 +363,7 @@ def test_diagnose_flags_the_guessed_mime_for_unknown_suffixes(
 
     report = run(plugin._diagnose(str(gif), event=_Event()))
 
-    # ① 一行明确警示（就放在判定行上方）
+    # ① 一行明确警示（就放在结论行上方）
     assert (
         "提醒   : ⚠️ 扩展名 .gif 不在已知视频容器内：显式路径不校验扩展名，"
         "将以 video/mp4 发送，provider 可能拒绝"
