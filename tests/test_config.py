@@ -136,12 +136,26 @@ def test_compress_budget_never_exceeds_gate():
 
 
 def test_normalized_lowers_compress_below_gate():
+    """13/15 这组自相矛盾的配置：目标贴着闸门下方（90%），不是砍到 60%。"""
     cfg, warnings = VideoConfig.from_mapping(
-        {"max_size_mb": 13, "compress_max_mb": 20}
+        {"max_size_mb": 13, "compress_max_mb": 15}
     ).normalized()
     assert cfg.compress_max_mb < 13
-    assert cfg.compress_max_mb == pytest.approx(13 * 0.6)
+    assert cfg.compress_max_mb == pytest.approx(11.7)
     assert any("已自动下调" in item for item in warnings)
+
+
+def test_normalized_tiny_gate_stays_solvable_and_under_the_gate():
+    """1.0MB 闸门：0.9 仍在 [MIN_COMPRESS_MB, 闸门) 内，不能越界也不能死循环。"""
+    cfg, warnings = VideoConfig(
+        max_size_mb=1.0, compress_max_mb=2.0
+    ).normalized()
+    assert cfg.compress_max_mb < 1.0
+    assert cfg.compress_max_mb >= getattr(config_mod, "MIN_COMPRESS_MB", 0.5)
+    assert any("已自动下调" in item for item in warnings)
+    again, again_warnings = cfg.normalized()
+    assert again == cfg
+    assert again_warnings == []
 
 
 def test_normalized_reports_unsolvable_tiny_gate():

@@ -360,12 +360,13 @@ class VideoConfig:
 
         能自动修正的：
 
-        - ``compress_max_mb >= max_size_mb`` —— 那样压缩完仍然超限；
+        - ``compress_max_mb >= max_size_mb`` —— 那样压缩完仍然超限，下调到
+          **闸门的 90%**（贴着闸门下方留约 10% 余量，理由见函数体注释）；
         - ``compress_crf > 51`` —— 超出 H.264 上限。
 
         不能自动修正的**显式告警**，交给用户决定：
 
-        - ``max_size_mb`` 太小（0.83MB 以下时 ``compress_max_mb`` 无论如何都
+        - ``max_size_mb`` 太小（0.56MB 以下时 ``compress_max_mb`` 无论如何都
           不小于它，旧代码 ``max(0.5, max_size_mb * 0.6)`` 在 0.5MB 处会原地
           打转却只报"已自动下调为 0.5"，等于错报成功）；
         - ``oversize_action="truncate"`` 但 ``max_duration_sec<=0`` —— 截断永远
@@ -375,7 +376,22 @@ class VideoConfig:
         warnings: list[str] = []
         ceiling = self.compress_max_mb
         if ceiling >= self.max_size_mb:
-            candidate = self.max_size_mb * 0.6
+            # 目标是"贴着闸门下方"，不是砍到一半：0.6 会让 13MB 闸门只剩
+            # 7.8MB，而码率预算本来就是从这个目标反推的（media.py 的
+            # budget_kbits 按 max_mb 算），等于白白牺牲一半画质。
+            # 为什么是 0.9：
+            #   1) 压缩器自己已按 max_mb 反推码率并给容器与音频留了 8% 余量
+            #      （media.py: budget_kbits = max_mb * 8192 * 0.92），这 8% 与
+            #      这里的 10% 是**叠加**的，常规产物落在闸门的 ~83%；
+            #   2) 真正的硬上限是 -fs "写满即停"，实测溢出 1.03x（0.5MB 预算
+            #      -> 532KB）；越小的预算里固定开销占比越高，最坏 1.28x 出现
+            #      在 0.2MB 这种极小预算上（见 FIX-REPORT §3.3-1）。10% 余量
+            #      在 0.5MB 以上这一档吸收得掉；
+            #   3) 万一越过闸门，injector 压缩后会复核体积并记下
+            #      "仍超闸门，已尽力"，不会静默宣称成功。
+            # 系数 < 1 保证候选值严格小于闸门，所以 normalized() 幂等（再跑
+            # 一次不会又改），也不会在 0.9 与闸门之间来回打转。
+            candidate = self.max_size_mb * 0.9
             if candidate < MIN_COMPRESS_MB:
                 warnings.append(
                     f"max_size_mb({self.max_size_mb:g}) 过小：compress_max_mb "

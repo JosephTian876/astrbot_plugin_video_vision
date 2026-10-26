@@ -70,7 +70,11 @@
   `cache_max_mb ≤ 65536`、`max_video_count ≤ 10`、`max_compress_seconds ≤ 600`、
   `openai_timeout_sec ≤ 3600`、`openai_max_tokens ≤ 100000`。
   被收敛的值会在加载日志里提示一条。
-- `normalized()` 对**无法自动修正**的矛盾显式告警：`max_size_mb` 小于 0.83MB
+- `normalized()` 把 `compress_max_mb >= max_size_mb` 的目标下调到**闸门的 90%**
+  （贴着闸门下方留 10% 余量；压缩器本身已按 `max_mb` 反推码率并留 8% 容器余量，
+  `-fs` 实测溢出 1.03–1.28×，此前砍到 60% 等于白白牺牲一半画质 —— 13MB 闸门下
+  7.8MB 变 11.7MB）。
+- `normalized()` 对**无法自动修正**的矛盾显式告警：`max_size_mb` 小于 0.56MB
   时 `compress_max_mb` 无解（旧代码会报告"已自动下调"却没真的修好）、
   `oversize_action=truncate` 配 `max_duration_sec<=0`、
   `compress_max_mb >= cache_max_mb`。
