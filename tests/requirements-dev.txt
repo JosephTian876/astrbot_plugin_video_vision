@@ -1,0 +1,13 @@
+# 测试/CI 依赖（**不是**插件运行时依赖）。
+#
+# 插件本身不引入任何第三方 Python 包：`requirements.txt` 必须保持只有注释，
+# 那是插件市场的硬约束（`tests/test_docs.py::test_requirements_has_no_new_runtime_dependency`）。
+#
+# 这里的东西只在跑测试与 CI 时需要：
+# - pytest    ：测试框架（CI 用 --junitxml 出报告）
+# - httpx     ：给 `core/openai_vision.py` 的 HTTP 客户端用；真实 AstrBot 经
+#               google-genai 自带它，测试机上必须自己装
+# - PyYAML    ：校验 `.github/workflows/ci.yml` 的语法（tests/test_ci.py）
+pytest==9.1.1
+httpx>=0.28,<0.29
+PyYAML>=6.0,<7

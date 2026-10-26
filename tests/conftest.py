@@ -40,15 +40,19 @@ if PLUGIN_PACKAGE not in sys.modules:
 
 
 def _find_media_tools() -> tuple[str, str] | None:
-    """定位 ffmpeg / ffprobe：环境变量 -> D:\\ffmpeg\\bin -> PATH。"""
-    candidates = [os.environ.get("VV_FFMPEG_DIR", ""), r"D:\ffmpeg\bin"]
-    for candidate in candidates:
-        if not candidate:
-            continue
-        ffmpeg = Path(candidate) / "ffmpeg.exe"
-        ffprobe = Path(candidate) / "ffprobe.exe"
-        if ffmpeg.is_file() and ffprobe.is_file():
-            return str(ffmpeg), str(ffprobe)
+    """定位 ffmpeg / ffprobe：``VV_FFMPEG_DIR`` -> ``PATH``。
+
+    刻意**不再**硬编码 ``D:\\ffmpeg\\bin``（0.2.1 的做法）：那是开发机的私有路径，
+    写进公开仓库没有意义；更糟的是它**优先于 PATH**，于是本机永远测不到"PATH 上
+    有 ffmpeg"这条路径，CI 上的行为也就无法在本地复现。
+    """
+    directory = os.environ.get("VV_FFMPEG_DIR", "")
+    if directory:
+        for name in ("ffmpeg", "ffmpeg.exe"):
+            ffmpeg = Path(directory) / name
+            ffprobe = Path(directory) / name.replace("ffmpeg", "ffprobe")
+            if ffmpeg.is_file() and ffprobe.is_file():
+                return str(ffmpeg), str(ffprobe)
     ffmpeg = shutil.which("ffmpeg")
     ffprobe = shutil.which("ffprobe")
     if ffmpeg and ffprobe:
@@ -56,14 +60,37 @@ def _find_media_tools() -> tuple[str, str] | None:
     return None
 
 
+def _ffmpeg_is_required() -> bool:
+    """``VV_REQUIRE_FFMPEG=1`` 时缺 ffmpeg 必须**失败**，不能静默跳过。
+
+    否则 CI 会绿得莫名其妙：29 个用例（含参数化约 40+ 例）只是被 skip，
+    覆盖腰斩而没人发现（ARCH-REVIEW §7.3-6）。
+    """
+    return os.environ.get("VV_REQUIRE_FFMPEG", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 MEDIA_TOOLS = _find_media_tools()
+
+#: 缺 ffmpeg 时给用户看的那句话（skip 与 fail 共用）
+_FFMPEG_HELP = "需要真实 ffmpeg/ffprobe（可用 VV_FFMPEG_DIR 指定所在目录，或装进 PATH）"
 
 
 @pytest.fixture(scope="session")
 def media_tools() -> tuple[str, str]:
     """(ffmpeg, ffprobe) 真实可执行文件路径；没有则跳过相关用例。"""
     if MEDIA_TOOLS is None:
-        pytest.skip("需要真实 ffmpeg/ffprobe（可用 VV_FFMPEG_DIR 指定所在目录）")
+        if _ffmpeg_is_required():
+            pytest.fail(
+                f"{_FFMPEG_HELP}；当前 VV_REQUIRE_FFMPEG=1，缺 ffmpeg 视为失败"
+                "（CI 里就是这么设的）",
+                pytrace=False,
+            )
+        pytest.skip(_FFMPEG_HELP)
     return MEDIA_TOOLS
 
 

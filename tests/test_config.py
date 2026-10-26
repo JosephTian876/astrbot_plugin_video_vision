@@ -201,7 +201,7 @@ def test_compress_budget_below_the_lower_bound_is_reported_once():
     cfg, notices = VideoConfig.from_mapping_detailed(
         {"max_size_mb": 13.0, "compress_max_mb": 0.1}
     )
-    assert cfg.compress_max_mb == pytest.approx(getattr(config_mod, "MIN_COMPRESS_MB"))
+    assert cfg.compress_max_mb == pytest.approx(config_mod.MIN_COMPRESS_MB)
     budget_notices = [item for item in notices if "compress_max_mb" in item]
     assert budget_notices == [
         "compress_max_mb=0.1 低于下限 0.5，已收敛为 0.5"

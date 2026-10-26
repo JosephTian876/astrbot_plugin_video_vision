@@ -23,7 +23,6 @@ import pytest
 from vv_plugin.core import diagnostics
 from vv_plugin.core.config import VideoConfig
 from vv_plugin.core.decide import classify
-from vv_plugin.core.injector import PrepareOutcome, VideoInjection
 from vv_plugin.core.diagnostics import (
     ProbeFacts,
     ProviderFacts,
@@ -33,6 +32,7 @@ from vv_plugin.core.diagnostics import (
     startup_lines,
     videotest_usage,
 )
+from vv_plugin.core.injector import PrepareOutcome, VideoInjection
 
 REPO = Path(__file__).resolve().parents[1]
 MODULE_PATH = REPO / "core" / "diagnostics.py"

@@ -275,7 +275,12 @@ def test_fs_really_caps_output_size(media_tools, long_video, tmp_path):
     )
 
     size_mb = output.stat().st_size / 1024 / 1024
-    assert size_mb <= budget * 1.15, f"体积硬上限失效: {size_mb:.2f}MB"
+    # 上界 1.30 = 文档自述的最坏溢出（media.py 的 -fs 说明：实测 1.03–1.28×）。
+    # 为什么不能卡 1.15：溢出量取决于 ffmpeg 的 libavformat 版本 —— 本机是
+    # N-125551，Ubuntu 24.04 是 6.1，Windows choco 是 7.x/8.x；同一份输入在不同
+    # 版本上封口位置不同（越小的预算固定开销占比越高，最坏 1.28× 出现在极小预算）。
+    # 这条用例要锁的是"有硬上限"，不是"某个版本的字节数"，所以按文档的最坏值取界。
+    assert size_mb <= budget * 1.30, f"体积硬上限失效: {size_mb:.2f}MB"
     # -fs 触顶时 ffmpeg 会提前封口：产物时长明显短于 30s 的源
     assert probe_duration(output, ffprobe) < 25.0
 

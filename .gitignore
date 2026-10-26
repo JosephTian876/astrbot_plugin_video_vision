@@ -6,6 +6,9 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
+# 测试产物（CI 用 --junitxml 出报告并作为 artifact 上传）
+junit-*.xml
+
 # 插件运行时产物
 video_vision_cache/
 *.log

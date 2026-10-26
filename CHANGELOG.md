@@ -137,6 +137,26 @@
   `hooks` 与 `main` 各写一遍收成 `decide.allowed_provider_types()` 一份，
   闸门 ① 的判定与渲染从此不可能分叉。
 
+### CI 与测试基建
+
+- 新增 `.github/workflows/ci.yml`（仓库此前**零 CI**）：`ruff check` 固定
+  `0.15.22`（AstrBot 自己 pin 的版本 —— 同一个仓库 `0.17.x` 的默认规则集会报
+  31 个 error，不 pin 的门禁等于没有门禁）+ `pytest` 矩阵
+  `{ubuntu-latest, windows-latest} × {3.10, 3.11, 3.12, 3.13}`，
+  `--junitxml` 存 artifact，`concurrency` 取消旧跑，单 job 15 分钟超时。
+- 测试依赖单独放 `tests/requirements-dev.txt`（pytest / httpx / PyYAML）；
+  `requirements.txt` 仍保持"只有注释"（插件市场约束）。
+- `VV_REQUIRE_FFMPEG=1`：设了它时缺 ffmpeg 是**失败**而不是静默 skip
+  （CI 里设上）。此前缺 ffmpeg 时约 40 例会悄悄消失，CI 照样绿。
+- 删掉 `tests/conftest.py` 里硬编码的 `D:/ffmpeg/bin`（开发机私有路径，而且
+  它**优先于 PATH**，本机永远测不到"PATH 上有 ffmpeg"这条路径）；改为
+  `VV_FFMPEG_DIR` -> `PATH` 两级查找。
+- 三处 CI 不稳点：`-fs` 体积断言按文档自述的最坏值放宽到 1.30×（溢出量取决于
+  libavformat 版本）、滴灌假端点从 64 轮降到 8 轮（teardown 少等二十多秒）、
+  `pytest.ini` 打开 `--strict-config --strict-markers`。
+- 新增 `tests/test_ci.py`（14 例）：用 PyYAML 解析 workflow 并断言 pin 的版本、
+  矩阵、超时、artifact 与 `VV_REQUIRE_FFMPEG`；上面三处不稳点修复也写成回归断言。
+
 ## 0.2.0
 
 新增 **openai_compat 模式**：配置文件可自定义 OpenAI 兼容视觉服务商。

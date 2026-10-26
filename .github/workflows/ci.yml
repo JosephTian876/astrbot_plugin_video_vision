@@ -1,0 +1,106 @@
+name: CI
+
+# 门禁只有两条：ruff（pin 到 AstrBot 自己用的版本）与 pytest（2 平台 × 4 版本）。
+# 不跑 ruff format（本仓库尚未 format，见 ARCH-REVIEW §7.1：format 门禁应单独一个提交）。
+
+on:
+  push:
+    branches: [main, master, "fix/**", "feat/**"]
+    paths-ignore: ["**/*.md", "logo.png"]
+  pull_request:
+  workflow_dispatch:
+
+# 同一分支连续推送时取消旧的一跑（矩阵 8 lane，旧跑白占 runner）
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUNBUFFERED: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  # 缺 ffmpeg 时**失败**而不是静默 skip（否则 CI 绿得莫名其妙：约 40 例被跳过）
+  VV_REQUIRE_FFMPEG: "1"
+
+jobs:
+  lint:
+    name: lint (ruff 0.15.22)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # 必须 pin：同一个仓库
+      #   ruff 0.15.22（AstrBot 的 pin）→ All checks passed!
+      #   ruff 0.17.x（默认规则已扩）  → 30 个 error
+      # 不 pin 的 lint 门禁等于没有门禁。
+      - name: Install pinned ruff
+        run: python -m pip install "ruff==0.15.22"
+
+      - name: ruff check
+        run: ruff check --output-format=github .
+
+  test:
+    name: pytest ${{ matrix.os }} / py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    defaults:
+      run:
+        # Windows runner 默认 pwsh；用 bash 让两端命令一致
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+          cache-dependency-path: tests/requirements-dev.txt
+
+      - name: Install ffmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - name: Install ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          if command -v ffmpeg >/dev/null 2>&1; then
+            echo "ffmpeg already on PATH"
+          else
+            choco install ffmpeg --no-progress -y
+            echo "C:/ProgramData/chocolatey/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Install test deps
+        run: python -m pip install -r tests/requirements-dev.txt
+
+      # VV_REQUIRE_FFMPEG=1：这一步红了就是 runner 没装好，比后面 40 例静默 skip 好
+      - name: Show toolchain
+        run: |
+          python -V
+          ffmpeg -version | head -n 1
+          ffprobe -version | head -n 1
+
+      - name: pytest
+        run: >
+          python -m pytest -q
+          --junitxml=junit-${{ matrix.os }}-py${{ matrix.python }}.xml
+
+      - name: Upload junit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-${{ matrix.os }}-py${{ matrix.python }}
+          path: junit-*.xml
+          retention-days: 7
+          if-no-files-found: warn

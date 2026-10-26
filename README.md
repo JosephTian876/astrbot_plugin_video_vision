@@ -381,6 +381,8 @@ astrbot_plugin_video_vision/
 ├── main.py                 插件入口：注册钩子与 /videotest
 ├── _conf_schema.json       WebUI 配置 schema
 ├── metadata.yaml
+├── .github/workflows/ci.yml  lint（ruff 0.15.22）+ pytest 2 平台 × 4 版本
+├── tests/                  pytest 套件（stubs/ 里是 astrbot 的最小桩）
 ├── core/                   与 AstrBot 解耦的纯逻辑（便于日后上移核心）
 │   ├── config.py           配置模型与容错
 │   ├── decide.py           「会发生什么」的唯一真相源（纯函数：闸门/策略/截断/分类）
@@ -397,6 +399,19 @@ astrbot_plugin_video_vision/
 任何符号（插件市场安全检查要求日志记录器必须且只能来自 `astrbot.api`，所以这一处
 是有意保留的）。其余纯逻辑（`config` / `decide` / `diagnostics` / `media` /
 `openai_vision` / `placeholder`）可以直接搬进 AstrBot 核心。
+
+### CI
+
+`.github/workflows/ci.yml` 两条门禁：
+
+| job | 内容 |
+|---|---|
+| `lint` | `ruff check`，**pin 到 `0.15.22`**（AstrBot 自己 pin 的版本）。不 pin 就没有门禁：同一个仓库 `ruff 0.17.x` 的默认规则集会报 31 个 error |
+| `test` | `pytest -q --junitxml=…`，矩阵 `{ubuntu-latest, windows-latest} × {3.10, 3.11, 3.12, 3.13}`，单 job 15 分钟超时，junit 报告作为 artifact 上传 |
+
+CI 里设了 **`VV_REQUIRE_FFMPEG=1`**：缺 ffmpeg 时相关用例**失败**而不是静默 skip
+——否则约 40 例会悄悄消失，CI 照样绿。本机跑测试时可用 `VV_FFMPEG_DIR=<目录>`
+指定 ffmpeg 所在目录（不设则从 `PATH` 找）。
 
 ---
 

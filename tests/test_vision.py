@@ -82,13 +82,20 @@ class _Handler(BaseHTTPRequestHandler):
             pass
 
     def _drip(self) -> None:
-        """每 0.5s 吐 1 字节：httpx 的分阶段超时永远碰不到，只能靠整体上限。"""
+        """每 0.5s 吐 1 字节：httpx 的分阶段超时永远碰不到，只能靠整体上限。
+
+        循环次数刻意压到 8（4 秒）：客户端在 1.0 秒的整体超时就断开并结束用例，
+        但这个**服务端线程**要一直滴到循环结束才退出，``server.shutdown()`` 之后的
+        ``thread.join(timeout=10)`` 会陪它等 —— 0.2.1 的 64 轮（32 秒）足够让 2 vCPU
+        的 CI runner 在 teardown 上超时。8 轮仍远超 1.0 秒的客户端预算，
+        "整体超时"这条语义不变。
+        """
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", "64")
         self.end_headers()
         try:
-            for _ in range(64):
+            for _ in range(8):
                 self.wfile.write(b" ")
                 self.wfile.flush()
                 time.sleep(0.5)
