@@ -15,8 +15,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
+from typing import Any
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -38,7 +40,12 @@ from .core.injector import prepare_video
 from .core.media import file_size_mb, probe_duration, resolve_ffmpeg_tools
 from .core.openai_vision import analyze_video, build_vision_prompt
 from .core.placeholder import VIDEO_SUFFIXES, VideoPlaceholder
-from .hooks.llm_request import handle_llm_request
+from .hooks.llm_request import (
+    GEMINI_PROVIDER_TYPES,
+    handle_llm_request,
+    mark_degradation_warned,
+    resolve_provider,
+)
 
 PLUGIN_NAME = "astrbot_plugin_video_vision"
 PLUGIN_REPO = "https://github.com/JosephTian876/astrbot_plugin_video_vision"
@@ -85,6 +92,26 @@ def _resolve_cache_root() -> str:
     return os.path.join(base, "plugin_data", PLUGIN_NAME, "cache")
 
 
+def _missing_credentials(cfg: VideoConfig) -> list[str]:
+    """视觉服务三要素里缺哪几项（凭据齐全性诊断用）。"""
+    missing: list[str] = []
+    if not cfg.openai_base_url:
+        missing.append("openai_base_url")
+    if not cfg.openai_api_key:
+        missing.append("openai_api_key")
+    if not cfg.openai_model:
+        missing.append("openai_model")
+    return missing
+
+
+def _credentials_summary(cfg: VideoConfig) -> str:
+    """一行"凭据是否齐全"，供 /videotest 使用。"""
+    missing = _missing_credentials(cfg)
+    if not missing:
+        return " ✅ base_url / api_key / model 齐全"
+    return f" ❌ 缺 {'、'.join(missing)}"
+
+
 @register(
     PLUGIN_NAME,
     "JosephTian876",
@@ -99,8 +126,13 @@ class VideoVisionPlugin(Star):
         super().__init__(context)
 
         self.raw_config: dict = dict(config or {})
-        resolved, warnings = VideoConfig.from_mapping(self.raw_config).normalized()
+        # from_mapping_detailed 额外返回「未知 / 拼错的键」与「被上下界收敛的值」
+        # —— 0.2.0 对这两类完全静默，用户只会奇怪"为什么配置没生效"。
+        resolved, notices = VideoConfig.from_mapping_detailed(self.raw_config)
+        resolved, warnings = resolved.normalized()
         self.config: VideoConfig = resolved
+        for notice in notices:
+            logger.warning("[VideoVision] 配置提示: %s", notice)
         for warning in warnings:
             logger.warning("[VideoVision] 配置已自动修正: %s", warning)
 
@@ -138,7 +170,8 @@ class VideoVisionPlugin(Star):
             if not masked:
                 masked = "已配置" if key else "未配置"
             logger.info(
-                "[VideoVision] 模式=openai_compat | 视觉服务=%s | 模型=%s | key=%s | 超时=%.0fs",
+                "[VideoVision] 模式=openai_compat | 视觉服务=%s | 模型=%s | "
+                "key=%s | 超时=%.0fs",
                 self.config.openai_base_url or "未配置",
                 self.config.openai_model,
                 masked,
@@ -156,6 +189,8 @@ class VideoVisionPlugin(Star):
                 "（老配置零改动仍可继续用）。要使用 OpenAI 兼容视觉服务，"
                 "请把这三项补齐。"
             )
+            # 承诺是"只告警一次"：启动这条信息最完整，钩子里不再重复刷
+            mark_degradation_warned()
         if not ffmpeg:
             logger.warning(
                 "[VideoVision] 未找到 ffmpeg：超限视频将无法压缩，会被直接跳过。"
@@ -172,8 +207,22 @@ class VideoVisionPlugin(Star):
 
     # ------------------------------------------------------------ 调试指令
     @filter.command("videotest", alias={"视频测试"})
-    async def cmd_videotest(self, event: AstrMessageEvent, path: GreedyStr = ""):
-        """逐步诊断视频处理链路（仅管理员）。"""
+    async def cmd_videotest(self, event: AstrMessageEvent, path: GreedyStr):
+        """逐步诊断视频处理链路（仅管理员）。
+
+        **``path`` 绝对不能写默认值**。框架的 ``CommandFilter.init_handler_md``
+        （``astrbot/core/star/filter/command.py:76-79``）在参数**有默认值**时存的
+        是默认值本身（``""``），而 ``validate_and_convert_params``
+        （``:101-102``）用 ``param_type_or_default_val is GreedyStr`` 判断贪婪
+        参数 —— 所以 0.2.0 的 ``path: GreedyStr = ""`` 让 ``is_greedy`` 恒为
+        ``False``，只取**第一个 token**：
+        ``/videotest "C:\\Program Files\\a.mp4"`` 会变成 ``C:\\Program`` →
+        "文件不存在"。
+
+        现在按框架自身的写法（``astrbot/core/builtin_stars/builtin_commands/
+        main.py:40``）去掉默认值；无参数时框架把 ``params[i:]`` 的空列表 join
+        成空串传进来，行为与原来的默认值一致。
+        """
         if str(getattr(event, "role", "") or "") != "admin":
             yield event.plain_result("该指令仅管理员可用。")
             return
@@ -186,12 +235,13 @@ class VideoVisionPlugin(Star):
             yield event.plain_result(
                 "用法：\n"
                 "  /videotest <视频文件绝对路径>\n"
-                "或先发一个视频/视频文件，再发送 /videotest"
+                "或先发一个视频/视频文件，再发送 /videotest\n"
+                "路径含空格时请用引号包起来。"
             )
             return
 
         try:
-            report = await self._diagnose(target)
+            report = await self._diagnose(target, event=event)
         except Exception as exc:  # noqa: BLE001
             logger.error("[VideoVision] /videotest 诊断异常: %s", exc, exc_info=True)
             report = f"❌ 诊断过程异常: {type(exc).__name__}: {exc}"
@@ -238,13 +288,29 @@ class VideoVisionPlugin(Star):
                     logger.debug("[VideoVision] /videotest 解析文件路径失败: %s", exc)
                     continue
                 if path and os.path.exists(path):
-                    logger.debug("[VideoVision] /videotest 从 File 组件找到视频: %s", name)
+                    logger.debug(
+                        "[VideoVision] /videotest 从 File 组件找到视频: %s", name
+                    )
                     return str(path)
         return ""
 
-    async def _diagnose(self, target: str) -> str:
+    async def _diagnose(self, target: str, event: Any | None = None) -> str:
         """跑一遍完整链路并输出逐步报告。
-        gemini_native 模式不发请求；openai_compat 模式会真实调用视觉服务。"""
+
+        gemini_native 模式不发请求；openai_compat 模式会真实调用视觉服务。
+
+        两个耗时段（``probe_duration`` 与 ``prepare_video``）都通过
+        ``asyncio.to_thread`` 执行：它们是阻塞子进程，直接在事件循环里跑会把
+        整个 AstrBot 卡住（实测同步诊断 0.5s 会把一个在飞的钩子从 0.30s
+        拖到 0.50s，心跳最大间隔 625ms）。
+
+        Args:
+            target: 视频文件路径。
+            event: 当前消息事件，用于查 provider 类型 / 模态；可为 None。
+
+        Returns:
+            多行可读报告（直接回给管理员）。
+        """
         cfg = self.config
         lines: list[str] = ["🔍 视频链路诊断"]
 
@@ -256,27 +322,42 @@ class VideoVisionPlugin(Star):
             return "\n".join(lines)
 
         size_mb = file_size_mb(target)
-        duration = probe_duration(target, self.ffprobe)
+        duration = await asyncio.to_thread(probe_duration, target, self.ffprobe)
 
         lines.append(f"文件: {os.path.basename(target)}")
         lines.append(f"体积: {size_mb:.2f} MB")
         lines.append(f"时长: {duration:.1f} s" if duration > 0 else "时长: 读取失败")
         lines.append("")
-        lines.append(f"ffmpeg : {'✅ ' + self.ffmpeg if self.ffmpeg else '❌ 未找到'}")
-        lines.append(f"ffprobe: {'✅ ' + self.ffprobe if self.ffprobe else '❌ 未找到'}")
+        media_ok = "❌ 未找到"
+        lines.append(
+            f"ffmpeg : {'✅ ' + self.ffmpeg if self.ffmpeg else media_ok}"
+        )
+        lines.append(
+            f"ffprobe: {'✅ ' + self.ffprobe if self.ffprobe else media_ok}"
+        )
         lines.append(
             f"配置   : 闸门={cfg.max_size_mb:.1f}MB 上限={cfg.compress_max_mb:.1f}MB "
             f"CRF={cfg.compress_crf} "
             f"策略={_ACTION_LABELS.get(cfg.oversize_action, cfg.oversize_action)}"
         )
-        # 用与钩子完全相同的判定，避免 /videotest 说的和实际跑的不一样
+
+        # ---- 模式 / 凭据（0.2.0 只报模式）----
         effective_mode = cfg.effective_provider_mode
         degraded = cfg.provider_mode != effective_mode
         lines.append(
             f"模式   : {effective_mode}"
-            + ("（openai_compat 三项未配齐，运行时降级）" if degraded else "")
+            + (
+                f"（provider_mode={cfg.provider_mode} 三项未配齐，运行时降级）"
+                if degraded
+                else ""
+            )
         )
+        lines.append(f"凭据   : 视觉服务{_credentials_summary(cfg)}")
 
+        # ---- provider 与三道闸门（0.2.0 完全不诊断，而这正是最常见的失败点）----
+        lines.extend(await self._diagnose_gates(cfg, event, effective_mode))
+
+        # ---- 体积 / 时长判定（与钩子完全相同的判定）----
         oversize = size_mb > cfg.max_size_mb
         overlong = cfg.max_duration_sec > 0 and duration > cfg.max_duration_sec
         if not oversize and not overlong:
@@ -290,18 +371,25 @@ class VideoVisionPlugin(Star):
             label = _ACTION_LABELS.get(cfg.oversize_action, cfg.oversize_action)
             lines.append(f"判定   : {'；'.join(why)} → {label}")
 
+        # ---- 将要发给视觉服务的 prompt 预览（截断）----
+        lines.append(f"prompt : {self._prompt_preview(cfg, effective_mode)}")
+
         lines.append("")
         started = time.monotonic()
-        outcome = prepare_video(
+        outcome = await asyncio.to_thread(
+            prepare_video,
             VideoPlaceholder(name=os.path.basename(target), path=target),
             config=cfg,
             cache_root=self.cache_root,
             logger=logger,
+            debug=cfg.debug_log,
         )
         elapsed = time.monotonic() - started
 
         if not outcome.ok or outcome.injection is None:
             lines.append(f"❌ 准备失败（{elapsed:.2f}s）")
+            if outcome.kind:
+                lines.append(f"分类: {outcome.kind}")
             lines.append(f"原因: {outcome.reason}")
             return "\n".join(lines)
 
@@ -331,7 +419,7 @@ class VideoVisionPlugin(Star):
         # openai_compat：真实调用一次视觉服务，端到端验证配置与网络
         if is_openai:
             lines.append("")
-            prompt = build_vision_prompt(cfg, "")
+            prompt = build_vision_prompt(cfg, "", logger=logger)
             result = await analyze_video(
                 inj.data_uri,
                 os.path.basename(target),
@@ -352,6 +440,88 @@ class VideoVisionPlugin(Star):
             else:
                 lines.append(f"❌ 视觉调用失败: {result.reason}")
         return "\n".join(lines)
+
+    async def _diagnose_gates(
+        self, cfg: VideoConfig, event: Any | None, mode: str
+    ) -> list[str]:
+        """输出 provider 信息与三道闸门的判定结果。
+
+        判定逻辑与 ``hooks/llm_request._handle`` **完全一致**（同样的允许列表、
+        同样的 modalities 规则），避免"诊断说的"和"实际跑的"不一样。
+
+        Args:
+            cfg: 当前配置。
+            event: 消息事件，用于 ``get_using_provider_async(umo=...)``。
+            mode: ``effective_provider_mode``。
+
+        Returns:
+            若干行文本。
+        """
+        gate0 = "⓪ File 组件扩展名筛选 → 本指令用显式路径，不适用"
+        if mode == "openai_compat":
+            return [
+                "provider: 不适用（插件直连视觉服务，不经过主对话 provider）",
+                f"闸门   : {gate0}",
+                "         ① Gemini 系 provider 校验 → openai_compat 不适用",
+                "         ② audio 模态校验 → openai_compat 不适用",
+                f"         ③ 视觉服务凭据{_credentials_summary(cfg)}",
+            ]
+
+        provider, provider_error = await resolve_provider(self, event)
+        provider_config = getattr(provider, "provider_config", None) or {}
+        provider_type = str(provider_config.get("type") or "")
+        modalities = provider_config.get("modalities")
+        declared = (
+            ", ".join(str(item) for item in modalities)
+            if isinstance(modalities, list) and modalities
+            else "未声明"
+        )
+        lines = [
+            f"provider: type={provider_type or '未声明'} "
+            f"id={provider_config.get('id') or '未声明'} "
+            f"modalities=[{declared}]"
+        ]
+        allowed = GEMINI_PROVIDER_TYPES | set(cfg.additional_provider_types)
+        if provider is None:
+            gate1 = f"① provider 解析失败 ❌（{provider_error or '未知'}）"
+        elif not cfg.require_gemini_provider:
+            gate1 = (
+                f"① require_gemini_provider=false → 放行"
+                f"（类型 {provider_type or '未声明'}，不校验 MIME 兼容性）"
+            )
+        elif provider_type in allowed:
+            gate1 = f"① 类型 {provider_type} ✅ 在允许列表"
+        else:
+            gate1 = (
+                f"① 类型 {provider_type or '未声明'} ❌ 不在允许列表 "
+                f"{sorted(allowed)}"
+            )
+        if not isinstance(modalities, list) or not modalities:
+            gate2 = "② modalities 未声明 → ⚠️ 放行（无法校验，视频块可能被清洗）"
+        elif "audio" in modalities:
+            gate2 = "② modalities 含 audio ✅"
+        else:
+            gate2 = "② modalities 不含 audio ❌（视频块会被清洗成 [Audio]）"
+        gate3 = f"③ 视觉服务凭据{_credentials_summary(cfg)}（本模式不使用）"
+        return [
+            *lines,
+            f"闸门   : {gate0}",
+            f"         {gate1}",
+            f"         {gate2}",
+            f"         {gate3}",
+        ]
+
+    @staticmethod
+    def _prompt_preview(cfg: VideoConfig, mode: str) -> str:
+        """将要发送（或注入）的 prompt 预览，压成一行并截断。"""
+        if mode != "openai_compat":
+            return "（gemini_native 不调用视觉服务，无 prompt）"
+        prompt = build_vision_prompt(cfg, "", logger=logger)
+        flat = " ".join(prompt.split())
+        suffix = ""
+        if "{question}" not in (cfg.vision_qa_prompt or ""):
+            suffix = "（⚠️ vision_qa_prompt 缺 {question}，用户问题会被追加到末尾）"
+        return flat[:200] + ("…" if len(flat) > 200 else "") + suffix
 
     async def terminate(self) -> None:
         """插件被停用/卸载时的清理。"""
