@@ -30,6 +30,11 @@ except ImportError:  # pragma: no cover
     Video = None  # type: ignore[assignment]
     File = None  # type: ignore[assignment]
 
+try:  # 单独 import：老版本缺 Reply 时不该把 Video/File 一起带下水
+    from astrbot.api.message_components import Reply
+except ImportError:  # pragma: no cover
+    Reply = None  # type: ignore[assignment]
+
 try:
     from astrbot.core.star.filter.command import GreedyStr
 except ImportError:  # pragma: no cover
@@ -86,6 +91,56 @@ _ACTION_LABELS = {
     "truncated": "已截断",
     "rejected": "已拒绝",
 }
+
+#: ``/videotest`` 的用法。三条入口只有前两条在任何平台都成立，第三条看平台：
+#:
+#: * ① 显式路径 —— 永远是最后的手段；
+#: * ② 引用（回复）含视频的消息 —— **唯一**让「视频」和「命令」落在同一条
+#:   事件里的自然方式。被引用消息的消息段在 ``Reply.chain`` 里
+#:   （``aiocqhttp_platform_adapter.py:328-337`` 收到 ``reply`` 段时先 ``get_msg``
+#:   再把被引用消息整条重新解析成消息链），``Reply.message_str`` 只是文本；
+#: * ③ 视频和命令写在同一条消息里（平台支持图文混排时）。
+#:
+#: 0.2.1 的旧文案写「或先发一个视频/视频文件，再发送 /videotest」，这句话是
+#: **做不到的**：那是两条独立消息、两个独立事件，处理 ``/videotest`` 时
+#: ``event.message_obj.message`` 里只有后一条消息，插件没有任何途径回头看上一条
+#: 消息里的视频。真机证据（2026-10-26 11:34）：11:34:35 发视频、11:34:40 发
+#: ``/videotest`` → 拿到的正是这段泛泛的用法提示；11:34:52 改成**引用**那条视频
+#: 再发 ``/videotest`` → 命令命中并产出了诊断（引用链里的视频
+#: ``media_video_20261026113452316_48f6.mp4``）。
+_USAGE_TEXT = (
+    "用法（任选一种）：\n"
+    "  1) /videotest <视频文件绝对路径>\n"
+    "  2) 引用（回复）那条视频消息，再发 /videotest\n"
+    "  3) 视频和 /videotest 写在同一条消息里（平台支持时）\n"
+    "注意：「先单独发一个视频、再单独发 /videotest」不行 —— 那是两条消息、"
+    "两个事件，插件看不到上一条消息里的视频；请用 2) 的引用方式。\n"
+    "路径含空格时请用引号包起来。"
+)
+
+#: 找不到视频时的原因码 → 一句具体的话。
+#:
+#: 0.2.1 只有一段泛泛的用法提示：不管是「没给参数」「引用的消息里没有视频」还是
+#: 「平台根本没把被引用消息的内容交出来」，用户看到的字一模一样 —— 于是"命令不
+#: 生效"和"你引用错了"在他的视角完全无法区分。
+_VIDEO_REASON_TEXT = {
+    "no-media": "本条消息和引用的消息里都没有视频",
+    "quote-content-missing": (
+        "引用了消息，但平台没有把被引用消息的内容交给插件"
+        "（aiocqhttp 的 get_msg 失败时就是这样），看不到里面的视频"
+    ),
+    "quote-no-video": "引用的那条消息里没有视频",
+    "video-unreadable": "找到了视频，但没能取到本地文件（链接可能已过期）",
+}
+
+
+def _videotest_usage(reason: str = "") -> str:
+    """用法提示；``reason`` 非空时把「本次为什么没找到视频」一起说出来。"""
+    note = _VIDEO_REASON_TEXT.get(reason, "")
+    if not note:
+        return _USAGE_TEXT
+    head, _, tail = _USAGE_TEXT.partition("\n注意：")
+    return f"{head}\n本次没找到视频：{note}\n注意：{tail}"
 
 
 def _resolve_cache_root() -> str:
@@ -297,22 +352,23 @@ class VideoVisionPlugin(Star):
         现在按框架自身的写法（``astrbot/core/builtin_stars/builtin_commands/
         main.py:40``）去掉默认值；无参数时框架把 ``params[i:]`` 的空列表 join
         成空串传进来，行为与原来的默认值一致。
+
+        无参数时视频只可能来自**本条事件**的消息链，共三种入口（见
+        :data:`_USAGE_TEXT`）：同一条消息里的视频、引用（回复）的视频消息
+        （``Reply.chain``）、显式路径。**"先单独发视频、再发 /videotest" 不可能
+        成立** —— 两条消息是两个独立事件，这条命令执行时上一条消息早已处理完。
         """
         if str(getattr(event, "role", "") or "") != "admin":
             yield event.plain_result("该指令仅管理员可用。")
             return
 
         target = str(path or "").strip().strip('"').strip("'")
+        reason = ""
         if not target:
-            target = await self._find_video_in_event(event)
+            target, reason = await self._find_video_in_event(event)
 
         if not target:
-            yield event.plain_result(
-                "用法：\n"
-                "  /videotest <视频文件绝对路径>\n"
-                "或先发一个视频/视频文件，再发送 /videotest\n"
-                "路径含空格时请用引号包起来。"
-            )
+            yield event.plain_result(_videotest_usage(reason))
             return
 
         try:
@@ -322,17 +378,35 @@ class VideoVisionPlugin(Star):
             report = f"❌ 诊断过程异常: {type(exc).__name__}: {exc}"
         yield event.plain_result(report)
 
-    async def _find_video_in_event(self, event: AstrMessageEvent) -> str:
+    async def _find_video_in_event(self, event: AstrMessageEvent) -> tuple[str, str]:
         """从当前消息或引用消息里找一个视频的本地路径。
 
         同时处理两种组件形态：``Video``，以及**被当作文件投递的视频**
         （``File``）—— 实测 QQ/NapCat 走的是后者。
+
+        「引用视频」的数据来源是 ``Reply.chain``，不是 ``Reply.message_str``：
+        aiocqhttp 适配器收到 ``reply`` 段时会先 ``get_msg``，把被引用消息**整条**
+        重新解析成消息链塞进 ``Reply.chain``
+        （``aiocqhttp_platform_adapter.py:310-337``）。
+        顺带说明为什么引用不影响命令匹配：``CommandFilter.filter`` 只看
+        ``event.get_message_str()``（``command.py:191-206``），而带引用的
+        ``message_str`` 与不带引用时**完全一样**（适配器只把 ``text`` 段拼进它，
+        ``aiocqhttp_platform_adapter.py:245-252,422``）。
+
+        Returns:
+            ``(路径, 原因码)``。找到时路径非空、原因码为空串；找不到时路径为空串，
+            原因码是 :data:`_VIDEO_REASON_TEXT` 的键 —— 用户因此能拿到一句具体的
+            话（"引用的消息里没有视频" / "平台没给被引用内容"），而不是一段无论
+            什么原因都一样的用法提示。
         """
         try:
             chain = list(getattr(event.message_obj, "message", None) or [])
-        except Exception:
-            return ""
+        except Exception:  # noqa: BLE001
+            return "", "no-media"
 
+        replies = [
+            comp for comp in chain if Reply is not None and isinstance(comp, Reply)
+        ]
         candidates = list(chain)
         for comp in chain:
             inner = getattr(comp, "chain", None)
@@ -340,12 +414,14 @@ class VideoVisionPlugin(Star):
                 candidates.extend(inner)
 
         # 先找真正的 Video 组件（语义最明确）
+        saw_video = False
         if Video is not None:
             for comp in candidates:
                 if not isinstance(comp, Video):
                     continue
+                saw_video = True
                 try:
-                    return await comp.convert_to_file_path()
+                    return await comp.convert_to_file_path(), ""
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("[VideoVision] /videotest 解析视频路径失败: %s", exc)
 
@@ -366,7 +442,94 @@ class VideoVisionPlugin(Star):
                     logger.debug(
                         "[VideoVision] /videotest 从 File 组件找到视频: %s", name
                     )
-                    return str(path)
+                    return str(path), ""
+
+        # 引用消息的 chain 为空（适配器 get_msg 失败）或里面没有能用的视频：
+        # 按 OneBot 的 get_msg 自己再取一次 ——「引用视频不生效」唯一还有救的分支。
+        for reply in replies:
+            recovered = await self._resolve_quoted_video_via_onebot(event, reply)
+            if recovered:
+                return recovered, ""
+
+        if saw_video:
+            return "", "video-unreadable"
+        if any(not getattr(reply, "chain", None) for reply in replies):
+            return "", "quote-content-missing"
+        if replies:
+            return "", "quote-no-video"
+        return "", "no-media"
+
+    async def _resolve_quoted_video_via_onebot(
+        self, event: AstrMessageEvent, reply: Any
+    ) -> str:
+        """``Reply.chain`` 拿不到内容时，按 OneBot 的 ``get_msg`` 再取一次视频。
+
+        适配器在收消息时已经 ``get_msg`` 过一次
+        （``aiocqhttp_platform_adapter.py:310-326``）；偶发失败（NapCat 超时、
+        视频 CDN 链接还没就绪）时 ``Reply.chain`` 是空的，于是引用里的视频对插件
+        **完全不可见** —— 用户看到的表现就是"引用视频发 /videotest 没反应"。
+
+        ``event.bot.api.call_action`` 正是框架自己的 ``OneBotClient`` 用的入口
+        （``core/utils/quoted_message/onebot_client.py:35-41``），所以这里不需要
+        任何平台判断：不是 OneBot 平台就取不到 ``call_action``，直接跳过。
+
+        只认 ``video`` 段：``file`` 段的取址要额外的 ``get_private_file_url`` /
+        ``get_group_file_url``，而那是适配器已经替我们试过的一步。
+
+        Args:
+            event: 当前消息事件。
+            reply: 引用组件（只用它的 ``id``）。
+
+        Returns:
+            视频本地路径；取不到时返回空串（绝不抛异常、绝不拖慢命令）。
+        """
+        call_action = getattr(
+            getattr(getattr(event, "bot", None), "api", None), "call_action", None
+        )
+        message_id = getattr(reply, "id", None)
+        if not callable(call_action) or message_id in (None, "") or Video is None:
+            return ""
+
+        payload: Any = None
+        for params in ({"message_id": message_id}, {"id": message_id}):
+            try:
+                payload = await call_action("get_msg", **params)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[VideoVision] /videotest 取引用消息失败: %s", exc)
+                payload = None
+                continue
+            if isinstance(payload, dict):
+                break
+        if not isinstance(payload, dict):
+            return ""
+
+        data = payload.get("data")
+        data = data if isinstance(data, dict) else payload
+        segments = data.get("message")
+        if not isinstance(segments, list):
+            return ""
+
+        for segment in segments:
+            if not isinstance(segment, dict) or segment.get("type") != "video":
+                continue
+            info = segment.get("data")
+            info = info if isinstance(info, dict) else {}
+            ref = str(info.get("file") or info.get("url") or "")
+            if not ref:
+                continue
+            try:
+                video = Video(
+                    file=ref,
+                    url=str(info.get("url") or ""),
+                    path=str(info.get("path") or ""),
+                )
+                path = await video.convert_to_file_path()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[VideoVision] /videotest 重取引用视频失败: %s", exc)
+                continue
+            if path:
+                logger.info("[VideoVision] /videotest 从引用消息重新取到视频: %s", ref)
+                return str(path)
         return ""
 
     async def _diagnose(self, target: str, event: Any | None = None) -> str:

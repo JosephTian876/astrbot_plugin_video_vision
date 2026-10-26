@@ -127,3 +127,23 @@ def test_requirements_has_no_new_runtime_dependency():
 def test_schema_hints_mention_the_new_guards():
     assert "墙钟" in SCHEMA["max_compress_seconds"]["hint"]
     assert "1.3-3.2" in SCHEMA["compress_max_mb"]["hint"]
+
+
+def test_videotest_entry_points_are_documented_honestly():
+    """``/videotest`` 只能从**本条事件**里拿视频，文档不能承诺做不到的事。
+
+    旧 README 写「或回复一条含视频的消息」还算对，但插件内提示写的是
+    「或先发一个视频/视频文件，再发送 /videotest」—— 真机上那是两条独立消息、
+    两个独立事件（11:34:35 发视频 → 11:34:40 发命令 → 只得到用法提示）。
+    """
+    from vv_plugin.main import _USAGE_TEXT
+
+    # README：三种入口 + 明确写出"先发视频再发命令不行"
+    assert "引用（回复）那条视频消息" in README
+    assert "先单独发一个视频" in README
+    assert "是不行的" in README
+    # 插件内提示：同样的说法，且旧的那句必须消失
+    assert "引用（回复）那条视频消息" in _USAGE_TEXT
+    assert "先单独发一个视频" in _USAGE_TEXT
+    assert "再发送 /videotest" not in _USAGE_TEXT
+    assert "先发视频再发命令" in CHANGELOG
