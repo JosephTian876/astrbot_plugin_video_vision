@@ -52,19 +52,56 @@ class VisionResult:
     completion_tokens: int = 0
 
 
-def build_vision_prompt(config: VideoConfig, question: str) -> str:
+#: 视觉服务响应正文的硬上限（字符）。1MB 正文原样拼进 prompt 会直接顶爆主模型
+#: 的上下文（实测第三方端点可能返回整段 HTML 错误页或复读）。超限截断并告警。
+MAX_ANALYSIS_CHARS = 16 * 1024
+
+#: 已告警过的模板，避免每轮刷屏
+_warned_templates: set[str] = set()
+
+
+def _warn_missing_placeholder(logger: Any | None) -> None:
+    """``vision_qa_prompt`` 缺 ``{question}`` 时告警一次。"""
+    if "vision_qa_prompt" in _warned_templates:
+        return
+    _warned_templates.add("vision_qa_prompt")
+    if logger is not None:
+        logger.warning(
+            "[VideoVision] vision_qa_prompt 里没有 {question} 占位符："
+            "用户的问题已追加到模板末尾（建议把 {question} 加回去，"
+            "否则模板里的指示不会针对用户的具体问题）"
+        )
+
+
+def build_vision_prompt(
+    config: VideoConfig, question: str, *, logger: Any | None = None
+) -> str:
     """按「用户是否附带问题」挑选提示词。
 
     B2 策略：用户有问题就把原话带给视觉模型，得到针对性回答；
     没有问题（纯发视频）退化为通用详细描述。
+
+    若用户把 ``vision_qa_prompt`` 里的 ``{question}`` 删掉了，0.2.0 会把模板
+    原样发出去 —— 用户的问题被**静默丢弃**（实测：模板"没有占位符的模板" +
+    问题"讲了什么" → 视觉模型只收到前者）。现在把问题追加到模板末尾并告警
+    一次，绝不静默丢用户问题。
+
+    Args:
+        config: 插件配置。
+        question: 用户随视频附带的文字（可为空）。
+        logger: 可选日志器，用于告警「模板缺占位符」。
+
+    Returns:
+        最终发给视觉服务的提示词。
     """
     question = (question or "").strip()
     if question and config.vision_with_question:
         template = config.vision_qa_prompt or ""
-        try:
+        if "{question}" in template:
             prompt = template.replace("{question}", question)
-        except Exception:  # noqa: BLE001 - 模板再怪也不能炸
-            prompt = ""
+        else:
+            prompt = f"{template.rstrip()}\n\n用户的问题：「{question}」"
+            _warn_missing_placeholder(logger)
         if prompt.strip():
             return prompt
     return config.vision_describe_prompt
@@ -138,9 +175,20 @@ def _parse_response(kind: str, data: dict) -> tuple[str, int, int]:
             int(usage.get("input_tokens") or 0),
             int(usage.get("output_tokens") or 0),
         )
-    analysis = (
-        data.get("choices", [{}])[0].get("message", {}).get("content") or ""
-    ).strip()
+    choices = data.get("choices")
+    if not isinstance(choices, list) or not choices:
+        # ``choices: []``（或干脆没有该字段）不是"解析失败"，是"服务返回空内容"。
+        # 0.2.0 直接 data["choices"][0] -> IndexError -> 报"响应解析失败"，
+        # 把一次服务端空回答伪装成了客户端解析 bug。
+        usage = data.get("usage") or {}
+        return (
+            "",
+            int(usage.get("prompt_tokens") or 0),
+            int(usage.get("completion_tokens") or 0),
+        )
+    first = choices[0] if isinstance(choices[0], dict) else {}
+    message = first.get("message") or {}
+    analysis = (message.get("content") or "").strip()
     usage = data.get("usage") or {}
     return (
         analysis,
@@ -250,6 +298,17 @@ async def analyze_video(
             False, name, reason="视觉服务返回了空内容", elapsed_sec=elapsed
         )
 
+    # 第三方的回答是不可信数据，长度也必须设上限：把 1MB 正文原样拼进 prompt
+    # 会直接顶爆主模型上下文，还会让日志/内存失真。
+    if len(analysis) > MAX_ANALYSIS_CHARS:
+        if log is not None:
+            log.warning(
+                "[VideoVision] 视觉服务返回正文过长（%d 字符），已截断为 %d 字符",
+                len(analysis),
+                MAX_ANALYSIS_CHARS,
+            )
+        analysis = analysis[:MAX_ANALYSIS_CHARS] + "…（响应过长，已截断）"
+
     if log is not None:
         log.info(
             "[VideoVision] 视觉理解完成: %s | %s | %.1fs | token %s+%s",
@@ -282,7 +341,7 @@ async def analyze_videos(
         videos: [(文件名, data URI), ...]
         question: 用户随消息附带的文字（可为空串）。
     """
-    prompt = build_vision_prompt(config, question)
+    prompt = build_vision_prompt(config, question, logger=logger)
     tasks = [
         analyze_video(uri, name, prompt, config=config, logger=logger)
         for name, uri in videos
