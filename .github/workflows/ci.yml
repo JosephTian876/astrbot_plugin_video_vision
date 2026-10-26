@@ -65,11 +65,31 @@ jobs:
           cache: pip
           cache-dependency-path: tests/requirements-dev.txt
 
+      # ubuntu-latest 镜像本来就自带 ffmpeg：有就直接用，只在缺失时才 apt。
+      # 直接无条件 `apt-get update` 会在 runner 网络抖动时**卡死**（2026-10-26 实测：
+      # ubuntu py3.13 卡在 "Install ffmpeg (Linux)" 23 分钟，连 job 的
+      # timeout-minutes: 15 都没触发）→ 所以：先探测、每次 apt 外面套 `timeout`、
+      # 失败重试 3 次。这里红了就说明 runner 真没 ffmpeg，比后面 40 例静默 skip 好。
       - name: Install ffmpeg (Linux)
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg
+          if command -v ffmpeg >/dev/null 2>&1 && command -v ffprobe >/dev/null 2>&1; then
+            echo "ffmpeg already present: $(ffmpeg -version | head -n 1)"
+            exit 0
+          fi
+          for attempt in 1 2 3; do
+            echo "::group::apt attempt ${attempt}"
+            if timeout 240 sudo apt-get update -qq &&
+               timeout 240 sudo apt-get install -y --no-install-recommends ffmpeg; then
+              echo "::endgroup::"
+              break
+            fi
+            echo "::endgroup::"
+            echo "apt attempt ${attempt} failed; sleeping 10s"
+            sleep 10
+          done
+          command -v ffmpeg
+          command -v ffprobe
 
       - name: Install ffmpeg (Windows)
         if: runner.os == 'Windows'
