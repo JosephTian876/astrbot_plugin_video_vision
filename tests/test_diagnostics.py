@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import ast
 import inspect
+import os
+import posixpath
 from pathlib import Path
 
 import pytest
@@ -37,13 +39,31 @@ from vv_plugin.core.injector import PrepareOutcome, VideoInjection
 REPO = Path(__file__).resolve().parents[1]
 MODULE_PATH = REPO / "core" / "diagnostics.py"
 
+# ------------------------------------------------------------ 文档样例的固定事实
+#
+# README「输出示例」是在 Windows 开发机上真跑截下来的，所以 ffmpeg / ffprobe 两行
+# 就是下面这两个字符串。测试**显式注入**它们（``render_report`` 只做原样拼接），
+# 于是期望串在任何平台都是同一份字节。绝不许改成 ``shutil.which`` / ``os.sep`` 的
+# 实时结果：那会把"单一真相源"拆成"每个平台各一份文档"。
+DOC_FFMPEG = r"D:\ffmpeg\bin\ffmpeg.exe"
+DOC_FFPROBE = r"D:\ffmpeg\bin\ffprobe.exe"
 
-def make_probe(path: str = r"C:\videos\demo.mp4", **kwargs) -> ProbeFacts:
+#: 样例的输入路径。故意用带 ``/`` 的绝对路径：``ntpath`` 与 ``posixpath`` 都把 ``/``
+#: 当分隔符，所以 ``os.path.basename`` 在 Windows 与 Linux 上都返回 ``demo.mp4``。
+#: 这里曾写 ``r"C:\videos\demo.mp4"`` —— POSIX 的 ``basename`` **不认** ``\``，报告
+#: 第一行会原样打出整条路径（CI run 40335025358 在 ubuntu ×3 上的唯一失败点）。
+DOC_PATH = "/videos/demo.mp4"
+
+#: 压缩产物路径：只用于取后缀渲染 MIME 行，同样不依赖宿主分隔符。
+DOC_OUTPUT = "/cache/compressed.mp4"
+
+
+def make_probe(path: str = DOC_PATH, **kwargs) -> ProbeFacts:
     options = {
         "size_mb": 21.79,
         "duration_sec": 20.0,
-        "ffmpeg": r"D:\ffmpeg\bin\ffmpeg.exe",
-        "ffprobe": r"D:\ffmpeg\bin\ffprobe.exe",
+        "ffmpeg": DOC_FFMPEG,
+        "ffprobe": DOC_FFPROBE,
     }
     options.update(kwargs)
     return ProbeFacts(path=path, **options)
@@ -54,8 +74,8 @@ def make_injection(**kwargs) -> VideoInjection:
     uri = "data:video/mp4;base64," + "A" * 2_500_000
     options = {
         "block": {"type": "audio_url", "audio_url": {"url": uri}},
-        "source_path": r"C:\videos\demo.mp4",
-        "used_path": r"C:\cache\compressed.mp4",
+        "source_path": DOC_PATH,
+        "used_path": DOC_OUTPUT,
         "size_mb": 1.79,
         "duration_sec": 20.0,
         "action": "compressed",
@@ -68,15 +88,20 @@ def make_injection(**kwargs) -> VideoInjection:
 # --------------------------------------------------------------- 逐字格式
 
 
-def test_render_report_is_byte_exact_for_the_documented_example():
-    """README「输出示例」那一份报告，逐字相等（含每个空行与缩进）。"""
+def _documented_example_report() -> str:
+    """README「输出示例」那一份报告（事实全部固定，不读宿主环境）。
+
+    ffmpeg / ffprobe 两行来自**显式入参**（``DOC_*`` 常量），不是 ``PATH`` 探测
+    结果；输入路径用 :data:`DOC_PATH`，两种路径语义下 ``basename`` 都是
+    ``demo.mp4``。所以"文档样例"在任何平台都渲染成同一份字节。
+    """
     cfg = VideoConfig(
         max_size_mb=13.0,
         compress_max_mb=8.0,
         max_duration_sec=0.0,
         provider_mode="gemini_native",
     )
-    probe = make_probe()
+    probe = make_probe(ffmpeg=DOC_FFMPEG, ffprobe=DOC_FFPROBE)
     plan = classify(
         size_mb=probe.size_mb, duration_sec=probe.duration_sec, config=cfg,
         mime_or_suffix=".mp4",
@@ -87,7 +112,7 @@ def test_render_report_is_byte_exact_for_the_documented_example():
         modalities=["text", "image", "audio"],
     )
 
-    report = render_report(
+    return render_report(
         cfg=cfg,
         mode="gemini_native",
         probe=probe,
@@ -97,14 +122,17 @@ def test_render_report_is_byte_exact_for_the_documented_example():
         elapsed_sec=0.64,
     )
 
-    assert report == (
+
+def test_render_report_is_byte_exact_for_the_documented_example():
+    """README「输出示例」那一份报告，逐字相等（含每个空行与缩进）。"""
+    assert _documented_example_report() == (
         "🔍 视频链路诊断\n"
         "文件: demo.mp4\n"
         "体积: 21.79 MB\n"
         "时长: 20.0 s\n"
         "\n"
-        "ffmpeg : ✅ D:\\ffmpeg\\bin\\ffmpeg.exe\n"
-        "ffprobe: ✅ D:\\ffmpeg\\bin\\ffprobe.exe\n"
+        f"ffmpeg : ✅ {DOC_FFMPEG}\n"
+        f"ffprobe: ✅ {DOC_FFPROBE}\n"
         "配置   : 闸门=13.0MB 上限=8.0MB CRF=30 策略=压缩\n"
         "编码上限: data URI 18MB ≈ 原始 13.5MB（编码后超过必失败，与体积闸门无关）\n"
         "模式   : gemini_native\n"
@@ -129,6 +157,29 @@ def test_render_report_is_byte_exact_for_the_documented_example():
         "预计上传耗时: 约 14s（provider 预算 180s）\n"
         "✅ 在预算内"
     )
+
+
+class _PosixOs:
+    """``os`` 的代理：``path`` 换成 ``posixpath``，其余属性照旧。"""
+
+    path = posixpath
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(os, name)
+
+
+def test_the_documented_example_does_not_depend_on_host_path_semantics(monkeypatch):
+    """同一份样例在 POSIX 路径语义下必须渲染出**同一份字节**。
+
+    为什么需要它：``core/diagnostics.py`` 里对 ``os`` 的唯一用法就是
+    ``ProbeFacts.name`` 的 ``os.path.basename``，而 POSIX 的 ``basename`` 不把
+    ``\\`` 当分隔符。样例路径一旦写回 ``r"C:\\videos\\demo.mp4"``，ubuntu lane 的
+    第一行就变成 ``文件: C:\\videos\\demo.mp4``（CI run 40335025358），而 Windows
+    上一切照绿 —— 这条把那个差异搬到本机来跑，推之前就能发现。
+    """
+    native = _documented_example_report()
+    monkeypatch.setattr(diagnostics, "os", _PosixOs())
+    assert _documented_example_report() == native
 
 
 def test_render_report_reports_the_failure_kind_and_reason():
@@ -234,8 +285,8 @@ def test_render_report_shows_credentials_prompt_and_vision_result():
         outcome=PrepareOutcome(
             True,
             make_injection(
-                source_path=r"C:\videos\demo.mp4",
-                used_path=r"C:\videos\demo.mp4",
+                source_path=DOC_PATH,
+                used_path=DOC_OUTPUT,
                 size_mb=0.93,
                 duration_sec=3.0,
                 action="as-is",

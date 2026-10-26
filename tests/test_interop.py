@@ -250,7 +250,11 @@ def _injection(**overrides) -> VideoInjection:
     return VideoInjection(**options)
 
 
-def _probe(path: str = r"C:\videos\demo.mp4", **overrides) -> ProbeFacts:
+def _probe(path: str = "/videos/demo.mp4", **overrides) -> ProbeFacts:
+    """样例事实。``path`` 用带 ``/`` 的绝对路径：``ntpath`` 与 ``posixpath`` 的
+    ``basename`` 都返回 ``demo.mp4``，于是这份"出站文本语料"在 Windows 与 Linux 上
+    逐字相同（写 ``C:\\videos\\demo.mp4`` 时 POSIX 会把整条路径打进「文件:」行）。
+    """
     options = {
         "size_mb": 21.79,
         "duration_sec": 20.0,
