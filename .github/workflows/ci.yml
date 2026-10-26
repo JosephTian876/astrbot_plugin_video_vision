@@ -77,10 +77,11 @@ jobs:
             exit 0
           fi
           url="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz"
+          rm -rf /tmp/ffmpeg-dist && mkdir -p /tmp/ffmpeg-dist
           for attempt in 1 2 3; do
             echo "::group::download attempt ${attempt}"
             if timeout 300 curl -fsSL --retry 2 -o /tmp/ffmpeg.tar.xz "$url" &&
-               timeout 120 tar -xJf /tmp/ffmpeg.tar.xz -C /tmp; then
+               timeout 120 tar -xJf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg-dist --strip-components=1; then
               echo "::endgroup::"
               break
             fi
@@ -88,9 +89,10 @@ jobs:
             echo "download attempt ${attempt} failed; sleeping 10s"
             sleep 10
           done
-          bin_dir="$(find /tmp -maxdepth 2 -type d -name bin -path '*ffmpeg*' | head -n 1)"
-          test -n "$bin_dir"
-          sudo install -m 0755 "$bin_dir/ffmpeg" "$bin_dir/ffprobe" /usr/local/bin/
+          # 注意：不要用 `find /tmp` 找 bin 目录 —— runner 的 /tmp 里有 systemd-private-*
+          # 无权限目录，bash 的 pipefail 会让整步以非零退出（2026-10-26 实测踩过）。
+          test -x /tmp/ffmpeg-dist/bin/ffmpeg
+          sudo install -m 0755 /tmp/ffmpeg-dist/bin/ffmpeg /tmp/ffmpeg-dist/bin/ffprobe /usr/local/bin/
           command -v ffmpeg
           command -v ffprobe
 
