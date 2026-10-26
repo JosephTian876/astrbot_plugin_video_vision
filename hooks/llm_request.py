@@ -61,15 +61,10 @@ try:
 except Exception:  # pragma: no cover - 版本差异兜底
     AudioURLPart = None  # type: ignore[assignment]
 
-#: 判定为「Gemini 系」的 provider 类型 —— 只有它们才会把 audio_url 块按 MIME
-#: 构造成媒体 Part（``process_audio_url`` 是 MIME 无关的）。其他 provider 会把
-#: 视频当音频处理，因此默认拦住。仅 gemini_native 模式使用。
-GEMINI_PROVIDER_TYPES: frozenset[str] = frozenset(
-    {
-        "googlegenai_chat_completion",
-        "gemini_video_chat_completion",  # 兼容早期设计/第三方实现
-    }
-)
+#: 判定为「Gemini 系」的 provider 类型 —— 唯一定义在 ``core/decide.py``：
+#: ``/videotest`` 渲染闸门 ① 与这里判定必须吃同一份集合（0.2.1 是两遍表达式，
+#: 见 ARCH-REVIEW R8）。这里保留同名别名，``hooks/__init__.py`` 的公开名字不变。
+GEMINI_PROVIDER_TYPES = decide.GEMINI_PROVIDER_TYPES
 
 #: 挂在 req 上的去重标记，避免同一请求重复注入（前缀与陪伴插件区隔）
 _DONE_ATTR = "_video_vision_injected"
@@ -580,9 +575,7 @@ async def _handle(plugin: Any, event: Any, req: Any) -> None:
             )
 
         # ---- 闸门 1：必须是 Gemini 系 provider（可配置额外放行）----
-        allowed_provider_types = GEMINI_PROVIDER_TYPES | set(
-            config.additional_provider_types
-        )
+        allowed_provider_types = decide.allowed_provider_types(config)
         if (
             config.require_gemini_provider
             and provider_type not in allowed_provider_types

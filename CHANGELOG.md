@@ -119,6 +119,20 @@
   schema 1:1、缓存原子性与并发、注入决策、视觉服务两种协议与错误分支、
   钩子归因、`/videotest` 诊断与 `GreedyStr` 契约、文档一致性。
 
+### 结构（内部重构，行为不变）
+
+- `/videotest` 的报告、启动日志与用法文本全部搬到新模块
+  `core/diagnostics.py`（单一入口 `render_report(...)`，内部按段落拆私有函数）。
+  `main.py` 从 758 行降到 449 行，只剩插件类、命令注册、事件/配置装配与
+  "把事实喂给渲染层"。报告的逐字格式第一次可以在**不装 ffmpeg、不跑子进程**
+  的条件下单测：`tests/test_diagnostics.py` 断言整份报告（含每个空行与缩进）。
+  为守住层次，`core/` **不 import `hooks/`**：provider 由 `main` 解析后以
+  `ProviderFacts`（`type` / `id` / `modalities` 三个纯数据字段）传入，
+  `render_report` 的签名里没有 `event`。
+- 「Gemini 系 provider 白名单 + `additional_provider_types`」的表达式从
+  `hooks` 与 `main` 各写一遍收成 `decide.allowed_provider_types()` 一份，
+  闸门 ① 的判定与渲染从此不可能分叉。
+
 ## 0.2.0
 
 新增 **openai_compat 模式**：配置文件可自定义 OpenAI 兼容视觉服务商。

@@ -27,7 +27,7 @@ from pathlib import Path
 import pytest
 
 from vv_plugin import main
-from vv_plugin.core import placeholder
+from vv_plugin.core import diagnostics, placeholder
 from vv_plugin.core.decide import classify
 from vv_plugin.core.config import VideoConfig
 from vv_plugin.core.media import (
@@ -119,13 +119,17 @@ def test_placeholder_looks_like_video_agrees_with_suffix_of(path, name, expected
 
 @pytest.mark.parametrize("ext", [".mp4", ".MP4", ".gif", ".txt", ""])
 def test_diagnose_suffix_helpers_agree_with_suffix_of(ext):
-    """``main`` 的两处后缀判断（扩展名警示 / MIME 行）与 ``suffix_of`` 同源。"""
+    """两处后缀判断（扩展名警示 / MIME 行）与 ``suffix_of`` 同源。
+
+    两个 helper 现在住在 ``core/diagnostics.py``（本轮从 ``main`` 搬出），
+    断言不变：后缀已知时没有警示、MIME 行用真实探测值；未知时警示 + ``(推断)``。
+    """
     path = f"clip{ext}"
     expected_added = suffix_of(path)
     known = expected_added in VIDEO_SUFFIXES
 
-    note = main._unknown_container_note(path)
-    mime_line = main._mime_line(path, "as-is")
+    note = diagnostics.container_note(path)
+    mime_line = diagnostics.mime_line(path, "as-is")
 
     expected = (
         f"MIME   : {guess_video_mime(path)}"
@@ -150,9 +154,10 @@ def test_suffix_logic_has_exactly_one_source_file():
     """结构断言：``splitext`` 只允许出现在 ``core/media.py::suffix_of`` 里。
 
     用 AST 而不是字符串计数 —— 文档里提到 ``splitext`` 不该算实现（本轮就踩过）。
+    ``core/diagnostics.py`` 也是新增的调用点，一并纳入检查。
     """
     offenders = []
-    for module in (main, placeholder):
+    for module in (main, placeholder, diagnostics):
         source = Path(module.__file__).read_text(encoding="utf-8")
         if "splitext" in source:
             offenders.append(Path(module.__file__).name)

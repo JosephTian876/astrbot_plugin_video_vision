@@ -17,14 +17,15 @@ import pytest
 
 from astrbot.core.star.filter.command import GreedyStr
 from vv_plugin import main as main_module
+from vv_plugin.core import diagnostics
 from vv_plugin.core.config import VideoConfig
 from vv_plugin.core.injector import PrepareOutcome
 from vv_plugin.core.openai_vision import VisionResult
 from vv_plugin.hooks import llm_request as hooks
 from vv_plugin.main import VideoVisionPlugin
 
-# 0.2.1 新增的私有助手：用模块属性取，保证本文件在 0.2.0 上也能被收集
-_missing_credentials = getattr(main_module, "_missing_credentials", None)
+# 凭据齐全性诊断在 ``core/diagnostics.py``（本轮从 ``main`` 搬出）
+_missing_credentials = diagnostics.missing_credentials
 
 # --------------------------------------------------- 框架参数提取（复刻源码）
 
@@ -258,7 +259,6 @@ def test_diagnose_reports_missing_credentials(media_tools, tiny_video):
     report = run(plugin._diagnose(tiny_video, event=_Event()))
 
     assert "❌ 缺 openai_base_url、openai_api_key" in report
-    assert _missing_credentials is not None
     assert _missing_credentials(plugin.config) == [
         "openai_base_url",
         "openai_api_key",

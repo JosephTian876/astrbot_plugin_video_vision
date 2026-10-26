@@ -22,6 +22,31 @@ from .config import VideoConfig
 from .media import MAX_DATA_URI_BYTES, will_truncate
 from .placeholder import VIDEO_SUFFIXES
 
+#: 判定为「Gemini 系」的 provider 类型 —— 只有它们才会把 audio_url 块按 MIME
+#: 构造成媒体 Part（``process_audio_url`` 是 MIME 无关的）。其他 provider 会把
+#: 视频当音频处理，因此默认拦住。仅 gemini_native 模式使用。
+#:
+#: 0.2.1 它住在 ``hooks/llm_request.py``，而 ``main._diagnose_gates`` 为了渲染
+#: 闸门 ① 又抄了一遍「GEMINI | additional」表达式（ARCH-REVIEW R8）——
+#: 于是"诊断说的"和"实际拦的"是两份代码。现在唯一实现在这里；``hooks`` 保留
+#: 同名别名（re-export），公开名字不变。
+GEMINI_PROVIDER_TYPES: frozenset[str] = frozenset(
+    {
+        "googlegenai_chat_completion",
+        "gemini_video_chat_completion",  # 兼容早期设计/第三方实现
+    }
+)
+
+
+def allowed_provider_types(config: VideoConfig) -> frozenset[str]:
+    """``gemini_native`` 允许注入视频的 provider type 集合。
+
+    「默认白名单 + ``additional_provider_types``」的唯一写法：钩子用它判定，
+    ``/videotest`` 用它渲染闸门 ①，两边不可能再各写一遍（ARCH-REVIEW R8）。
+    """
+    return GEMINI_PROVIDER_TYPES | set(config.additional_provider_types)
+
+
 #: 动作标签（唯一一份）：前三项是判决 / 配置词表，后四项是结果词表
 #: （``VideoInjection.action``）。合成一张 7 键映射是 0.2.x 的报告格式，拆开要改
 #: ``/videotest`` 的输出，属行为变化。
