@@ -17,6 +17,7 @@ from .media import (
     probe_video,
     read_as_data_uri,
     resolve_ffmpeg_tools,
+    suffix_of,
 )
 from .openai_vision import (
     VisionResult,
@@ -54,4 +55,5 @@ __all__ = [
     "probe_video",
     "read_as_data_uri",
     "resolve_ffmpeg_tools",
+    "suffix_of",
 ]

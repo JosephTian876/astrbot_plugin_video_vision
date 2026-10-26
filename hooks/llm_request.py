@@ -47,6 +47,7 @@ from typing import Any
 
 from astrbot.api import logger
 
+from ..core import decide
 from ..core.config import VideoConfig
 from ..core.injector import VideoInjection, prepare_video
 from ..core.openai_vision import analyze_videos
@@ -83,50 +84,35 @@ PROVIDER_ERROR_EXCEPTION = "exception"
 PROVIDER_ERROR_NONE = "none"
 PROVIDER_ERROR_NO_CONTEXT = "no-context"
 
-#: 失败分类 -> 注入给模型的短语。键来自 ``MediaToolError.KINDS`` 与
-#: ``PrepareOutcome.kind``（injector 另有 missing / rejected / size / internal）。
-_SHORT_REASONS: dict[str, str] = {
-    "timeout": "ffmpeg timed out while transcoding the video",
-    "exit_code": "ffmpeg failed to transcode the video",
-    "not_found": "ffmpeg is not available",
-    "corrupt": "the video file appears to be corrupt",
-    "empty": "the video file is empty",
-    "duration": "its duration could not be read",
-    "too_large": "it exceeds the size limit",
-    "size": "it exceeds the size limit",
-    "rejected": "it exceeds the size limit",
-    "missing": "the file could not be read",
-}
-
 
 def _short_reason(reason: str, kind: str = "") -> str:
     """把失败原因压缩成不含本机路径的短语，供注入给模型。
 
-    优先用**机器可读**的 ``kind``（``MediaToolError.kind`` /
-    ``PrepareOutcome.kind``）分类，拿不到 kind 时才回落到字符串匹配，且匹配
-    顺序是「超时 / 退出码 / 未找到 ffmpeg / 文件损坏 / 产物为空」——0.2.0 只有
-    一处 ``"ffmpeg" in reason``，于是超时、退出码非 0、真未找到、产物为空四种
-    完全不同的原因**全部**被报成 "ffmpeg is not available"（实测 4/4 复现），
-    模型收到的说明是错的。
+    **码 -> 短语的唯一映射在 ``core/decide.py``**（``SHORT_REASONS``，访问器
+    ``decide.explain``）。``PrepareOutcome.kind`` 与 ``MediaPlan.reason_code``
+    都从那里取文案 —— 0.2.1 在本文件另存了一份 12 行的表，与判决侧各改各的。
 
-    注意匹配顺序：更具体的原因要排在更宽泛的之前。
-    例如「无法读取时长，拒绝盲压缩（体积超闸门）」应归类为时长问题，
-    而不是体积问题 —— 否则模型会收到误导性的说明。
+    这里只保留**没有码**时的字符串回退：
 
-    视觉服务（openai_compat）的原因由 ``core/openai_vision._classify_error``
-    统一以「视觉服务」开头，因此**整体前置判定**：那些原因里常带
-    「调小体积闸门」之类的说明文字，若让下面的「闸门」分支先匹配，
-    一次超时会被误报成「体积超限」。
+    * 视觉服务（``openai_compat``）的原因由 ``core/openai_vision._classify_error``
+      产出，属**另一个错误域**（HTTP / SSL / 连通性），没有机器可读分类 ——
+      给它现编一套码是另一件事，不在本次结构重构里；
+    * ``kind`` 不在码表里（``internal`` / ``other``）时保持 0.2.1 的回退行为。
+
+    匹配顺序：视觉服务 -> 码表 -> 文本回退，且更具体的原因排在更宽泛的之前
+    （例如「无法读取时长，拒绝盲压缩（体积超闸门）」必须归为时长问题，否则模型
+    收到的说明是错的）。
 
     Args:
         reason: 原始失败原因（可能含本机路径，绝不原样外发）。
-        kind: 可选的机器可读分类。
+        kind: 可选的机器可读分类（``MediaToolError.KINDS`` / ``PrepareOutcome.kind``
+            / ``MediaPlan.reason_code``）。
 
     Returns:
         一句英文短语。
     """
     low = reason.lower()
-    # ---- 视觉服务（openai_compat 模式）----
+    # ---- 视觉服务（openai_compat 模式）：另一个错误域，没有码 ----
     if "视觉服务" in reason:
         if "ssl" in low or "证书" in reason:
             return "vision service SSL certificate check failed"
@@ -135,28 +121,29 @@ def _short_reason(reason: str, kind: str = "") -> str:
         if "连接" in reason or "connect" in low:
             return "the vision service is unreachable"
         return "the vision service returned an error"
-    # ---- 机器可读分类优先 ----
-    if kind in _SHORT_REASONS:
-        return _SHORT_REASONS[kind]
-    # ---- 本地视频处理（两种模式共用）：字符串回退 ----
+    # ---- 机器可读分类优先（唯一真相源：core/decide.py）----
+    phrase = decide.explain(kind)
+    if phrase:
+        return phrase
+    # ---- 本地视频处理（两种模式共用）：只有"没有码"时才走文本回退 ----
     if "超时" in reason or "timeout" in low or "timed out" in low:
-        return _SHORT_REASONS["timeout"]
+        return decide.explain("timeout")
     if "退出码" in reason:
-        return _SHORT_REASONS["exit_code"]
+        return decide.explain("exit_code")
     if "未找到 ffmpeg" in reason or "ffmpeg 无法启动" in reason:
-        return _SHORT_REASONS["not_found"]
+        return decide.explain("not_found")
     if "损坏" in reason or "无法解析视频" in reason:
-        return _SHORT_REASONS["corrupt"]
+        return decide.explain("corrupt")
     if "0 字节" in reason or "未产出" in reason or "为空" in reason:
-        return _SHORT_REASONS["empty"]
+        return decide.explain("empty")
     if "不存在" in reason or "not exist" in low or "不是普通文件" in reason:
-        return "the file could not be read"
+        return decide.explain("missing")
     if "时长" in reason:
-        return "its duration could not be read"
+        return decide.explain("unknown_duration")
     if "压缩" in reason and "拒绝" not in reason:
         return "compression failed"
     if "拒绝" in reason or "闸门" in reason or "too large" in low:
-        return "it exceeds the size limit"
+        return decide.explain("too_large")
     return "it could not be processed"
 
 

@@ -1,17 +1,19 @@
 """把视频占位符转换成 Gemini provider 能识别的视频内容块。
 
-这是插件的核心决策层：**不依赖 AstrBot**。
+这是插件的**执行**层：**不依赖 AstrBot**。
 
 处理流程::
 
-    路径存在性 -> 探测体积/时长 -> 是否需要压缩或截断
-        |                                  |
-        |  不需要                          |  需要
-        v                                  v
-      直接编码                       oversize_action 分支
-                                       compress -> ffmpeg(带缓存) -> 编码
-                                       truncate -> ffmpeg 截断 -> 编码
-                                       reject   -> 放弃并给出原因
+    路径存在性 -> 探测体积/时长 -> decide.classify() -> 执行 MediaPlan
+        |
+        +-- as-is             -> 直接编码源文件
+        +-- compress/truncate -> ffmpeg(带缓存) -> 编码
+        +-- reject / 无 ffmpeg / 读不出时长 -> 给出原因
+
+判决本身（闸门、oversize_action、截断估算、缓存资格、失败分类）全在
+``core/decide.py``：本模块里不再出现任何 ``if size_mb > config.max_size_mb``。
+0.2.1 这些知识在本文件与 ``main._diagnose`` 各写了一遍，于是产出了"诊断说谎"
+那一族 bug（判定行说「未超限，直接送」，下一行却是「❌ 分类: corrupt」）。
 
 任何一步失败都返回 ``ok=False`` 的结果，**绝不抛异常打断对话**。
 """
@@ -28,6 +30,7 @@ from typing import Any
 from astrbot.api import logger as _log
 
 from .config import VideoConfig
+from .decide import MediaPlan, classify
 from .media import (
     OUTPUT_SUFFIX,
     CompressCache,
@@ -38,9 +41,8 @@ from .media import (
     probe_duration,
     read_as_data_uri,
     resolve_ffmpeg_tools,
-    will_truncate,
 )
-from .placeholder import VIDEO_SUFFIXES, VideoPlaceholder
+from .placeholder import VideoPlaceholder
 
 
 @dataclass(frozen=True)
@@ -66,7 +68,9 @@ class PrepareOutcome:
     """准备结果。``ok=False`` 时 ``reason`` 说明原因（用于日志与 /videotest）。
 
     ``kind`` 是失败分类，取值与 ``MediaToolError.KINDS`` 一致，另有
-    ``missing``（路径不存在）/ ``rejected``（配置拒绝）/ ``size`` / ``internal``。
+    ``missing``（路径不存在）/ ``rejected``（配置拒绝）/ ``internal``（未预期异常）。
+    由判决产生的 kind 一律取自 ``decide.MediaPlan.kind``（唯一真相源），执行期失败
+    则取自 ``MediaToolError.kind``。
     它存在的意义是让上层不必靠中文字符串猜测失败原因 —— 0.2.0 里
     ``_short_reason`` 就是靠 ``"ffmpeg" in reason`` 判断，于是超时、退出码、
     未找到、产物为空全部被报成「ffmpeg is not available」。
@@ -76,34 +80,6 @@ class PrepareOutcome:
     injection: VideoInjection | None = None
     reason: str = ""
     kind: str = ""
-
-
-def _looks_like_video(path: str | os.PathLike[str]) -> bool:
-    """扩展名是否属于常见视频容器。"""
-    return Path(path).suffix.lower() in VIDEO_SUFFIXES
-
-
-def _estimate_truncate_seconds(
-    duration: float, size_mb: float, max_size_mb: float
-) -> float:
-    """按体积预算估算「截到多长才不超预算」。
-
-    体积近似随时长线性增长，于是
-    ``truncate_to ≈ duration * max_size_mb / size_mb``；再留 10% 余量（线性
-    假设对 CRF 编码偏乐观，宁可短一点），且至少 1 秒、不超过源时长。
-
-    Args:
-        duration: 源时长（秒）。
-        size_mb: 源体积（MB）。
-        max_size_mb: 体积闸门（MB）。
-
-    Returns:
-        建议的截断时长（秒）；参数不可用时返回 0.0（表示不截断）。
-    """
-    if duration <= 0 or size_mb <= 0 or max_size_mb <= 0:
-        return 0.0
-    estimate = duration * (max_size_mb / size_mb) * 0.9
-    return max(1.0, min(estimate, duration))
 
 
 def _make_block(used_path: str) -> dict[str, Any]:
@@ -172,7 +148,13 @@ def _prepare_video(
     log: Any,
     debug: bool,
 ) -> PrepareOutcome:
-    """``prepare_video`` 的实现体（允许抛异常，由外层兜住）。"""
+    """``prepare_video`` 的实现体（允许抛异常，由外层兜住）。
+
+    只有两步：**探测事实**（体积 / 时长 / ffmpeg 能力）和**执行判决**
+    （:func:`core.decide.classify` 给出的 :class:`MediaPlan`）。本函数里不再出现
+    任何 ``if size_mb > config.max_size_mb`` —— 那正是 0.2.1 里 ``main._diagnose``
+    手工重算一遍、然后与这里分叉的那段知识。
+    """
 
     def dbg(message: str, *args: Any) -> None:
         if debug:
@@ -189,25 +171,7 @@ def _prepare_video(
 
     ffmpeg, ffprobe = resolve_ffmpeg_tools(config.ffmpeg_path)
     size_mb = file_size_mb(source)
-    # 0 字节 / 读不到体积：0.2.0 会当成"未超限"直接编码注入，等于喂给模型空内容
-    if size_mb <= 0:
-        return PrepareOutcome(
-            False,
-            reason=f"文件是 0 字节（或无法读取体积），拒绝发送: {source}",
-            kind="empty",
-        )
     duration = probe_duration(source, ffprobe)
-    # 有时长探测能力却读不出时长、且扩展名是视频/容器 -> 文件损坏或不是媒体。
-    # 没有 ffprobe 时无法判断，保持旧行为（照样送，不误伤）。
-    if ffprobe and duration <= 0 and _looks_like_video(source):
-        return PrepareOutcome(
-            False,
-            reason=(
-                "无法解析视频（时长读取失败，文件可能已损坏或不是有效视频）: "
-                f"{source}"
-            ),
-            kind="corrupt",
-        )
     dbg(
         "探测 %s | 体积=%.2fMB 时长=%.2fs | ffmpeg=%s ffprobe=%s",
         placeholder.name,
@@ -217,23 +181,37 @@ def _prepare_video(
         ffprobe or "缺失",
     )
 
-    oversize = size_mb > config.max_size_mb
-    overlong = (
-        config.max_duration_sec > 0
-        and duration > 0
-        and duration > config.max_duration_sec
+    # ---- 判决（唯一真相源，不做 I/O）----
+    plan = classify(
+        size_mb=size_mb,
+        duration_sec=duration,
+        config=config,
+        mime_or_suffix=Path(source).suffix,
+        has_ffmpeg=bool(ffmpeg),
+        has_ffprobe=bool(ffprobe),
     )
     dbg(
-        "判定 超体积=%s 超时长=%s | 闸门=%.1fMB 时长上限=%.1fs 策略=%s",
-        oversize,
-        overlong,
+        "判定 超体积=%s 超时长=%s | 闸门=%.1fMB 时长上限=%.1fs 策略=%s | "
+        "plan=%s/%s 截断到=%.1fs 可缓存=%s",
+        plan.oversize,
+        plan.overlong,
         config.max_size_mb,
         config.max_duration_sec,
         config.oversize_action,
+        plan.action,
+        plan.reason_code,
+        plan.truncate_to_sec,
+        plan.cache_eligible,
     )
 
+    # ---- 判决说"执行不了"：分类（kind）与文案都来自 plan ----
+    if plan.blocked:
+        return PrepareOutcome(
+            False, reason=_blocked_reason(plan, config, source), kind=plan.kind
+        )
+
     # ---- 无需处理，直接送 ----
-    if not oversize and not overlong:
+    if plan.action == "as-is":
         dbg("无需处理，直接编码源文件")
         try:
             block = _make_block(source)
@@ -252,64 +230,20 @@ def _prepare_video(
                 used_path=source,
                 size_mb=size_mb,
                 duration_sec=duration,
-                action="as-is",
+                action=plan.outcome_action,
             ),
         )
 
-    why = []
-    if oversize:
-        why.append(f"体积 {size_mb:.1f}MB > 闸门 {config.max_size_mb:.1f}MB")
-    if overlong:
-        why.append(f"时长 {duration:.1f}s > 上限 {config.max_duration_sec:.1f}s")
-    trigger = "；".join(why)
-
-    # ---- 拒绝 ----
-    if config.oversize_action == "reject":
-        return PrepareOutcome(
-            False, reason=f"按配置拒绝（{trigger}）", kind="rejected"
+    # ---- 压缩 / 截断：参数全部来自 plan（要不要截、截到几秒都在里面）----
+    truncate_to = plan.truncate_to_sec
+    if plan.action == "truncate" and plan.oversize and truncate_to > 0:
+        dbg(
+            "truncate 按体积预算估算: %.1fMB -> %.1fs（源 %.1fs / %.1fMB）",
+            config.max_size_mb,
+            truncate_to,
+            duration,
+            size_mb,
         )
-
-    # ---- 需要 ffmpeg ----
-    if not ffmpeg:
-        hint = (
-            f"配置的 ffmpeg_path 无效: {config.ffmpeg_path}"
-            if config.ffmpeg_path
-            else "请安装 ffmpeg 或在插件配置里指定 ffmpeg_path"
-        )
-        return PrepareOutcome(
-            False,
-            reason=f"需要压缩但未找到 ffmpeg（{trigger}）。{hint}",
-            kind="not_found",
-        )
-    if duration <= 0:
-        return PrepareOutcome(
-            False,
-            reason=f"无法读取时长，拒绝盲压缩（{trigger}）",
-            kind="duration",
-        )
-
-    # ---- 截断决策（truncate 现在是**真的**按体积预算截断）----
-    # 0.2.0 的 truncate 与 compress 行为完全相同（只在"仅超时长"时多传一个
-    # -t），选项形同虚设。这里按体积预算估算一个时长：
-    #   truncate_to ≈ duration * max_size_mb / size_mb（留 10% 余量，最小 1s）
-    # 用户显式设的 max_duration_sec 仍然优先（取两者更小的）。
-    truncate_to = config.max_duration_sec if overlong else 0.0
-    if config.oversize_action == "truncate" and oversize:
-        estimated = _estimate_truncate_seconds(
-            duration, size_mb, config.max_size_mb
-        )
-        if estimated > 0:
-            truncate_to = min(estimated, truncate_to) if truncate_to else estimated
-            dbg(
-                "truncate 按体积预算估算: %.1fMB -> %.1fs（源 %.1fs / %.1fMB）",
-                config.max_size_mb,
-                truncate_to,
-                duration,
-                size_mb,
-            )
-    # action 只由「是否真的传了 -t」决定，避免报告与行为不一致
-    applied_truncate = will_truncate(duration, truncate_to)
-    action = "truncated" if applied_truncate else "compressed"
 
     # ---- 缓存查找 ----
     cache: CompressCache | None = None
@@ -344,9 +278,9 @@ def _prepare_video(
                         source_path=source,
                         used_path=hit,
                         size_mb=cached_size,
-                        duration_sec=min(duration, truncate_to or duration),
-                        action=action,
-                        note=f"缓存命中；{trigger}",
+                        duration_sec=plan.expected_duration_sec,
+                        action=plan.outcome_action,
+                        note=f"缓存命中；{plan.note}",
                     ),
                 )
         except Exception as exc:  # noqa: BLE001
@@ -395,7 +329,7 @@ def _prepare_video(
             final_path = cache.put(cache_key, produced)
 
         new_size = file_size_mb(final_path)
-        expected_duration = min(duration, truncate_to) if truncate_to else duration
+        expected_duration = plan.expected_duration_sec
         new_duration = probe_duration(final_path, ffprobe) or expected_duration
         dbg(
             "压缩完成 | 耗时=%.2fs %.2fMB -> %.2fMB | 产物时长=%.2fs",
@@ -405,8 +339,8 @@ def _prepare_video(
             new_duration,
         )
 
-        note = f"{trigger} -> {new_size:.1f}MB"
-        if applied_truncate:
+        note = f"{plan.note} -> {new_size:.1f}MB"
+        if plan.applies_truncate:
             note += f"（按体积预算截断到 {truncate_to:.1f}s）"
         if expected_duration and new_duration < expected_duration * 0.8:
             # -fs 触顶会让 ffmpeg 提前封口：时长比预期更短，是硬上限的代价
@@ -438,7 +372,7 @@ def _prepare_video(
                 used_path=final_path,
                 size_mb=new_size,
                 duration_sec=new_duration,
-                action=action,
+                action=plan.outcome_action,
                 note=note,
             ),
         )
@@ -447,6 +381,28 @@ def _prepare_video(
         # 放在 finally 里，任何提前 return / 异常路径都不会泄漏临时目录。
         if temp_dir is not None:
             _cleanup(temp_dir)
+
+
+def _blocked_reason(plan: MediaPlan, config: VideoConfig, source: str) -> str:
+    """把「为什么执行不了」渲染成一句话（文案与 0.2.1 逐字一致）。
+
+    判决只给 code，人话在这里拼：它需要 ``source`` 与 ``config.ffmpeg_path``，
+    而 ``decide.classify`` 刻意不看这两样（纯函数、零 I/O）。
+    """
+    if plan.reason_code in {"empty", "corrupt"}:
+        return f"{plan.note}: {source}"
+    if plan.reason_code == "rejected":
+        return f"按配置拒绝（{plan.note}）"
+    if plan.reason_code == "no_ffmpeg":
+        hint = (
+            f"配置的 ffmpeg_path 无效: {config.ffmpeg_path}"
+            if config.ffmpeg_path
+            else "请安装 ffmpeg 或在插件配置里指定 ffmpeg_path"
+        )
+        return f"需要压缩但未找到 ffmpeg（{plan.note}）。{hint}"
+    if plan.reason_code == "unknown_duration":
+        return f"无法读取时长，拒绝盲压缩（{plan.note}）"
+    return plan.note
 
 
 def content_hash_from_text(text: str) -> str:

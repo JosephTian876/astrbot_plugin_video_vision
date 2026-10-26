@@ -85,10 +85,32 @@ class VideoInfo:
     mime: str
 
 
+def suffix_of(path: str | os.PathLike[str] | None) -> str:
+    """小写扩展名（含点）；没有扩展名 / 传空时是空串。
+
+    全仓**唯一**的「取小写后缀」实现。0.2.1 有四份：``main._suffix_of``、
+    ``placeholder.VideoPlaceholder.looks_like_video``、``guess_video_mime`` 里的
+    ``Path(path).suffix``，以及 ``main`` 找 File 组件时内联的 ``os.path.splitext``
+    —— 同一件事四种写法，改一处就会漏（ARCH-REVIEW R5）。
+
+    注意它吃的是**路径**：``suffix_of("mp4")`` 是 ``""``（没有点），
+    ``suffix_of(".mp4")`` 也是 ``""``（``splitext`` 把前导点当文件名）。
+    要判断「裸扩展名或 MIME 是不是视频容器」，用
+    :func:`core.decide._looks_like_video`（它专门处理这两种形态）。
+
+    Args:
+        path: 文件路径（``str`` / ``PathLike``）；``None`` 视为空。
+
+    Returns:
+        形如 ``.mp4`` 的小写后缀；无后缀时是 ``""``。
+    """
+    text = "" if path is None else os.fspath(path)
+    return os.path.splitext(text)[1].lower()
+
+
 def guess_video_mime(path: str | os.PathLike[str]) -> str:
     """按扩展名猜 MIME；未知则回落到 video/mp4。"""
-    suffix = Path(path).suffix.lower()
-    return VIDEO_MIME_BY_SUFFIX.get(suffix, OUTPUT_MIME)
+    return VIDEO_MIME_BY_SUFFIX.get(suffix_of(path), OUTPUT_MIME)
 
 
 def file_size_mb(path: str | os.PathLike[str]) -> float:

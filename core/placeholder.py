@@ -21,11 +21,12 @@
 
 from __future__ import annotations
 
-import os
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
+
+from .media import suffix_of
 
 #: 核心生成的四种形态。path 用贪婪匹配到行尾的 `]`，以容忍路径里出现 `]`。
 _VIDEO_RE = re.compile(
@@ -63,8 +64,7 @@ class VideoPlaceholder:
 
     def looks_like_video(self) -> bool:
         """File 类型附件是否长得像视频（按扩展名判断）。"""
-        suffix = os.path.splitext(self.path or self.name or "")[1].lower()
-        return suffix in VIDEO_SUFFIXES
+        return suffix_of(self.path or self.name) in VIDEO_SUFFIXES
 
 
 def parse_placeholder_text(text: Any) -> VideoPlaceholder | None:

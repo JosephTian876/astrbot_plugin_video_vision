@@ -56,6 +56,16 @@ def test_core_zero_dependency_claim_is_qualified():
     assert "astrbot.api" in README
 
 
+def test_readme_directory_tree_lists_every_core_module():
+    """目录树必须与 ``core/*.py`` 一一对应（本轮新增 ``decide.py`` 时踩到的漂移）。"""
+    import re
+
+    listed = set(re.findall(r"^│\s+[├└]── (\w+)\.py", README, re.MULTILINE))
+    actual = {path.stem for path in (REPO / "core").glob("*.py")} - {"__init__"}
+    assert listed == actual, f"README 少列/多列: {sorted(listed ^ actual)}"
+    assert "decide.py" in README, "判决模块必须出现在目录树里"
+
+
 def test_hide_local_path_example_matches_the_real_output():
     assert "[Video: fileseg_xxx.mp4]" not in README
     real = _NEUTRALIZE_TEXT["gemini_native"].replace("{name}", "fileseg_xxx.mp4")

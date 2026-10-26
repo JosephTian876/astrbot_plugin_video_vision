@@ -381,8 +381,9 @@ astrbot_plugin_video_vision/
 ├── metadata.yaml
 ├── core/                   与 AstrBot 解耦的纯逻辑（便于日后上移核心）
 │   ├── config.py           配置模型与容错
+│   ├── decide.py           「会发生什么」的唯一真相源（纯函数：闸门/策略/截断/分类）
 │   ├── media.py            ffmpeg/ffprobe 封装、压缩、缓存
-│   ├── injector.py         体积闸门决策与压缩编排
+│   ├── injector.py         执行 decide 的 MediaPlan（压缩编排 + data URI 编码）
 │   ├── openai_vision.py    OpenAI 兼容视觉服务客户端（实测格式见模块说明）
 │   └── placeholder.py      占位文本解析
 └── hooks/
@@ -391,8 +392,8 @@ astrbot_plugin_video_vision/
 
 `core/` 下除 `injector.py` 从 `astrbot.api` 取 `logger` 之外**不依赖** AstrBot 的
 任何符号（插件市场安全检查要求日志记录器必须且只能来自 `astrbot.api`，所以这一处
-是有意保留的）。其余纯逻辑（`config` / `media` / `openai_vision` / `placeholder`）
-可以直接搬进 AstrBot 核心。
+是有意保留的）。其余纯逻辑（`config` / `decide` / `media` / `openai_vision` /
+`placeholder`）可以直接搬进 AstrBot 核心。
 
 ---
 

@@ -41,14 +41,21 @@ except ImportError:  # pragma: no cover
     GreedyStr = str  # type: ignore[assignment,misc]
 
 from .core.config import VideoConfig
+from .core.decide import (
+    ACTION_LABELS,
+    URI_LIMIT_MB,
+    URI_LIMIT_RAW_MB,
+    classify,
+    describe,
+)
 from .core.injector import prepare_video
 from .core.media import (
-    MAX_DATA_URI_BYTES,
     OUTPUT_MIME,
     file_size_mb,
     guess_video_mime,
     probe_duration,
     resolve_ffmpeg_tools,
+    suffix_of,
 )
 from .core.openai_vision import analyze_video, build_vision_prompt
 from .core.placeholder import VIDEO_SUFFIXES, VideoPlaceholder
@@ -82,15 +89,8 @@ PLUGIN_VERSION = _read_plugin_version()
 #: 比其他插件都晚执行（数值越小越晚），确保陪伴插件改写完请求后我们再追加。
 HOOK_PRIORITY = -300000
 
-_ACTION_LABELS = {
-    "compress": "压缩",
-    "reject": "拒绝",
-    "truncate": "截断",
-    "as-is": "直接送（未压缩）",
-    "compressed": "已压缩",
-    "truncated": "已截断",
-    "rejected": "已拒绝",
-}
+# ``_ACTION_LABELS`` 已搬进 ``core/decide.py``：动作词表是判决的一部分，
+# ``/videotest`` 的判定行与「动作:」行都查同一张表（见 ``decide.describe``）。
 
 #: ``/videotest`` 的用法。三条入口只有前两条在任何平台都成立，第三条看平台：
 #:
@@ -174,33 +174,6 @@ def _credentials_summary(cfg: VideoConfig) -> str:
     return f" ❌ 缺 {'、'.join(missing)}"
 
 
-#: data URI 硬上限（**编码后**）。与 ``core/media.py`` 用同一个常量，不复制魔数。
-_URI_LIMIT_MB = MAX_DATA_URI_BYTES / 1024 / 1024
-#: 换算成"原始体积"：base64 每 3 字节膨胀到 4 字节（18MB ≈ 13.5MB 源文件）。
-_URI_LIMIT_RAW_MB = _URI_LIMIT_MB * 3 / 4
-
-
-def _encoded_size_mb(raw_mb: float) -> float:
-    """原始体积 → 编码成 data URI 后的体积（估算，用于诊断行）。"""
-    return raw_mb * 4 / 3
-
-
-def _encoding_limit_note(raw_mb: float) -> str:
-    """体积 ``raw_mb`` 的文件编码后是否会撞上 data URI 硬上限；撞了就返回一句人话。"""
-    encoded_mb = _encoded_size_mb(raw_mb)
-    if encoded_mb <= _URI_LIMIT_MB:
-        return ""
-    return (
-        f"编码后约 {encoded_mb:.1f}MB > 编码上限 {_URI_LIMIT_MB:.0f}MB"
-        f"（≈ 原始 {_URI_LIMIT_RAW_MB:.1f}MB），实际会以 too_large 失败"
-    )
-
-
-def _suffix_of(path: str) -> str:
-    """小写扩展名（含点）；没有扩展名时是空串。"""
-    return os.path.splitext(path or "")[1].lower()
-
-
 def _unknown_container_note(path: str) -> str:
     """显式路径 + 未知后缀时的警示句；后缀是已知视频容器时返回空串。
 
@@ -212,7 +185,7 @@ def _unknown_container_note(path: str) -> str:
 
     这里只把事实写进报告，**不改任何行为**：正常消息流仍由闸门 ⓪ 负责筛选。
     """
-    suffix = _suffix_of(path)
+    suffix = suffix_of(path)
     if suffix in VIDEO_SUFFIXES:
         return ""
     return (
@@ -230,7 +203,7 @@ def _mime_line(path: str, action: str) -> str:
     """
     if action != "as-is":
         return f"MIME   : {OUTPUT_MIME}（压缩产物，固定为 mp4）"
-    if _suffix_of(path) in VIDEO_SUFFIXES:
+    if suffix_of(path) in VIDEO_SUFFIXES:
         return f"MIME   : {guess_video_mime(path)}"
     return f"MIME   : {OUTPUT_MIME} (推断)"
 
@@ -280,7 +253,7 @@ class VideoVisionPlugin(Star):
             self.config.max_size_mb,
             self.config.compress_max_mb,
             self.config.compress_crf,
-            _ACTION_LABELS.get(
+            ACTION_LABELS.get(
                 self.config.oversize_action, self.config.oversize_action
             ),
             self.config.require_gemini_provider,
@@ -431,7 +404,7 @@ class VideoVisionPlugin(Star):
                 if not isinstance(comp, File):
                     continue
                 name = str(getattr(comp, "name", "") or "")
-                if os.path.splitext(name)[1].lower() not in VIDEO_SUFFIXES:
+                if suffix_of(name) not in VIDEO_SUFFIXES:
                     continue
                 try:
                     path = await comp.get_file()
@@ -576,7 +549,7 @@ class VideoVisionPlugin(Star):
         lines.append(
             f"配置   : 闸门={cfg.max_size_mb:.1f}MB 上限={cfg.compress_max_mb:.1f}MB "
             f"CRF={cfg.compress_crf} "
-            f"策略={_ACTION_LABELS.get(cfg.oversize_action, cfg.oversize_action)}"
+            f"策略={ACTION_LABELS.get(cfg.oversize_action, cfg.oversize_action)}"
         )
         # 配置被自动修正过时，把"你写的原值 → 生效值"一起打出来。
         for notice in getattr(self, "config_notices", []):
@@ -585,7 +558,7 @@ class VideoVisionPlugin(Star):
             lines.append(f"配置修正: {warning}")
         # 与体积闸门无关的第二道体积限制：data URI 编码上限。
         lines.append(
-            f"编码上限: data URI {_URI_LIMIT_MB:.0f}MB ≈ 原始 {_URI_LIMIT_RAW_MB:.1f}MB"
+            f"编码上限: data URI {URI_LIMIT_MB:.0f}MB ≈ 原始 {URI_LIMIT_RAW_MB:.1f}MB"
             "（编码后超过必失败，与体积闸门无关）"
         )
 
@@ -610,45 +583,20 @@ class VideoVisionPlugin(Star):
         if container_note:
             lines.append(f"提醒   : {container_note}")
 
-        # ---- 体积 / 时长判定（与钩子完全相同的判定）----
-        # 判定行必须把 data URI 编码上限一起算进来：闸门放到 200MB 时若只写
-        # "未超限，直接送"，紧接着就是 too_large 失败 —— 诊断自相矛盾。
-        oversize = size_mb > cfg.max_size_mb
-        overlong = cfg.max_duration_sec > 0 and duration > cfg.max_duration_sec
-        # injector 的 corrupt 规则：有 ffprobe 能力却读不出时长 + 后缀是视频容器
-        # -> 直接 kind="corrupt"。判定行必须与它一致，否则"未超限，直接送"的
-        # 下一行就是"❌ 准备失败 分类: corrupt"（真机证据见 LIVE-TEST §10.2②）。
-        unreadable = (
-            bool(self.ffprobe)
-            and duration <= 0
-            and _suffix_of(target) in VIDEO_SUFFIXES
+        # ---- 体积 / 时长判定：只渲染 decide 的判决，绝不在这里重算 ----
+        # 0.2.1 这段是**手工预测** injector 会怎么判（注释自己写着"必须与 injector
+        # 完全一致"，corrupt / 编码上限 / overlong 的 duration>0 守卫都是靠人肉同步
+        # 的）。现在两侧吃同一个 MediaPlan：判定行与实际结果结构上不可能再分叉
+        # （真机证据见 LIVE-TEST §10.2②）。
+        plan = classify(
+            size_mb=size_mb,
+            duration_sec=duration,
+            config=cfg,
+            mime_or_suffix=suffix_of(target),
+            has_ffmpeg=bool(self.ffmpeg),
+            has_ffprobe=bool(self.ffprobe),
         )
-        if size_mb <= 0:
-            lines.append("判定   : 体积 0.00MB（空文件）→ 会以 empty 失败")
-        elif unreadable:
-            lines.append("判定   : 无法解析（时长读取失败）→ 会以 corrupt 失败")
-        elif not oversize and not overlong:
-            limit_note = _encoding_limit_note(size_mb)
-            if limit_note:
-                lines.append(f"判定   : 体积/时长在闸门内 → 直接送；但{limit_note}")
-            else:
-                lines.append("判定   : 未超限，直接送")
-        else:
-            why = []
-            if oversize:
-                why.append(f"体积 {size_mb:.1f}MB > 闸门 {cfg.max_size_mb:.1f}MB")
-            if overlong:
-                why.append(f"时长 {duration:.1f}s > 上限 {cfg.max_duration_sec:.1f}s")
-            label = _ACTION_LABELS.get(cfg.oversize_action, cfg.oversize_action)
-            line = f"判定   : {'；'.join(why)} → {label}"
-            # 压缩/截断的目标体积也可能撞编码上限（compress_max_mb 上界远大于 13.5MB）
-            if cfg.oversize_action != "reject":
-                target_note = _encoding_limit_note(cfg.compress_max_mb)
-                if target_note:
-                    line += (
-                        f"；但压缩目标 {cfg.compress_max_mb:.1f}MB {target_note}"
-                    )
-            lines.append(line)
+        lines.append(f"判定   : {describe(plan)}")
 
         # ---- 将要发给视觉服务的 prompt 预览（截断）----
         lines.append(f"prompt : {self._prompt_preview(cfg, effective_mode)}")
@@ -680,7 +628,7 @@ class VideoVisionPlugin(Star):
         budget_name = "视觉服务预算" if is_openai else "provider 预算"
 
         lines.append(f"✅ 准备成功（{elapsed:.2f}s）")
-        lines.append(f"动作: {_ACTION_LABELS.get(inj.action, inj.action)}")
+        lines.append(f"动作: {ACTION_LABELS.get(inj.action, inj.action)}")
         lines.append(f"产物: {inj.size_mb:.2f} MB / {inj.duration_sec:.1f} s")
         lines.append(f"编码: data URI {uri_mb:.2f} MB")
         # 声明给 provider 的 MIME：未知后缀回落 video/mp4 时标 (推断)，

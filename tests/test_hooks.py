@@ -66,6 +66,24 @@ def test_short_reason_prefers_machine_readable_kind(kind, expected):
     assert hooks._short_reason("随便什么原因", kind) == expected
 
 
+def test_short_reason_has_no_second_phrase_table():
+    """结构：码 -> 短语只有 ``core/decide.py`` 一份（本轮结构重构）。
+
+    0.2.1 在本文件里另存了 12 行 ``_SHORT_REASONS``，与判决侧各改各的。现在
+    ``_short_reason`` 只查 ``decide.explain``，这里把"不许再长出一张表"钉住：
+    对 ``decide.SHORT_REASONS`` 的每个键，hooks 的输出必须**逐字等于**判决侧的
+    文案（不是"差不多"，是同一个函数）。
+    """
+    from vv_plugin.core import decide
+
+    assert not hasattr(hooks, "_SHORT_REASONS"), "本地码表应已删除"
+    for code in decide.SHORT_REASONS:
+        assert hooks._short_reason("随便什么原因", code) == decide.explain(code), code
+    # 判决码（不是对外 kind）也必须走同一句话
+    for code in ("no_ffmpeg", "unknown_duration"):
+        assert hooks._short_reason("", code) == decide.explain(code), code
+
+
 def test_short_reason_still_handles_vision_service_reasons():
     assert (
         hooks._short_reason("视觉服务请求超时（可调大 openai_timeout_sec）")

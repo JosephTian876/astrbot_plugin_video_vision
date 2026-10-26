@@ -10,14 +10,14 @@ import tempfile
 
 import pytest
 
-from vv_plugin.core import injector, media
+from vv_plugin.core import media
 from vv_plugin.core.config import VideoConfig
+from vv_plugin.core.decide import estimate_truncate_seconds
 from vv_plugin.core.injector import PrepareOutcome, prepare_video
 from vv_plugin.core.media import MediaToolError, compress_video, probe_duration
 
 # 0.2.1 新增的符号用模块属性取，保证本文件在 0.2.0 上也能被收集
 # （从而拿到逐用例的基线对比，而不是收集期 ImportError）。
-_estimate_truncate_seconds = getattr(injector, "_estimate_truncate_seconds", None)
 MAX_DATA_URI_BYTES = getattr(media, "MAX_DATA_URI_BYTES", None)
 
 
@@ -82,12 +82,15 @@ def test_corrupt_file_is_still_allowed_without_ffprobe(
 
 
 def test_estimate_truncate_seconds_formula():
-    assert _estimate_truncate_seconds is not None, "0.2.1 才引入按体积估算截断"
-    assert _estimate_truncate_seconds(10.0, 20.0, 10.0) == pytest.approx(4.5)
-    assert _estimate_truncate_seconds(10.0, 1000.0, 10.0) == 1.0  # 下限 1 秒
-    assert _estimate_truncate_seconds(3.0, 1.0, 10.0) == 3.0  # 不超过源时长
-    assert _estimate_truncate_seconds(0.0, 10.0, 5.0) == 0.0
-    assert _estimate_truncate_seconds(5.0, 0.0, 5.0) == 0.0
+    """截断估算的公式与边界（0.2.1 起这条规则住在 ``core/decide.py``）。
+
+    断言的是**公式**（行为），不是它被哪个模块导出 —— 重构只搬了家，公式没动。
+    """
+    assert estimate_truncate_seconds(10.0, 20.0, 10.0) == pytest.approx(4.5)
+    assert estimate_truncate_seconds(10.0, 1000.0, 10.0) == 1.0  # 下限 1 秒
+    assert estimate_truncate_seconds(3.0, 1.0, 10.0) == 3.0  # 不超过源时长
+    assert estimate_truncate_seconds(0.0, 10.0, 5.0) == 0.0
+    assert estimate_truncate_seconds(5.0, 0.0, 5.0) == 0.0
 
 
 def test_truncate_action_really_truncates(
