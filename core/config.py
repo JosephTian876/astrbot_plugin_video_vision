@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields, replace
-from typing import Any, ClassVar
+from typing import Any
 
 #: 实测经中转站上传约 7-9 秒/MB（原始体积）。13MB 对应约 60-90 秒，
 #: 需留在 provider timeout（默认 120s，本机已调至 180s）之内。
@@ -123,12 +123,40 @@ def _as_int(
 
 
 def _as_float_or_none(value: Any) -> float | None:
-    """同 :func:`_as_float` 的容错，但**不**做上下界收敛；取不到数字返回 None。"""
+    """同 :func:`_as_float` 的容错，但**不**做上下界收敛；取不到数字返回 None。
+
+    用途只有一个：分辨"用户真的写了一个数（比如 0.1）"和"用户写了垃圾（比如
+    ``"abc"``）"。前者要报「低于下限、已收敛」，后者只是回落默认值 —— 与其它
+    数值键一致，不发提示。
+    """
     try:
         result = float(value)
     except (TypeError, ValueError, OverflowError):
         return None
     return None if result != result else result  # NaN 视为"没有值"
+
+
+#: ``compress_max_mb`` 的默认值（``_conf_schema.json`` 同值）
+DEFAULT_COMPRESS_MB = 8.0
+
+#: ``compress_max_mb`` 相对体积闸门保留的余量：压缩目标 = ``min(用户值, 闸门 × 0.9)``。
+#:
+#: 为什么是 0.9（而不是"砍到一半"的 0.6）：
+#:
+#: 1. 目标是"贴着闸门下方"：0.6 会让 13MB 闸门只剩 7.8MB，而码率预算本来就是
+#:    从这个目标反推的（``media.budget_kbits`` 按 max_mb 算），等于白白牺牲一半画质；
+#: 2. 压缩器自己已按 max_mb 反推码率并给容器与音频留了 8% 余量
+#:    （``media.py: budget_kbits = max_mb * 8192 * 0.92``），这 8% 与这里的 10%
+#:    是**叠加**的，常规产物落在闸门的 ~83%；
+#: 3. 真正的硬上限是 ``-fs``"写满即停"，实测溢出 1.03x（0.5MB 预算 -> 532KB）；
+#:    越小的预算里固定开销占比越高，最坏 1.28x 出现在 0.2MB 这种极小预算上
+#:    （见 FIX-REPORT §3.3-1）。10% 余量在 0.5MB 以上这一档吸收得掉；
+#: 4. 万一越过闸门，injector 压缩后会复核体积并记下"仍超闸门，已尽力"，
+#:    不会静默宣称成功。
+#:
+#: 系数 < 1 保证 ``min()`` 的结果严格小于闸门，因此 :func:`_resolve_compress_mb`
+#: **幂等**（再喂回去得到同一个值），``normalized()`` 对它的产出零改动零告警。
+COMPRESS_GATE_RATIO = 0.9
 
 
 def _mb_text(value: float) -> str:
@@ -165,9 +193,12 @@ def _as_str_list(value: Any) -> list[str]:
 
 #: 数值字段的 (下限, 上限)，用于把「被收敛的值」变成一条可读告警。
 #: 与 ``from_mapping_detailed`` 里的实际边界一一对应。
+#:
+#: ``compress_max_mb`` **刻意不在这张表里**：它的上界不是常量而是体积闸门，
+#: 且它的提示要同时写出"用户原值 → 最终值"。两者都由
+#: :func:`_resolve_compress_mb` 一次算完（单趟归一），不再走这里的通用循环。
 _NUMERIC_BOUNDS: dict[str, tuple[float, float]] = {
     "max_size_mb": (0.5, MAX_SIZE_MB_CEILING),
-    "compress_max_mb": (MIN_COMPRESS_MB, MAX_SIZE_MB_CEILING),
     "cache_max_mb": (16, CACHE_MAX_MB_CEILING),
     "max_video_count": (0, MAX_VIDEO_COUNT_CEILING),
     "max_compress_seconds": (1.0, MAX_COMPRESS_SECONDS_CEILING),
@@ -176,48 +207,75 @@ _NUMERIC_BOUNDS: dict[str, tuple[float, float]] = {
 }
 
 
-def _range_notices(
-    data: Mapping[str, Any], *, max_size_mb: float | None = None
-) -> list[str]:
+def _range_notices(data: Mapping[str, Any]) -> list[str]:
     """把「超出上下界、已被收敛」的字段列成告警（不报错）。
+
+    每个字段最多一条，格式统一为「``key=原值 高于/低于 边界，已收敛为 X``」。
+    ``compress_max_mb`` 的闸门上界与"原值 → 最终值"由
+    :func:`_resolve_compress_mb` 单独负责（0.2.1 曾在这里为它开特例，
+    结果同一个字段打出两个"最终值"）。
 
     Args:
         data: 用户的原始配置字典。
-        max_size_mb: **已经收敛过**的体积闸门。``compress_max_mb`` 的上界跟着
-            闸门走，所以这里用 ``min(_NUMERIC_BOUNDS 的硬上界, max_size_mb)``。
-            0.2.1 之前这一步在 ``from_mapping_detailed`` 里静默夹取（上界是
-            ``max_size`` 但 notices 用的上界是 ``MAX_SIZE_MB_CEILING``），用户
-            的 ``compress_max_mb=15.0`` 被悄悄改成 13.0，而告警里又只出现
-            13.0 —— 真机证据见 ``FIX-REPORT.md`` §5.7。同一个字段只报一次
-            （``min()`` 取代硬上界，不是新增一条）。
     """
     notices: list[str] = []
     for key, (low, high) in _NUMERIC_BOUNDS.items():
         if key not in data:
             continue
-        try:
-            number = float(data[key])
-        except (TypeError, ValueError, OverflowError):
+        number = _as_float_or_none(data[key])
+        if number is None:  # 垃圾值会回落默认值，不属于"收敛"
             continue
-        if number != number:  # NaN 会回落默认值，不属于"收敛"
-            continue
-        gate_bounded = key == "compress_max_mb" and max_size_mb is not None
-        if gate_bounded:
-            high = min(high, max_size_mb)
         if number < low:
             notices.append(f"{key}={number:g} 低于下限 {low:g}，已收敛为 {low:g}")
         elif number > high:
-            if gate_bounded:
-                notices.append(
-                    f"compress_max_mb={_mb_text(number)} 高于上限 "
-                    f"{_mb_text(high)}（= max_size_mb：压缩预算不能超过体积闸门），"
-                    f"已收敛为 {_mb_text(high)}"
-                )
-            else:
-                notices.append(
-                    f"{key}={number:g} 高于上限 {high:g}，已收敛为 {high:g}"
-                )
+            notices.append(f"{key}={number:g} 高于上限 {high:g}，已收敛为 {high:g}")
     return notices
+
+
+def _resolve_compress_mb(raw: Any, gate_mb: float) -> tuple[float, str]:
+    """把 ``compress_max_mb`` **一次**算成最终生效值，并给出至多一条提示。
+
+    最终值 = ``min(用户值, 闸门 × :data:`COMPRESS_GATE_RATIO`)``，且不低于
+    :data:`MIN_COMPRESS_MB`。
+
+    为什么必须一次算完：0.2.1 分两步改同一个字段 —— ``from_mapping_detailed``
+    先按体积闸门把 15.0 夹成 13.0（第一条提示），``normalized()`` 再降到 11.7
+    （第二条提示）。于是同一个旋钮在 ``/videotest`` 里出现三个数字
+    （15.0 / 13.0 / 11.7），两条提示都在说"已修正"，生效值却等于哪一条都没写。
+    现在只有一次改写、一条提示，原值与最终值出现在**同一句**里。
+
+    幂等性由构造保证：``min(x, gate × 0.9)`` 再喂回来必然得到同一个值，所以
+    :meth:`VideoConfig.normalized` 对 ``from_mapping`` 的产出是"零改动零告警"。
+
+    闸门太小（``gate × 0.9 < MIN_COMPRESS_MB``）时**无解**：返回
+    ``min(用户值, 闸门)`` 且**不发提示** —— 那种情况交给 ``normalized()`` 发一条
+    "无法自动修正"的显式告警，绝不能假装修好了。
+
+    Args:
+        raw: 用户写的原始值（任何 JSON 类型）。
+        gate_mb: **已经收敛过**的体积闸门。
+
+    Returns:
+        ``(生效值, 提示或空串)``。
+    """
+    asked = _as_float(raw, DEFAULT_COMPRESS_MB, minimum=MIN_COMPRESS_MB)
+    candidate = gate_mb * COMPRESS_GATE_RATIO
+    if candidate < MIN_COMPRESS_MB:
+        return min(asked, gate_mb), ""
+    final = min(asked, candidate)
+    number = _as_float_or_none(raw)
+    if number is not None and number < MIN_COMPRESS_MB:
+        return final, (
+            f"compress_max_mb={number:g} 低于下限 {MIN_COMPRESS_MB:g}，"
+            f"已收敛为 {_mb_text(final)}"
+        )
+    if final >= asked:  # 用户值本身就贴着闸门下方，没被改
+        return final, ""
+    return final, (
+        f"compress_max_mb={_mb_text(asked)} 超过体积闸门 "
+        f"max_size_mb={_mb_text(gate_mb)}，已按闸门的 "
+        f"{COMPRESS_GATE_RATIO:.0%} 收敛为 {_mb_text(final)}"
+    )
 
 
 def _unknown_key_notices(data: Mapping[str, Any]) -> list[str]:
@@ -239,7 +297,7 @@ class VideoConfig:
     #: 默认空列表 —— 行为与旧版完全一致。
     additional_provider_types: list[str] = field(default_factory=list)
     max_size_mb: float = DEFAULT_MAX_SIZE_MB
-    compress_max_mb: float = 8.0
+    compress_max_mb: float = DEFAULT_COMPRESS_MB
     compress_crf: int = 30
     compress_preset: str = "veryfast"
     max_duration_sec: float = 60.0
@@ -266,20 +324,6 @@ class VideoConfig:
     vision_describe_prompt: str = DEFAULT_DESCRIBE_PROMPT
     vision_qa_prompt: str = DEFAULT_QA_PROMPT
     vision_verify_ssl: bool = True
-
-    #: ``from_mapping_detailed`` 记下的**用户原始** ``compress_max_mb``。
-    #:
-    #: 为什么需要它：``compress_max_mb`` 的上界是体积闸门，所以 15.0 配 13.0
-    #: 闸门时，构造 ``VideoConfig`` 那一步就会把 15.0 夹成 13.0；随后
-    #: ``normalized()`` 再降到 11.7。若告警照实例里的值报，用户看到的永远是
-    #: 13.0 —— 他自己写的 15.0 一次都没出现过（真机证据见 LIVE-TEST §10.2①）。
-    #: 这里只记住数字，**不改任何行为**；解析失败 / 没写这个键时是 None。
-    #:
-    #: 用 ``ClassVar`` 声明是刻意的：``dataclasses.fields()`` 会跳过 ClassVar，
-    #: 于是 ``_conf_schema.json`` ↔ dataclass 的 1:1 测试不受影响，``==``、
-    #: ``replace()`` 与 ``repr()`` 也不受污染（``replace()`` 出来的新实例没有
-    #: 这个实例属性，回落到 None）。
-    raw_compress_max_mb: ClassVar[float | None] = None
 
     @property
     def openai_service_ready(self) -> bool:
@@ -316,30 +360,32 @@ class VideoConfig:
         告警覆盖两类默认完全静默的问题：
 
         1. **未知 / 拼错的配置键**（0.2.0 里拼错 ``max_size_mb`` 会无声地
-           回到默认值，用户只会奇怪"为什么配置没生效"）；
-        2. **被上下界收敛的数值**（``inf`` / ``1e999`` / 多打几个零），现在也
-           包括「``compress_max_mb`` 被体积闸门夹」这一步。
+            回到默认值，用户只会奇怪"为什么配置没生效"）；
+        2. **被上下界收敛的数值**（``inf`` / ``1e999`` / 多打几个零），以及
+           被体积闸门收敛的 ``compress_max_mb``。
 
-        返回的配置会记住用户写的原始 ``compress_max_mb``（见
-        :attr:`raw_compress_max_mb`），供 :meth:`normalized` 在告警里显示
-        真实数字。
+        ``compress_max_mb`` 在这里就**一次算成最终值**（见
+        :func:`_resolve_compress_mb`）：出一个数、发一条提示，提示里同时有原值
+        与最终值。因此 :meth:`normalized` 不再二次改动它。
 
         Returns:
             (配置, 告警列表)。告警只用于日志，**不阻塞**插件加载。
         """
         data: Mapping[str, Any] = raw if isinstance(raw, Mapping) else {}
-        # compress_max_mb 的上界跟着体积闸门走：压缩产物必须小于闸门，
-        # 否则压完仍然超限（normalized() 会再兜一次并告警）。闸门要先算出来，
-        # _range_notices 才报得出「你的 15.0 被闸门夹到 13.0」。
         max_size = _as_float(
             data.get("max_size_mb"),
             DEFAULT_MAX_SIZE_MB,
             minimum=0.5,
             maximum=MAX_SIZE_MB_CEILING,
         )
-        notices = _unknown_key_notices(data) + _range_notices(
-            data, max_size_mb=max_size
+        # 压缩目标的上界跟着体积闸门走（压完必须小于闸门），且要一次算完 ——
+        # 闸门必须先算出来。
+        compress_max_mb, compress_notice = _resolve_compress_mb(
+            data.get("compress_max_mb"), max_size
         )
+        notices = _unknown_key_notices(data) + _range_notices(data)
+        if compress_notice:
+            notices.append(compress_notice)
         config = cls(
             enable=_as_bool(data.get("enable"), True),
             require_gemini_provider=_as_bool(
@@ -349,12 +395,7 @@ class VideoConfig:
                 data.get("additional_provider_types")
             ),
             max_size_mb=max_size,
-            compress_max_mb=_as_float(
-                data.get("compress_max_mb"),
-                8.0,
-                minimum=MIN_COMPRESS_MB,
-                maximum=max_size,
-            ),
+            compress_max_mb=compress_max_mb,
             compress_crf=_as_int(data.get("compress_crf"), 30, minimum=0),
             compress_preset=_as_choice(
                 data.get("compress_preset"), "veryfast", VALID_PRESETS
@@ -423,11 +464,6 @@ class VideoConfig:
             ),
             vision_verify_ssl=_as_bool(data.get("vision_verify_ssl"), True),
         )
-        raw_compress = _as_float_or_none(data.get("compress_max_mb"))
-        if raw_compress is not None:
-            # frozen dataclass 没有字段可放它，也不该进 schema；用 object.__setattr__
-            # 挂一个实例属性（ClassVar 声明见 raw_compress_max_mb 的注释）。
-            object.__setattr__(config, "raw_compress_max_mb", raw_compress)
         return config, notices
 
     def normalized(self) -> tuple[VideoConfig, list[str]]:
@@ -436,9 +472,12 @@ class VideoConfig:
         能自动修正的：
 
         - ``compress_max_mb >= max_size_mb`` —— 那样压缩完仍然超限，下调到
-          **闸门的 90%**（贴着闸门下方留约 10% 余量，理由见函数体注释）；
-          告警里的数字是**用户写的原始值**（``from_mapping_detailed`` 记下的
-          :attr:`raw_compress_max_mb`），不是被闸门夹过之后的中间值；
+          **闸门的 90%**（理由见 :data:`COMPRESS_GATE_RATIO`）。这条只是
+          **不变量守卫**：``from_mapping_detailed`` 已经用同一个公式
+          （:func:`_resolve_compress_mb`）算好了最终值，那里产出的配置再跑本函数
+          一定"零改动零告警"（幂等性由 ``min()`` 的构造保证）。守卫仍然保留，是为了
+          兜住直接 ``VideoConfig(max_size_mb=13, compress_max_mb=13)`` 这种构造 ——
+          那条路径没有经过 ``from_mapping``；
         - ``compress_crf > 51`` —— 超出 H.264 上限。
 
         不能自动修正的**显式告警**，交给用户决定：
@@ -453,22 +492,7 @@ class VideoConfig:
         warnings: list[str] = []
         ceiling = self.compress_max_mb
         if ceiling >= self.max_size_mb:
-            # 目标是"贴着闸门下方"，不是砍到一半：0.6 会让 13MB 闸门只剩
-            # 7.8MB，而码率预算本来就是从这个目标反推的（media.py 的
-            # budget_kbits 按 max_mb 算），等于白白牺牲一半画质。
-            # 为什么是 0.9：
-            #   1) 压缩器自己已按 max_mb 反推码率并给容器与音频留了 8% 余量
-            #      （media.py: budget_kbits = max_mb * 8192 * 0.92），这 8% 与
-            #      这里的 10% 是**叠加**的，常规产物落在闸门的 ~83%；
-            #   2) 真正的硬上限是 -fs "写满即停"，实测溢出 1.03x（0.5MB 预算
-            #      -> 532KB）；越小的预算里固定开销占比越高，最坏 1.28x 出现
-            #      在 0.2MB 这种极小预算上（见 FIX-REPORT §3.3-1）。10% 余量
-            #      在 0.5MB 以上这一档吸收得掉；
-            #   3) 万一越过闸门，injector 压缩后会复核体积并记下
-            #      "仍超闸门，已尽力"，不会静默宣称成功。
-            # 系数 < 1 保证候选值严格小于闸门，所以 normalized() 幂等（再跑
-            # 一次不会又改），也不会在 0.9 与闸门之间来回打转。
-            candidate = self.max_size_mb * 0.9
+            candidate = self.max_size_mb * COMPRESS_GATE_RATIO
             if candidate < MIN_COMPRESS_MB:
                 warnings.append(
                     f"max_size_mb({self.max_size_mb:g}) 过小：compress_max_mb "
@@ -477,15 +501,8 @@ class VideoConfig:
                 )
             else:
                 ceiling = candidate
-                # 告警必须说**用户写的那个数**：from_mapping_detailed 已经把
-                # 15.0 夹成闸门 13.0，照 self.compress_max_mb 报就等于把用户的
-                # 15.0 悄悄换掉（真机证据见 LIVE-TEST §10.2①）。记住的原始值
-                # 优先；直接构造 VideoConfig 时没有原始值，就报当前值。
-                asked = self.compress_max_mb
-                if self.raw_compress_max_mb is not None:
-                    asked = self.raw_compress_max_mb
                 warnings.append(
-                    f"compress_max_mb({_mb_text(asked)}) 必须小于 "
+                    f"compress_max_mb({_mb_text(self.compress_max_mb)}) 必须小于 "
                     f"max_size_mb({_mb_text(self.max_size_mb)})，"
                     f"已自动下调为 {ceiling:.1f}"
                 )

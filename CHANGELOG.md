@@ -94,12 +94,16 @@
 - `normalized()` 把 `compress_max_mb >= max_size_mb` 的目标下调到**闸门的 90%**
   （贴着闸门下方留 10% 余量；压缩器本身已按 `max_mb` 反推码率并留 8% 容器余量，
   `-fs` 实测溢出 1.03–1.28×，此前砍到 60% 等于白白牺牲一半画质 —— 13MB 闸门下
-  7.8MB 变 11.7MB）。
-- `compress_max_mb` 被体积闸门夹这件事不再静默：`from_mapping_detailed` 的
-  notices 里会出现「`compress_max_mb=15.0` 高于上限 `13.0`（= max_size_mb）…」，
-  而 `normalized()` 的告警改为显示**用户写的原始值**：
-  `compress_max_mb(15.0) 必须小于 max_size_mb(13.0)，已自动下调为 11.7`
-  （此前两步夹取都静默/串了号，用户只看得到 13.0）。
+  7.8MB 变 11.7MB）。0.2.1 起这条只是**不变量守卫**，正常路径由下面这条一次算完。
+- **`compress_max_mb` 单趟归一：一个数值、一条提示。** 0.2.1 分两步改同一个字段
+  —— `from_mapping_detailed` 先按体积闸门把 15.0 夹成 13.0（提示一条），
+  `normalized()` 再降到 11.7（第二条提示）。于是同一个旋钮在 `/videotest` 里出现
+  **三个数字**（15.0 / 13.0 / 11.7），两条提示都在说"已修正"，生效值却等于哪一条
+  都没写全。现在只有一次改写、一条提示，原值与最终值同句：
+  `compress_max_mb=15.0 超过体积闸门 max_size_mb=13.0，已按闸门的 90% 收敛为 11.7`。
+  幂等性由构造保证（`min(x, 闸门 × 0.9)` 再喂回去必然同值），因此 `normalized()`
+  对它的产出零改动零告警 —— 不再需要"记住用户原值"的隐状态（`ClassVar` +
+  `object.__setattr__` 已删除）。
 - `normalized()` 对**无法自动修正**的矛盾显式告警：`max_size_mb` 小于 0.56MB
   时 `compress_max_mb` 无解（旧代码会报告"已自动下调"却没真的修好）、
   `oversize_action=truncate` 配 `max_duration_sec<=0`、

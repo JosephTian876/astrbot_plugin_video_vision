@@ -377,9 +377,12 @@ def test_diagnose_flags_the_guessed_mime_for_unknown_suffixes(
 def test_diagnose_echoes_config_corrections_with_the_raw_value(
     media_tools, tiny_video, tmp_path, stub_logger
 ):
-    """真实配置那种「15.0 配 13.0 闸门」，/videotest 必须打出用户写的 15.0。
+    """真实配置那种「15.0 配 13.0 闸门」，`/videotest` 必须打出用户写的 15.0。
 
     真机证据见 LIVE-TEST §10.2①：用户只能看到「上限=7.8MB」，看不到 15.0 被夹过。
+    单趟归一之后是**一条**提示，原值 15.0 与最终值 11.7 在同一句里 ——
+    旧实现会打两条（`配置提示:` 说收敛为 13.0、`配置修正:` 说下调为 11.7），
+    同一个旋钮三个数字。
     """
     plugin = make_plugin(
         _Context(),
@@ -393,11 +396,13 @@ def test_diagnose_echoes_config_corrections_with_the_raw_value(
     report = run(plugin._diagnose(tiny_video, event=_Event()))
 
     assert "配置   : 闸门=13.0MB 上限=11.7MB" in report
-    assert "配置提示: compress_max_mb=15.0 高于上限 13.0" in report
     assert (
-        "配置修正: compress_max_mb(15.0) 必须小于 max_size_mb(13.0)，"
-        "已自动下调为 11.7"
+        "配置提示: compress_max_mb=15.0 超过体积闸门 max_size_mb=13.0，"
+        "已按闸门的 90% 收敛为 11.7"
     ) in report
+    # 同一个字段只有一条提示：不能再出现第二条"已自动下调"
+    assert "配置修正:" not in report
+    assert "已自动下调" not in report
 
 
 def test_diagnose_does_not_flag_known_video_suffixes(

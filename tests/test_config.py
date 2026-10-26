@@ -137,12 +137,75 @@ def test_compress_budget_never_exceeds_gate():
 
 def test_normalized_lowers_compress_below_gate():
     """13/15 这组自相矛盾的配置：目标贴着闸门下方（90%），不是砍到 60%。"""
-    cfg, warnings = VideoConfig.from_mapping(
+    cfg, notices = VideoConfig.from_mapping_detailed(
         {"max_size_mb": 13, "compress_max_mb": 15}
-    ).normalized()
+    )
     assert cfg.compress_max_mb < 13
     assert cfg.compress_max_mb == pytest.approx(11.7)
-    assert any("已自动下调" in item for item in warnings)
+    # 单趟归一：这一步已经出最终值，normalized() 不再二次改动
+    fixed, warnings = cfg.normalized()
+    assert fixed == cfg
+    assert warnings == []
+    assert any("11.7" in item for item in notices)
+
+
+def test_compress_budget_is_resolved_in_one_pass_with_one_notice():
+    """回归（LIVE-TEST §10.2①）：15.0 配 13.0 闸门曾打出**两个**"最终值"。
+
+    旧实现：`from_mapping_detailed` 先按闸门夹成 13.0（提示一条），
+    `normalized()` 再降到 11.7（第二条提示）—— 同一个旋钮出现三个数字，
+    生效值等于哪一条提示都没写。现在一次算完、只发一条，原值与最终值同句。
+    """
+    raw = {"max_size_mb": 13.0, "compress_max_mb": 15.0}
+    cfg, notices = VideoConfig.from_mapping_detailed(raw)
+    fixed, warnings = cfg.normalized()
+
+    assert cfg.compress_max_mb == pytest.approx(11.7)
+    assert fixed == cfg and warnings == []
+
+    budget_notices = [item for item in notices if "compress_max_mb" in item]
+    assert len(budget_notices) == 1, notices
+    assert budget_notices[0] == (
+        "compress_max_mb=15.0 超过体积闸门 max_size_mb=13.0，"
+        "已按闸门的 90% 收敛为 11.7"
+    )
+    # 一个字段只出现在一条消息里（另一类消息里不许再提它）
+    assert sum("compress_max_mb" in item for item in notices) == 1
+    assert warnings == []
+
+
+def test_resolving_the_compress_budget_is_idempotent():
+    """幂等性由构造保证：``min(用户值, 闸门×0.9)`` 再喂回去是同一个值。"""
+    for gate in (13.0, 0.6, 1.0, 2000.0):
+        for asked in (0.1, 0.5, 5.0, 8.0, 12.0, 13.0, 15.0, 5000.0):
+            cfg, _ = VideoConfig.from_mapping_detailed(
+                {"max_size_mb": gate, "compress_max_mb": asked}
+            )
+            again, warnings = cfg.normalized()
+            assert again == cfg, (gate, asked, cfg)
+            # 压缩预算这条不变量必须已经满足：不会再"自动下调"或"无法修正"
+            assert not [
+                item
+                for item in warnings
+                if "已自动下调" in item or "无法自动修正" in item
+            ], (gate, asked, warnings)
+            # 再走一遍 from_mapping 也必须零提示（同一个值进、同一个值出）
+            recycled, notices = VideoConfig.from_mapping_detailed(
+                {"max_size_mb": cfg.max_size_mb, "compress_max_mb": cfg.compress_max_mb}
+            )
+            assert recycled.compress_max_mb == pytest.approx(cfg.compress_max_mb)
+            assert [item for item in notices if "compress_max_mb" in item] == []
+
+
+def test_compress_budget_below_the_lower_bound_is_reported_once():
+    cfg, notices = VideoConfig.from_mapping_detailed(
+        {"max_size_mb": 13.0, "compress_max_mb": 0.1}
+    )
+    assert cfg.compress_max_mb == pytest.approx(getattr(config_mod, "MIN_COMPRESS_MB"))
+    budget_notices = [item for item in notices if "compress_max_mb" in item]
+    assert budget_notices == [
+        "compress_max_mb=0.1 低于下限 0.5，已收敛为 0.5"
+    ]
 
 
 def test_normalized_tiny_gate_stays_solvable_and_under_the_gate():
@@ -273,59 +336,65 @@ def test_clean_config_has_no_notices():
 
 
 def test_compress_budget_clamped_by_gate_reports_the_raw_value():
-    """回归：15.0 配 13.0 闸门被**夹了两次**，用户却只看得到 13.0（LIVE-TEST §10.2①）。
+    """回归：15.0 配 13.0 闸门曾被**夹了两次**，用户却只看得到 13.0 或 11.7。
 
-    - 第一步：构造配置时 `compress_max_mb` 的上界是体积闸门，15.0 → 13.0，静默；
-    - 第二步：`normalized()` 再 13.0 → 11.7，告警里写的也是 13.0。
-    现在第一步进 notices、第二步的告警说用户写的 15.0 → 11.7。
+    旧实现两步都各发一条消息：第一步 15.0 → 13.0（notices），第二步 13.0 →
+    11.7（warnings），两条都在说"已修正"，生效值却等于任何一条都没写全的数。
+    现在只有一条，且原值 15.0 与最终值 11.7 出现在同一句里。
     """
     raw = {"max_size_mb": 13.0, "compress_max_mb": 15.0}
     cfg, notices = VideoConfig.from_mapping_detailed(raw)
-    assert cfg.compress_max_mb == pytest.approx(13.0)
-    fixed, warnings = cfg.normalized()
-    assert fixed.compress_max_mb == pytest.approx(11.7)
+    assert cfg.compress_max_mb == pytest.approx(11.7)
 
-    # ① 被闸门夹这件事进了 notices，且写的是用户的 15.0
     gate_notices = [item for item in notices if "compress_max_mb" in item]
     assert len(gate_notices) == 1, notices
-    assert "15.0" in gate_notices[0], notices
-    assert "13.0" in gate_notices[0], notices
-
-    # ② normalized 的告警说"15.0 -> 11.7"，不是被夹过的 13.0
-    auto_fixed = [item for item in warnings if "已自动下调" in item]
-    assert len(auto_fixed) == 1, warnings
-    assert "compress_max_mb(15.0)" in auto_fixed[0], warnings
-    assert "max_size_mb(13.0)" in auto_fixed[0], warnings
-    assert "11.7" in auto_fixed[0], warnings
-    # ③ 同一个字段只报一次，不产生第二条重复告警
-    assert sum("compress_max_mb" in item for item in notices + warnings) == 2
-    assert sum("已自动下调" in item for item in warnings) == 1
+    assert "15.0" in gate_notices[0], notices  # 用户原值
+    assert "13.0" in gate_notices[0], notices  # 体积闸门
+    assert "11.7" in gate_notices[0], notices  # 最终生效值
+    # 同一个字段只报一次，不再有第二条"自动修正"
+    fixed, warnings = cfg.normalized()
+    assert fixed.compress_max_mb == pytest.approx(11.7)
+    assert warnings == []
 
 
-def test_normalized_without_a_raw_value_reports_the_current_value():
-    """直接构造 VideoConfig 时没有"原始值"可记，告警回落成当前值（不能报空）。"""
+def test_normalized_still_guards_a_directly_constructed_conflict():
+    """``normalized()`` 仍是**不变量守卫**：直接构造的 13/13 也要被修正。
+
+    ``from_mapping`` 那条路已经单趟算完（不会再触发），但绕过它的构造方式
+    （测试、未来的配置来源）必须继续被兜住，并且告警说得出当前值。
+    """
     cfg, warnings = VideoConfig(max_size_mb=13.0, compress_max_mb=13.0).normalized()
     assert cfg.compress_max_mb == pytest.approx(11.7)
     assert any("compress_max_mb(13.0)" in item for item in warnings), warnings
+    assert any("已自动下调为 11.7" in item for item in warnings), warnings
+    # 守卫本身也幂等
+    again, again_warnings = cfg.normalized()
+    assert again == cfg and again_warnings == []
 
 
-def test_raw_value_memory_does_not_leak_into_schema_or_equality():
-    """记住 raw 值只是实例属性：不进 dataclass 字段、不影响 == / schema 1:1。"""
-    from dataclasses import fields
+def test_no_hidden_raw_value_state_on_the_frozen_dataclass():
+    """回归：不得再用 ``object.__setattr__`` 往 frozen dataclass 塞隐状态。
 
-    assert "raw_compress_max_mb" not in {item.name for item in fields(VideoConfig)}
+    0.2.1 为了在告警里报"用户写的 15.0"，用一个 ``ClassVar`` + 实例属性记住原值
+    —— 既污染了数据模型，又在 ``replace()`` 后丢失。单趟归一后不再需要它。
+    """
+    assert not hasattr(VideoConfig, "raw_compress_max_mb")
+    source = (REPO_ROOT / "core" / "config.py").read_text(encoding="utf-8")
+    assert "object.__setattr__" not in source
+    assert "ClassVar" not in source
+    assert "raw_compress_max_mb" not in source
     raw = {"max_size_mb": 13.0, "compress_max_mb": 15.0}
     remembered, _ = VideoConfig.from_mapping_detailed(raw)
-    assert remembered.raw_compress_max_mb == 15.0
     assert remembered == VideoConfig.from_mapping(raw)
-    plain = VideoConfig(max_size_mb=13.0, compress_max_mb=13.0)
-    assert plain.raw_compress_max_mb is None
+    assert not hasattr(remembered, "raw_compress_max_mb")
 
 
 def test_private_helpers_are_not_public_api():
-    """``_range_notices`` / ``_unknown_key_notices`` 只是内部实现。"""
+    """``_resolve_compress_mb`` / ``_range_notices`` 只是内部实现。"""
     assert config_mod._as_int(float("inf"), 7, maximum=3) == 3
     assert config_mod._as_int(float("-inf"), 7, minimum=1) == 1
+    final, notice = config_mod._resolve_compress_mb(15.0, 13.0)
+    assert final == pytest.approx(11.7) and "11.7" in notice
 
 
 # ------------------------------------------------------------- 向后兼容
