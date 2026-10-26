@@ -272,6 +272,56 @@ def test_clean_config_has_no_notices():
     assert notices == []
 
 
+def test_compress_budget_clamped_by_gate_reports_the_raw_value():
+    """回归：15.0 配 13.0 闸门被**夹了两次**，用户却只看得到 13.0（LIVE-TEST §10.2①）。
+
+    - 第一步：构造配置时 `compress_max_mb` 的上界是体积闸门，15.0 → 13.0，静默；
+    - 第二步：`normalized()` 再 13.0 → 11.7，告警里写的也是 13.0。
+    现在第一步进 notices、第二步的告警说用户写的 15.0 → 11.7。
+    """
+    raw = {"max_size_mb": 13.0, "compress_max_mb": 15.0}
+    cfg, notices = VideoConfig.from_mapping_detailed(raw)
+    assert cfg.compress_max_mb == pytest.approx(13.0)
+    fixed, warnings = cfg.normalized()
+    assert fixed.compress_max_mb == pytest.approx(11.7)
+
+    # ① 被闸门夹这件事进了 notices，且写的是用户的 15.0
+    gate_notices = [item for item in notices if "compress_max_mb" in item]
+    assert len(gate_notices) == 1, notices
+    assert "15.0" in gate_notices[0], notices
+    assert "13.0" in gate_notices[0], notices
+
+    # ② normalized 的告警说"15.0 -> 11.7"，不是被夹过的 13.0
+    auto_fixed = [item for item in warnings if "已自动下调" in item]
+    assert len(auto_fixed) == 1, warnings
+    assert "compress_max_mb(15.0)" in auto_fixed[0], warnings
+    assert "max_size_mb(13.0)" in auto_fixed[0], warnings
+    assert "11.7" in auto_fixed[0], warnings
+    # ③ 同一个字段只报一次，不产生第二条重复告警
+    assert sum("compress_max_mb" in item for item in notices + warnings) == 2
+    assert sum("已自动下调" in item for item in warnings) == 1
+
+
+def test_normalized_without_a_raw_value_reports_the_current_value():
+    """直接构造 VideoConfig 时没有"原始值"可记，告警回落成当前值（不能报空）。"""
+    cfg, warnings = VideoConfig(max_size_mb=13.0, compress_max_mb=13.0).normalized()
+    assert cfg.compress_max_mb == pytest.approx(11.7)
+    assert any("compress_max_mb(13.0)" in item for item in warnings), warnings
+
+
+def test_raw_value_memory_does_not_leak_into_schema_or_equality():
+    """记住 raw 值只是实例属性：不进 dataclass 字段、不影响 == / schema 1:1。"""
+    from dataclasses import fields
+
+    assert "raw_compress_max_mb" not in {item.name for item in fields(VideoConfig)}
+    raw = {"max_size_mb": 13.0, "compress_max_mb": 15.0}
+    remembered, _ = VideoConfig.from_mapping_detailed(raw)
+    assert remembered.raw_compress_max_mb == 15.0
+    assert remembered == VideoConfig.from_mapping(raw)
+    plain = VideoConfig(max_size_mb=13.0, compress_max_mb=13.0)
+    assert plain.raw_compress_max_mb is None
+
+
 def test_private_helpers_are_not_public_api():
     """``_range_notices`` / ``_unknown_key_notices`` 只是内部实现。"""
     assert config_mod._as_int(float("inf"), 7, maximum=3) == 3
