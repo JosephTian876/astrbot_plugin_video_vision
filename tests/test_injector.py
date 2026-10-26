@@ -123,7 +123,12 @@ def test_truncate_action_really_truncates(
 def test_compress_action_label_follows_real_dash_t(
     media_tools, ffmpeg_dir, noisy_video, make_placeholder, stub_logger
 ):
-    """只超时长（不超体积）时也必须报告"已截断"（0.2.0 报 compressed）。"""
+    """护栏：只超时长（不超体积）时也必须报告"已截断"。
+
+    注意这条在 v0.2.0 上**本来就通过**（公式 ``truncated if overlong and not
+    oversize`` 在"仅超时长"时正好给对），所以它是护栏而不是回归 —— 真正的标签
+    缺陷场景是下面那条"既超体积又超时长"。
+    """
     cfg = config_for(
         ffmpeg_dir,
         max_size_mb=50.0,
@@ -141,6 +146,35 @@ def test_compress_action_label_follows_real_dash_t(
     assert outcome.ok is True, outcome.reason
     assert outcome.injection.action == "truncated"
     assert outcome.injection.duration_sec < 2.5
+
+
+def test_action_label_when_oversize_and_overlong(
+    media_tools, ffmpeg_dir, noisy_video, make_placeholder, stub_logger
+):
+    """回归：既超体积又超时长时，0.2.0 真的传了 ``-t``（截到 1.5s）却报 compressed。
+
+    0.2.0 的公式是 ``truncated if (overlong and not oversize) else compressed``，
+    所以"只超时长"那条本来就通过；本用例覆盖的是它算错标签的真实场景。
+    """
+    cfg = config_for(
+        ffmpeg_dir,
+        max_size_mb=0.25,  # 4s 高熵片必然超
+        compress_max_mb=0.2,
+        oversize_action="compress",
+        max_duration_sec=1.5,  # 同时超时长
+        cache_enabled=False,
+    )
+    outcome = prepare_video(
+        make_placeholder(noisy_video),
+        config=cfg,
+        cache_root=None,
+        logger=stub_logger,
+    )
+
+    assert outcome.ok is True, outcome.reason
+    injection = outcome.injection
+    assert injection.action == "truncated"
+    assert injection.duration_sec < 2.5  # 确实被 -t 截短了，不是只改标签
 
 
 def test_reject_action_does_not_run_ffmpeg(
