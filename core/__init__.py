@@ -1,7 +1,11 @@
 """与 AstrBot 解耦的核心逻辑。
 
-本包内所有模块**不得**导入 astrbot.*，以便日后把视频支持上移到 AstrBot 核心
-（PR）时可以直接搬迁，无需改写。
+本包内所有模块**不导入 AstrBot 框架内部**，唯一例外是 ``injector.py`` 里的
+``from astrbot.api import logger`` —— 插件市场（LLM Guard）的日志规范要求记录器
+必须且只能从 ``astrbot.api`` 取得，不允许直接用内置 ``logging``（见
+``CHANGELOG.md`` 0.1.1 条）。也就是说：除 ``astrbot.api.logger`` 这一个合规例外，
+本包不 ``import astrbot.*``（``tests/test_docs.py`` 用 AST 锁住这条，docstring
+写错会红），以便日后把视频支持上移到 AstrBot 核心（PR）时可以直接搬迁，无需改写。
 """
 
 from .config import VideoConfig

@@ -71,7 +71,9 @@ Responses API（`/responses`）同样实测支持：视频用 `input_image` + da
 - 无第三方 Python 依赖（`openai_compat` 复用 AstrBot 自带的 `httpx`，它随
   `google-genai` 一起安装；若删掉那条依赖会走 ImportError 兜底并给出提示）。
 - AstrBot **>= 4.24.1**（`mark_as_temp` 自 4.24.1 起；占位符与 `modalities`
-  清洗自 4.23.5 起）。
+  清洗自 4.23.5 起）。**这个下界是按符号存在性核对出来的，没有在 4.24.1 上
+  实跑过** —— 真机全流程只在 4.29.1 上跑过。若你在 4.24.1–4.28.x 上遇到问题，
+  请带 `/videotest` 输出回报 issue。
 
 ---
 

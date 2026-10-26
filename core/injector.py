@@ -1,6 +1,12 @@
 """把视频占位符转换成 Gemini provider 能识别的视频内容块。
 
-这是插件的**执行**层：**不依赖 AstrBot**。
+这是插件的**执行**层：除 ``astrbot.api.logger`` 之外不依赖 AstrBot。
+
+为什么留那一个例外：插件市场（LLM Guard）的日志规范要求记录器必须且只能从
+``astrbot.api`` 取得，不允许直接用内置 ``logging``（``CHANGELOG.md`` 0.1.1 条）。
+所以本模块不是"零框架依赖"，而是"零框架**内部**依赖"——``astrbot.api`` 是公开
+API 面，其余（``astrbot.core.*`` / ``Context`` / ``AstrMessageEvent``）一概不碰，
+``tests/test_docs.py::test_code_side_dependency_claims_match_reality`` 用 AST 锁着。
 
 处理流程::
 
@@ -126,6 +132,10 @@ def prepare_video(
             log=log,
             debug=debug,
         )
+    # 这条 noqa 在 pin 住的 ruff 0.15.22 下**真的**在被使用：删掉它，同一行
+    # 立刻报 BLE001（已验证，见 FIX-REPORT §5.13-G）。ruff ≥0.16 的 BLE001 不再
+    # 对"记一条日志 + 返回降级结果"的 handler 报警，所以在 0.17.x 眼里它会是
+    # unused（RUF100）—— 那是**升级 ruff 时才需要处理**的事，别现在当成死代码删掉。
     except Exception as exc:  # noqa: BLE001 - 契约要求：任何失败都只返回结果
         log.warning(
             "[VideoVision] 准备视频时出现未预期异常: %s: %s",

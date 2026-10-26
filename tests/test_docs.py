@@ -43,6 +43,14 @@ def test_astrbot_lower_bound_matches_what_the_code_needs():
     assert "AstrBot **>= 4.24.1**" in README
 
 
+def test_astrbot_lower_bound_says_it_was_not_run_on_that_version():
+    """回归（VERIFY2 P3-9）：下界是按符号存在性论证的，文档不能暗示实跑过。"""
+    for text in (README, CHANGELOG):
+        assert "符号存在性" in text
+        assert "没有在 4.24.1 上" in text
+        assert "/videotest` 输出回报" in text
+
+
 def test_size_fuse_claim_is_no_longer_absolute():
     assert "不会压出超预算的文件" not in README
     assert "不会压出超预算的文件" not in MEDIA_SOURCE
@@ -54,6 +62,39 @@ def test_core_zero_dependency_claim_is_qualified():
     assert "core/ 下**不允许**出现 `import astrbot`" not in README
     assert "除 `injector.py` 从 `astrbot.api` 取 `logger`" in README
     assert "astrbot.api" in README
+
+
+def test_code_side_dependency_claims_match_reality():
+    """回归（VERIFY2 P3-2）：README 改了口径，代码里的两句规则没跟着改。
+
+    ``core/__init__.py`` 曾写"本包内所有模块**不得**导入 astrbot.*"，而
+    ``core/injector.py`` 的 import 段就 ``from astrbot.api import logger``；
+    ``injector.py`` 的模块 docstring 也曾写"**不依赖 AstrBot**"。
+    这里同时锁两件事：说法必须限定，**实际导入**也只允许那一条。
+    """
+    import ast
+
+    package = (REPO / "core" / "__init__.py").read_text(encoding="utf-8")
+    injector = (REPO / "core" / "injector.py").read_text(encoding="utf-8")
+    assert "不得**导入 astrbot" not in package
+    assert "astrbot.api" in package
+    assert "**不依赖 AstrBot**" not in injector
+
+    imports: list[tuple[str, str, list[str]]] = []
+    for path in sorted((REPO / "core").glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and (node.module or "").startswith(
+                "astrbot"
+            ):
+                imports.append(
+                    (path.name, node.module or "", [a.name for a in node.names])
+                )
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.startswith("astrbot"):
+                        imports.append((path.name, alias.name, []))
+    assert imports == [("injector.py", "astrbot.api", ["logger"])], imports
 
 
 def test_readme_directory_tree_lists_every_core_module():
@@ -137,6 +178,19 @@ def test_requirements_has_no_new_runtime_dependency():
 def test_schema_hints_mention_the_new_guards():
     assert "墙钟" in SCHEMA["max_compress_seconds"]["hint"]
     assert "1.3-3.2" in SCHEMA["compress_max_mb"]["hint"]
+
+
+def test_compress_hint_explains_the_gate_ceiling():
+    """回归（VERIFY2 P3-3）：面板 hint 只说"必须小于闸门"，没说会被闸门收敛。
+
+    README / CHANGELOG 都写了 90%，只有用户真会在面板上读到的那一句漏了 ——
+    于是"我填了 15，为什么生效 11.7"在面板里查不到解释。
+    """
+    hint = SCHEMA["compress_max_mb"]["hint"]
+    assert "max_size_mb" in hint
+    assert "90%" in hint
+    assert "启动" in hint and "/videotest" in hint
+    assert "11.7" in hint and "13.0" in hint  # 例子里的原值 -> 生效值
 
 
 def test_videotest_entry_points_are_documented_honestly():

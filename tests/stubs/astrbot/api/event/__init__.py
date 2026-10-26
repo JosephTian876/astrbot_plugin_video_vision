@@ -14,7 +14,7 @@ class AstrMessageEvent:  # pragma: no cover - 仅用于类型注解
 
 
 class _Filter:
-    def on_llm_request(self, priority: int = 0):  # noqa: D401 - 装饰器工厂
+    def on_llm_request(self, priority: int = 0):
         def decorator(func):
             return func
 

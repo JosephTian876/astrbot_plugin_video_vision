@@ -44,7 +44,7 @@ STATE = _State()
 class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
-    def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler 约定
+    def do_POST(self) -> None:  # BaseHTTPRequestHandler 的约定名；N802 对该基类豁免
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length)
         try:
