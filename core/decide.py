@@ -63,7 +63,10 @@ ACTION_LABELS: dict[str, str] = {
 #: - ``other``：``MediaToolError`` 的兜底桶，它的 reason 里往往还有更具体的信息
 #:   （如「压缩异常: …」），交给调用方的文本回退比一句笼统话更准；
 #: - ``internal``：同上，属"未预期异常"，不属判决；
-#: - ``size``：0.2.0 遗留键，全仓无发射点，保留只为不动对外词表。
+#: - ``size``：0.2.0 的遗留码，全仓**没有任何发射点**（``MediaToolError.KINDS``、
+#:   ``KIND_OF_CODE``、``injector``/``main`` 的 ``kind=`` 字面量里都没有它），
+#:   0.2.1 曾把它原样搬过来并写"保留只为不动对外词表" —— 一个永远产生不出来的
+#:   短语不算对外词表，本次已删（``explain("size")`` 现在返回空串）。
 #:
 #: 判决码（``no_ffmpeg`` / ``unknown_duration``）不在这里：``explain`` 先用
 #: :data:`KIND_OF_CODE` 把它们折成对外 kind 再查表，因此同一个概念只有一句文案。
@@ -75,7 +78,6 @@ SHORT_REASONS: dict[str, str] = {
     "empty": "the video file is empty",
     "duration": "its duration could not be read",
     "too_large": "it exceeds the size limit",
-    "size": "it exceeds the size limit",
     "missing": "the file could not be read",
     # 「按配置拒绝」必须分成三条：0.2.1 把 oversize 与 overlong 都报成
     # "it exceeds the size limit"，于是"视频太长被拒"告诉模型"它太大了"，

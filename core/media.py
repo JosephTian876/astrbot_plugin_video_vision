@@ -14,8 +14,6 @@ import os
 import shutil
 import subprocess
 import threading
-import time
-from dataclasses import dataclass
 from pathlib import Path
 
 #: 常见视频容器 -> MIME
@@ -73,16 +71,6 @@ class MediaToolError(RuntimeError):
     def __init__(self, message: str, kind: str = "other") -> None:
         super().__init__(message)
         self.kind = kind if kind in self.KINDS else "other"
-
-
-@dataclass(frozen=True)
-class VideoInfo:
-    """一次探测的结果。"""
-
-    path: str
-    size_mb: float
-    duration_sec: float
-    mime: str
 
 
 def suffix_of(path: str | os.PathLike[str] | None) -> str:
@@ -171,16 +159,6 @@ def probe_duration(path: str | os.PathLike[str], ffprobe: str | None) -> float:
         return float((completed.stdout or "").strip())
     except Exception:
         return 0.0
-
-
-def probe_video(path: str | os.PathLike[str], ffprobe: str | None) -> VideoInfo:
-    """探测体积 / 时长 / MIME。"""
-    return VideoInfo(
-        path=str(path),
-        size_mb=file_size_mb(path),
-        duration_sec=probe_duration(path, ffprobe),
-        mime=guess_video_mime(path),
-    )
 
 
 def content_hash(path: str | os.PathLike[str], *, chunk: int = 1 << 20) -> str:
@@ -569,6 +547,3 @@ class CompressCache:
                 total -= size
             except OSError:
                 continue
-
-    def stamp(self) -> str:
-        return time.strftime("%Y%m%d%H%M%S")

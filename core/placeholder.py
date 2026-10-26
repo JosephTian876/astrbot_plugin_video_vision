@@ -40,6 +40,23 @@ _FILE_RE = re.compile(
 
 _PREFIXES = ("[Video Attachment", "[File Attachment")
 
+
+def is_attachment_line(line: str) -> bool:
+    """这一行是否是附件占位符（``_PREFIXES`` 的**唯一**对外入口）。
+
+    给"从用户文本里剔除占位符"这类调用方用（``hooks.llm_request._extract_question``）。
+    0.2.1 那里另存了一份逐字节相同的 ``_ATTACHMENT_PREFIXES`` 元组，改一处就会
+    漂移（ARCH-REVIEW R6）；现在两份合成一份，本函数就是那个出口。
+
+    Args:
+        line: 任意一行文本（前后空白会被忽略）。
+
+    Returns:
+        True 表示这一行以附件占位符前缀开头。
+    """
+    return line.strip().startswith(_PREFIXES)
+
+
 #: 判定「这个 File 附件其实是视频」用的扩展名集合
 VIDEO_SUFFIXES: frozenset[str] = frozenset(
     {
@@ -109,14 +126,13 @@ def _part_text(part: Any) -> str | None:
 
 def iter_placeholders(
     parts: Iterable[Any] | None,
-    *,
-    include_file_kind: bool = True,
 ) -> list[tuple[int, VideoPlaceholder]]:
     """扫描内容块列表，返回 [(下标, 占位符), ...]。
 
-    Args:
-        include_file_kind: 是否把 ``[File Attachment: ...]`` 也当作候选。
-            上层通常传 True，再由扩展名过滤。
+    ``[Video Attachment: ...]`` 与 ``[File Attachment: ...]`` 都算候选，由上层
+    再按扩展名 / ``treat_file_as_video`` 过滤（``hooks.llm_request`` 的闸门 0）。
+    0.2.1 这里还有个 ``include_file_kind`` 形参，但三个调用点从不传 False，
+    那个分支等于死代码（ARCH-REVIEW P1-7），已删除。
     """
     found: list[tuple[int, VideoPlaceholder]] = []
     if not parts:
@@ -124,8 +140,6 @@ def iter_placeholders(
     for index, part in enumerate(parts):
         placeholder = parse_placeholder_text(_part_text(part))
         if placeholder is None:
-            continue
-        if placeholder.is_file_kind and not include_file_kind:
             continue
         found.append((index, placeholder))
     return found

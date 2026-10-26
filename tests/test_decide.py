@@ -479,6 +479,10 @@ def test_explain_returns_empty_string_for_foreign_reasons():
     assert explain("internal") == ""
     assert explain("other") == ""  # 兜底桶：交给文本回退
     assert explain("视觉服务返回 HTTP 500") == ""
+    # 0.2.0 的遗留码 ``size`` 已删（全仓无发射点，见 SHORT_REASONS 注释）：
+    # 它现在跟任何陌生码一样返回空串，不许悄悄长回来。
+    assert "size" not in decide.SHORT_REASONS
+    assert explain("size") == ""
 
 
 def test_plan_codes_resolve_to_the_same_phrase_as_their_kind():

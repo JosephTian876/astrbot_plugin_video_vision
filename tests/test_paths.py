@@ -26,13 +26,14 @@ from pathlib import Path
 
 import pytest
 
-from vv_plugin import main
-from vv_plugin.core import diagnostics, placeholder
+from vv_plugin import core, main
+from vv_plugin.core import diagnostics, media, placeholder
 from vv_plugin.core.decide import classify
 from vv_plugin.core.config import VideoConfig
 from vv_plugin.core.media import (
     OUTPUT_MIME,
     VIDEO_MIME_BY_SUFFIX,
+    CompressCache,
     guess_video_mime,
     suffix_of,
 )
@@ -180,3 +181,27 @@ def test_suffix_logic_has_exactly_one_source_file():
         and any(child is calls[0] for child in ast.walk(node))
     ]
     assert owners == ["suffix_of"], f"splitext 出现在 {owners}"
+
+
+def test_dead_code_from_arch_review_p1_7_stays_removed():
+    """ARCH-REVIEW P1-7 的死代码：删掉的**不许长回来**。
+
+    同族的 ``main._suffix_of`` 上一轮已删（守卫在
+    ``test_suffix_logic_has_exactly_one_source_file``）；其余几项拖到 0.2.1
+    收尾才做，正是 VERIFY2 第 10 项判 FAIL 的原因。这里用 ``hasattr`` /
+    ``inspect.signature`` 把它们钉住，防止下一次重构"顺手"再导出一遍。
+    """
+    import inspect
+
+    # a/b: probe_video + VideoInfo（函数与 dataclass，含 core 包的 re-export）
+    assert not hasattr(media, "probe_video"), "media.probe_video 应已删除"
+    assert not hasattr(media, "VideoInfo"), "media.VideoInfo 应已删除"
+    assert not hasattr(core, "probe_video"), "core.probe_video 不该再导出"
+    assert not hasattr(core, "VideoInfo"), "core.VideoInfo 不该再导出"
+    assert "probe_video" not in core.__all__ and "VideoInfo" not in core.__all__
+    # c: CompressCache.stamp（全仓零调用的时间戳工具）
+    assert not hasattr(CompressCache, "stamp"), "CompressCache.stamp 应已删除"
+    # d: iter_placeholders 的 include_file_kind 形参（没有调用方传 False）
+    assert "include_file_kind" not in inspect.signature(
+        placeholder.iter_placeholders
+    ).parameters

@@ -273,6 +273,31 @@ def test_question_keeps_current_turn_text():
     assert hooks._extract_question(event, SimpleNamespace()) == "这视频讲了什么"
 
 
+def test_question_drops_both_attachment_prefixes():
+    """``_extract_question`` 的前缀过滤必须与 ``placeholder._PREFIXES`` 同源。
+
+    0.2.1 在 ``hooks`` 里另存了一份逐字节相同的 ``_ATTACHMENT_PREFIXES``
+    （ARCH-REVIEW R6），改一处忘另一处就会把 ``[File Attachment: ...]``
+    —— QQ/NapCat 投递视频的真实形态 —— 里的本机路径当"用户问题"外发。
+    现在唯一来源是 ``core.placeholder.is_attachment_line()``，这条用例把
+    两种前缀都钉住。
+    """
+    for prefix in ("[Video Attachment", "[File Attachment"):
+        event = make_event(
+            f"{prefix}: name a.mp4, path C:\\Users\\me\\secret\\a.mp4]\n真正的问题"
+        )
+        text = hooks._extract_question(event, SimpleNamespace())
+        assert text == "真正的问题", (prefix, text)
+        assert "secret" not in text and "C:\\" not in text
+
+    # 前缀集合只有一份：hooks 里不许再长出同名字面量元组
+    import inspect
+
+    source = inspect.getsource(hooks)
+    assert "_ATTACHMENT_PREFIXES = (" not in source
+    assert "is_attachment_line(" in source
+
+
 def test_question_drops_previous_turn_image_paths():
     """回归：0.2.0 回落到 req.contexts，把上一轮的 original path 发给第三方。"""
     req = SimpleNamespace(

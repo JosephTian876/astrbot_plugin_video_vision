@@ -52,6 +52,7 @@ from ..core.config import VideoConfig
 from ..core.injector import VideoInjection, prepare_video
 from ..core.openai_vision import analyze_videos
 from ..core.placeholder import (
+    is_attachment_line,
     iter_placeholders,
     parse_placeholder_text,
 )
@@ -439,8 +440,6 @@ def mark_degradation_warned() -> None:
     _warned_config.add(_OPENAI_NOT_READY)
 
 
-_ATTACHMENT_PREFIXES = ("[Video Attachment", "[File Attachment")
-
 #: 含本机路径的段特征。框架把图片附件写成
 #: ``[Image 1: original path C:\...\x.png]``（``astrbot/core/agent/image_input.py``），
 #: 0.2.0 的 ``req.contexts`` 回退会把它整段拼进"用户问题"发给第三方端点。
@@ -486,8 +485,9 @@ def _extract_question(event: Any, req: Any) -> str:
     lines = [
         line
         for line in text.splitlines()
-        if not line.strip().startswith(_ATTACHMENT_PREFIXES)
-        and not _has_local_path(line)
+        # 占位符前缀只有一份定义：core.placeholder._PREFIXES
+        # （唯一出口 is_attachment_line）。
+        if not is_attachment_line(line) and not _has_local_path(line)
     ]
     return "\n".join(lines).strip()[:600]
 
