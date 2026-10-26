@@ -37,7 +37,12 @@ except ImportError:  # pragma: no cover
 
 from .core.config import VideoConfig
 from .core.injector import prepare_video
-from .core.media import file_size_mb, probe_duration, resolve_ffmpeg_tools
+from .core.media import (
+    MAX_DATA_URI_BYTES,
+    file_size_mb,
+    probe_duration,
+    resolve_ffmpeg_tools,
+)
 from .core.openai_vision import analyze_video, build_vision_prompt
 from .core.placeholder import VIDEO_SUFFIXES, VideoPlaceholder
 from .hooks.llm_request import (
@@ -110,6 +115,28 @@ def _credentials_summary(cfg: VideoConfig) -> str:
     if not missing:
         return " ✅ base_url / api_key / model 齐全"
     return f" ❌ 缺 {'、'.join(missing)}"
+
+
+#: data URI 硬上限（**编码后**）。与 ``core/media.py`` 用同一个常量，不复制魔数。
+_URI_LIMIT_MB = MAX_DATA_URI_BYTES / 1024 / 1024
+#: 换算成"原始体积"：base64 每 3 字节膨胀到 4 字节（18MB ≈ 13.5MB 源文件）。
+_URI_LIMIT_RAW_MB = _URI_LIMIT_MB * 3 / 4
+
+
+def _encoded_size_mb(raw_mb: float) -> float:
+    """原始体积 → 编码成 data URI 后的体积（估算，用于诊断行）。"""
+    return raw_mb * 4 / 3
+
+
+def _encoding_limit_note(raw_mb: float) -> str:
+    """体积 ``raw_mb`` 的文件编码后是否会撞上 data URI 硬上限；撞了就返回一句人话。"""
+    encoded_mb = _encoded_size_mb(raw_mb)
+    if encoded_mb <= _URI_LIMIT_MB:
+        return ""
+    return (
+        f"编码后约 {encoded_mb:.1f}MB > 编码上限 {_URI_LIMIT_MB:.0f}MB"
+        f"（≈ 原始 {_URI_LIMIT_RAW_MB:.1f}MB），实际会以 too_large 失败"
+    )
 
 
 @register(
@@ -340,6 +367,11 @@ class VideoVisionPlugin(Star):
             f"CRF={cfg.compress_crf} "
             f"策略={_ACTION_LABELS.get(cfg.oversize_action, cfg.oversize_action)}"
         )
+        # 与体积闸门无关的第二道体积限制：data URI 编码上限。
+        lines.append(
+            f"编码上限: data URI {_URI_LIMIT_MB:.0f}MB ≈ 原始 {_URI_LIMIT_RAW_MB:.1f}MB"
+            "（编码后超过必失败，与体积闸门无关）"
+        )
 
         # ---- 模式 / 凭据（0.2.0 只报模式）----
         effective_mode = cfg.effective_provider_mode
@@ -358,10 +390,18 @@ class VideoVisionPlugin(Star):
         lines.extend(await self._diagnose_gates(cfg, event, effective_mode))
 
         # ---- 体积 / 时长判定（与钩子完全相同的判定）----
+        # 判定行必须把 data URI 编码上限一起算进来：闸门放到 200MB 时若只写
+        # "未超限，直接送"，紧接着就是 too_large 失败 —— 诊断自相矛盾。
         oversize = size_mb > cfg.max_size_mb
         overlong = cfg.max_duration_sec > 0 and duration > cfg.max_duration_sec
-        if not oversize and not overlong:
-            lines.append("判定   : 未超限，直接送")
+        if size_mb <= 0:
+            lines.append("判定   : 体积 0.00MB（空文件）→ 会以 empty 失败")
+        elif not oversize and not overlong:
+            limit_note = _encoding_limit_note(size_mb)
+            if limit_note:
+                lines.append(f"判定   : 体积/时长在闸门内 → 直接送；但{limit_note}")
+            else:
+                lines.append("判定   : 未超限，直接送")
         else:
             why = []
             if oversize:
@@ -369,7 +409,15 @@ class VideoVisionPlugin(Star):
             if overlong:
                 why.append(f"时长 {duration:.1f}s > 上限 {cfg.max_duration_sec:.1f}s")
             label = _ACTION_LABELS.get(cfg.oversize_action, cfg.oversize_action)
-            lines.append(f"判定   : {'；'.join(why)} → {label}")
+            line = f"判定   : {'；'.join(why)} → {label}"
+            # 压缩/截断的目标体积也可能撞编码上限（compress_max_mb 上界远大于 13.5MB）
+            if cfg.oversize_action != "reject":
+                target_note = _encoding_limit_note(cfg.compress_max_mb)
+                if target_note:
+                    line += (
+                        f"；但压缩目标 {cfg.compress_max_mb:.1f}MB {target_note}"
+                    )
+            lines.append(line)
 
         # ---- 将要发给视觉服务的 prompt 预览（截断）----
         lines.append(f"prompt : {self._prompt_preview(cfg, effective_mode)}")

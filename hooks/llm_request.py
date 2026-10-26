@@ -566,20 +566,30 @@ async def _handle(plugin: Any, event: Any, req: Any) -> None:
 
         # ---- provider 解析失败：单独告警，绝不归因到「不是 Gemini 系」----
         if provider is None:
-            logger.warning(
-                "[VideoVision] 取不到当前 provider（原因: %s），视频不会注入。"
+            reason = provider_error or "(未知)"
+            hint = (
                 "这与「provider 类型不匹配」是两回事：请检查会话是否绑定了 "
-                "provider、provider 是否已启用，或在 WebUI 里重新选择模型。",
-                provider_error or "(未知)",
+                "provider、provider 是否已启用，或在 WebUI 里重新选择模型。"
             )
             if config.require_gemini_provider:
                 # 闸门 1 开着、又拿不到 provider：没有类型可判，直接跳过（0.2.0
                 # 也跳过，只是把原因错报成"类型不是 Gemini 系"）
+                logger.warning(
+                    "[VideoVision] 取不到当前 provider（原因: %s），"
+                    "require_gemini_provider=true，本次不注入视频。%s",
+                    reason,
+                    hint,
+                )
                 return
-            # 闸门 1 已被关闭：保持 0.2.0 的"盲注入"行为（风险见 README 已知限制）
-            logger.debug(
-                "[VideoVision] require_gemini_provider=false，取不到 provider "
-                "时按盲注入继续（无法校验 MIME 兼容性）"
+            # 闸门 1 已被关闭：保持 0.2.0 的"盲注入"行为（风险见 README 已知限制）。
+            # 文案必须与接下来的真实行为一致 —— 这里**不会** return，视频照样注入，
+            # 所以不能再说"视频不会注入"。
+            logger.warning(
+                "[VideoVision] 取不到当前 provider（原因: %s），"
+                "但 require_gemini_provider=false：闸门已关闭，"
+                "本次按逃生门继续盲注入视频（无法校验 MIME 兼容性）。%s",
+                reason,
+                hint,
             )
 
         # ---- 闸门 1：必须是 Gemini 系 provider（可配置额外放行）----

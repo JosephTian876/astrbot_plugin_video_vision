@@ -255,6 +255,7 @@ openai_compat 模式下会**真实调用一次视觉服务**并回显回复节�
 ffmpeg : ✅ D:\ffmpeg\bin\ffmpeg.exe
 ffprobe: ✅ D:\ffmpeg\bin\ffprobe.exe
 配置   : 闸门=13.0MB 上限=8.0MB CRF=30 策略=压缩
+编码上限: data URI 18MB ≈ 原始 13.5MB（编码后超过必失败，与体积闸门无关）
 模式   : gemini_native
 凭据   : 视觉服务 ❌ 缺 openai_base_url、openai_api_key
 provider: type=googlegenai_chat_completion id=gemini-2.5-flash modalities=[text, image, audio]
@@ -285,6 +286,10 @@ prompt : （gemini_native 不调用视觉服务，无 prompt）
   截断 200 字符）。若 `vision_qa_prompt` 里没有 `{question}`，这里会提示。
 - **action** 现在只由"是否真的传了 `-t`"决定：`策略=压缩` 但 `max_duration_sec`
   真的触发了截断时，动作会显示"已截断"而不是"已压缩"。
+- **编码上限**是**第二道**体积限制：data URI 编码后 18MB（≈ 原始 13.5MB），
+  与 `max_size_mb` 无关。`判定` 行已经把它算进来 —— 闸门调到 13.5MB 以上时，
+  原本的"未超限，直接送"会变成提前说明"编码后约 XMB > 编码上限 18MB，实际会以
+  `too_large` 失败"；压缩目标（`compress_max_mb`）超过同一阈值时也会在判定行提示。
 
 ---
 
@@ -378,8 +383,9 @@ astrbot_plugin_video_vision/
   且模型必须声明 **audio** 模态；走 OpenAI 协议的 Gemini 代理需在
   `additional_provider_types` 中显式放行。
 - 不支持多视频并行压缩；单条消息的视频串行处理（openai_compat 的视觉调用是并发的）。
-- 压缩缓存按源文件内容哈希做 key，**单个产物大于 `cache_max_mb` 时不会进缓存**
-  （放进去也会被自己挤掉，还会连带清空其它条目），这类视频每次都会重新压缩。
+- 压缩缓存按源文件内容哈希做 key，**单个产物大于 `cache_max_mb` 时不会进缓存**，
+  这类视频每次都会重新压缩。0.2.1 是**直接跳过它**（缓存里的其它条目不受影响）；
+  0.2.0 相反：会先放进去、再被自己挤掉，还会连带清空其它条目。
 - `/videotest` 只检查"路径存在且是文件"，**不校验扩展名**：给什么文件它就把什么
   按视频编码并发送（openai_compat 下会真的 POST 出去）。仅管理员可用，请勿在
   生产环境拿它测试非视频文件。

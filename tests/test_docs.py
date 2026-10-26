@@ -72,6 +72,7 @@ def test_videotest_example_matches_the_new_report():
         "模式   : gemini_native",
         "provider: type=",
         "闸门   :",
+        "编码上限:",
         "凭据   : 视觉服务",
         "prompt :",
     ):
