@@ -42,7 +42,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -78,9 +77,37 @@ _warned_gate: set[str] = set()
 _warned_config: set[str] = set()
 _OPENAI_NOT_READY = "openai_compat_not_ready"
 
+#: 「取不到 provider」的原因码。与「闸门拒绝」必须可区分：
+#: 一个是**解析失败**，一个是**策略不允许**，用户要采取的动作完全不同。
+PROVIDER_ERROR_EXCEPTION = "exception"
+PROVIDER_ERROR_NONE = "none"
+PROVIDER_ERROR_NO_CONTEXT = "no-context"
 
-def _short_reason(reason: str) -> str:
+#: 失败分类 -> 注入给模型的短语。键来自 ``MediaToolError.KINDS`` 与
+#: ``PrepareOutcome.kind``（injector 另有 missing / rejected / size / internal）。
+_SHORT_REASONS: dict[str, str] = {
+    "timeout": "ffmpeg timed out while transcoding the video",
+    "exit_code": "ffmpeg failed to transcode the video",
+    "not_found": "ffmpeg is not available",
+    "corrupt": "the video file appears to be corrupt",
+    "empty": "the video file is empty",
+    "duration": "its duration could not be read",
+    "too_large": "it exceeds the size limit",
+    "size": "it exceeds the size limit",
+    "rejected": "it exceeds the size limit",
+    "missing": "the file could not be read",
+}
+
+
+def _short_reason(reason: str, kind: str = "") -> str:
     """把失败原因压缩成不含本机路径的短语，供注入给模型。
+
+    优先用**机器可读**的 ``kind``（``MediaToolError.kind`` /
+    ``PrepareOutcome.kind``）分类，拿不到 kind 时才回落到字符串匹配，且匹配
+    顺序是「超时 / 退出码 / 未找到 ffmpeg / 文件损坏 / 产物为空」——0.2.0 只有
+    一处 ``"ffmpeg" in reason``，于是超时、退出码非 0、真未找到、产物为空四种
+    完全不同的原因**全部**被报成 "ffmpeg is not available"（实测 4/4 复现），
+    模型收到的说明是错的。
 
     注意匹配顺序：更具体的原因要排在更宽泛的之前。
     例如「无法读取时长，拒绝盲压缩（体积超闸门）」应归类为时长问题，
@@ -90,6 +117,13 @@ def _short_reason(reason: str) -> str:
     统一以「视觉服务」开头，因此**整体前置判定**：那些原因里常带
     「调小体积闸门」之类的说明文字，若让下面的「闸门」分支先匹配，
     一次超时会被误报成「体积超限」。
+
+    Args:
+        reason: 原始失败原因（可能含本机路径，绝不原样外发）。
+        kind: 可选的机器可读分类。
+
+    Returns:
+        一句英文短语。
     """
     low = reason.lower()
     # ---- 视觉服务（openai_compat 模式）----
@@ -101,9 +135,20 @@ def _short_reason(reason: str) -> str:
         if "连接" in reason or "connect" in low:
             return "the vision service is unreachable"
         return "the vision service returned an error"
-    # ---- 本地视频处理（两种模式共用）----
-    if "ffmpeg" in low:
-        return "ffmpeg is not available"
+    # ---- 机器可读分类优先 ----
+    if kind in _SHORT_REASONS:
+        return _SHORT_REASONS[kind]
+    # ---- 本地视频处理（两种模式共用）：字符串回退 ----
+    if "超时" in reason or "timeout" in low or "timed out" in low:
+        return _SHORT_REASONS["timeout"]
+    if "退出码" in reason:
+        return _SHORT_REASONS["exit_code"]
+    if "未找到 ffmpeg" in reason or "ffmpeg 无法启动" in reason:
+        return _SHORT_REASONS["not_found"]
+    if "损坏" in reason or "无法解析视频" in reason:
+        return _SHORT_REASONS["corrupt"]
+    if "0 字节" in reason or "未产出" in reason or "为空" in reason:
+        return _SHORT_REASONS["empty"]
     if "不存在" in reason or "not exist" in low or "不是普通文件" in reason:
         return "the file could not be read"
     if "时长" in reason:
@@ -232,7 +277,8 @@ async def build_video_blocks(
     selected = found[:limit]
     if len(found) > len(selected):
         logger.info(
-            "[VideoVision] 本条消息含 %d 个待处理视频，按 max_video_count=%d 只处理前 %d 个",
+            "[VideoVision] 本条消息含 %d 个待处理视频，"
+            "按 max_video_count=%d 只处理前 %d 个",
             len(found),
             limit,
             len(selected),
@@ -280,7 +326,7 @@ async def build_video_blocks(
                 "（File 组件按视频处理）" if placeholder.is_file_kind else "",
             )
         else:
-            failures.append(_short_reason(outcome.reason))
+            failures.append(_short_reason(outcome.reason, outcome.kind))
             logger.warning(
                 "[VideoVision] 视频未注入: %s | %s", placeholder.name, outcome.reason
             )
@@ -363,29 +409,79 @@ def _safe_size(path: str) -> float:
         return 0.0
 
 
-async def _resolve_provider(plugin: Any, event: Any) -> Any:
+async def resolve_provider(plugin: Any, event: Any) -> tuple[Any, str]:
+    """取当前 provider，并把**失败原因**一起返回。
+
+    框架的 ``Context.get_using_provider_async`` 签名是 ``-> Provider | None``
+    （``astrbot/core/star/context.py``），返回 None 是**正常返回值**，不是异常
+    边角。0.2.0 只兜异常，然后把「provider 类型 '(未知)' 不是 Gemini 系」打进
+    用户可见的 WARNING —— 取不到 provider、返回 None、真的用了非 Gemini
+    provider 这三种互不相干的原因产出**字面完全相同**的告警，且都建议用户
+    "去 additional_provider_types 里放行 ''"，这条建议永远不可能生效。
+
+    Returns:
+        (provider 或 None, 失败原因)。成功时原因为空串；失败时为
+        ``no-context`` / ``none`` / ``exception:<类型>: <详情>``。
+    """
+    context = getattr(plugin, "context", None)
+    getter = getattr(context, "get_using_provider_async", None)
+    if not callable(getter):
+        return None, PROVIDER_ERROR_NO_CONTEXT
     try:
-        return await plugin.context.get_using_provider_async(
-            umo=getattr(event, "unified_msg_origin", None)
-        )
+        provider = await getter(umo=getattr(event, "unified_msg_origin", None))
     except Exception as exc:  # noqa: BLE001
         logger.debug("[VideoVision] 获取当前 provider 失败: %s", exc)
-        return None
+        return None, f"{PROVIDER_ERROR_EXCEPTION}: {type(exc).__name__}: {exc}"
+    if provider is None:
+        logger.debug(
+            "[VideoVision] 当前没有可用 provider"
+            "（get_using_provider_async 返回 None）"
+        )
+        return None, PROVIDER_ERROR_NONE
+    return provider, ""
+
+
+def mark_degradation_warned() -> None:
+    """标记「降级告警已发过」。
+
+    schema hint 与 CHANGELOG 都承诺"只告警一次"，但 0.2.0 实际会在启动
+    （``VideoVisionPlugin.__init__``）与首次请求（:func:`_effective_mode`）
+    各告警一次。启动那条信息更完整，因此由它在告警后调用本函数，让钩子不再
+    重复刷一条。
+    """
+    _warned_config.add(_OPENAI_NOT_READY)
 
 
 _ATTACHMENT_PREFIXES = ("[Video Attachment", "[File Attachment")
 
+#: 含本机路径的段特征。框架把图片附件写成
+#: ``[Image 1: original path C:\...\x.png]``（``astrbot/core/agent/image_input.py``），
+#: 0.2.0 的 ``req.contexts`` 回退会把它整段拼进"用户问题"发给第三方端点。
+_LOCAL_PATH_MARKERS = ("original path",)
+
+
+def _has_local_path(text: str) -> bool:
+    low = text.lower()
+    return any(marker in low for marker in _LOCAL_PATH_MARKERS)
+
 
 def _extract_question(event: Any, req: Any) -> str:
-    """提取用户这条消息里随视频附带的文字（可能为空）。
+    """提取**当前轮**用户随视频附带的文字（可能为空）。
 
-    依次尝试：event.get_message_str() -> event.message_str -> req.prompt
-    -> req.contexts 里最后一条 user 文本。附件占位行会被剔除，
-    避免把「[Video Attachment: ...]」（**含本机路径**）当作用户问题带给外部
-    视觉服务 —— 那等于把本机路径泄露给第三方端点。
+    依次尝试：``event.get_message_str()`` -> ``event.message_str`` -> ``req.prompt``。
 
-    注意 contexts 分支必须在**分段级别**过滤：那里多个 TextPart 会被空格拼成
-    一行，拼完之后占位符就不在行首了，只按行首过滤会漏掉。
+    0.2.0 还会回落到 ``req.contexts`` 的最后一条 user 消息 —— 那是**历史轮次**
+    的上下文：上一轮的 ``[Image 1: original path C:\\Users\\me\\secret.png]``
+    会被当作用户问题发给外部视觉服务（实测返回
+    ``'[Image 1: original path C:\\Users\\me\\secret.png] 这图好看吗'``）。
+    现在只认当前轮文本，并且**任何含 ``original path`` 的段落一律剔除**。
+
+    Args:
+        event: 消息事件（鸭子类型，不 import AstrBot 具体类）。
+        req: LLM 请求对象，仅在没有任何事件文本时用 ``prompt`` 兜底。
+
+    Returns:
+        去掉附件占位符与本机路径段落后的用户问题（最多 600 字符）。
     """
     text = ""
     getter = getattr(event, "get_message_str", None)
@@ -400,37 +496,11 @@ def _extract_question(event: Any, req: Any) -> str:
         prompt = getattr(req, "prompt", None)
         if isinstance(prompt, str):
             text = prompt
-    if not text:
-        contexts = getattr(req, "contexts", None) or []
-        try:
-            for message in reversed(list(contexts)):
-                if not isinstance(message, Mapping):
-                    continue
-                if message.get("role") != "user":
-                    continue
-                content = message.get("content")
-                if isinstance(content, str):
-                    text = content
-                    break
-                if isinstance(content, list):
-                    chunks: list[str] = []
-                    for part in content:
-                        if not isinstance(part, Mapping):
-                            continue
-                        if part.get("type") != "text":
-                            continue
-                        piece = str(part.get("text") or "").strip()
-                        if not piece or piece.startswith(_ATTACHMENT_PREFIXES):
-                            continue  # 整段就是附件占位符，直接丢
-                        chunks.append(piece)
-                    text = " ".join(chunks)
-                    break
-        except Exception:  # noqa: BLE001
-            pass
     lines = [
         line
         for line in text.splitlines()
         if not line.strip().startswith(_ATTACHMENT_PREFIXES)
+        and not _has_local_path(line)
     ]
     return "\n".join(lines).strip()[:600]
 
@@ -490,9 +560,27 @@ async def _handle(plugin: Any, event: Any, req: Any) -> None:
     provider_type = "(openai_compat)"
 
     if mode == "gemini_native":
-        provider = await _resolve_provider(plugin, event)
+        provider, provider_error = await resolve_provider(plugin, event)
         provider_config = getattr(provider, "provider_config", None) or {}
         provider_type = str(provider_config.get("type") or "")
+
+        # ---- provider 解析失败：单独告警，绝不归因到「不是 Gemini 系」----
+        if provider is None:
+            logger.warning(
+                "[VideoVision] 取不到当前 provider（原因: %s），视频不会注入。"
+                "这与「provider 类型不匹配」是两回事：请检查会话是否绑定了 "
+                "provider、provider 是否已启用，或在 WebUI 里重新选择模型。",
+                provider_error or "(未知)",
+            )
+            if config.require_gemini_provider:
+                # 闸门 1 开着、又拿不到 provider：没有类型可判，直接跳过（0.2.0
+                # 也跳过，只是把原因错报成"类型不是 Gemini 系"）
+                return
+            # 闸门 1 已被关闭：保持 0.2.0 的"盲注入"行为（风险见 README 已知限制）
+            logger.debug(
+                "[VideoVision] require_gemini_provider=false，取不到 provider "
+                "时按盲注入继续（无法校验 MIME 兼容性）"
+            )
 
         # ---- 闸门 1：必须是 Gemini 系 provider（可配置额外放行）----
         allowed_provider_types = GEMINI_PROVIDER_TYPES | set(
@@ -504,18 +592,25 @@ async def _handle(plugin: Any, event: Any, req: Any) -> None:
         ):
             logger.debug(
                 "[VideoVision] provider 类型 %r 不在允许列表 %s 中，跳过视频注入",
-                provider_type or "(未知)",
+                provider_type or "(未声明)",
                 sorted(allowed_provider_types),
             )
             if provider_type not in _warned_gate:
                 _warned_gate.add(provider_type)
-                logger.warning(
-                    "[VideoVision] 当前 provider 类型 %r 不是 Gemini 系，已跳过视频注入。"
-                    "若该 provider 同样支持按 MIME 构造媒体 Part，"
-                    "可在插件配置里关闭 require_gemini_provider，"
-                    "或在 additional_provider_types 中放行该类型。",
-                    provider_type or "(未知)",
-                )
+                if not provider_type:
+                    logger.warning(
+                        "[VideoVision] 当前 provider 没有声明 type，无法判断是否 "
+                        "Gemini 系，已跳过视频注入。若确认它支持按 MIME 构造媒体 "
+                        "Part，可在插件配置里关闭 require_gemini_provider。",
+                    )
+                else:
+                    logger.warning(
+                        "[VideoVision] 当前 provider 类型 %r 不是 Gemini 系，"
+                        "已跳过视频注入。若该 provider 同样支持按 MIME 构造媒体 "
+                        "Part，可在插件配置里关闭 require_gemini_provider，"
+                        "或在 additional_provider_types 中放行该类型。",
+                        provider_type,
+                    )
             return
 
         # ---- 闸门 2：模型必须声明 audio 模态 ----
@@ -527,7 +622,8 @@ async def _handle(plugin: Any, event: Any, req: Any) -> None:
             if key not in _warned_modality:
                 _warned_modality.add(key)
                 logger.warning(
-                    "[VideoVision] 模型 %s 的 modalities 未包含 audio，视频块会被清洗成文本。"
+                    "[VideoVision] 模型 %s 的 modalities 未包含 audio，"
+                    "视频块会被清洗成文本。"
                     "请在 WebUI 给该模型勾选「音频」模态后重试。",
                     provider_config.get("id") or provider_type,
                 )
