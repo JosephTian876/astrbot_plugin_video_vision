@@ -65,11 +65,10 @@ jobs:
           cache: pip
           cache-dependency-path: tests/requirements-dev.txt
 
-      # ubuntu-latest 镜像本来就自带 ffmpeg：有就直接用，只在缺失时才 apt。
-      # 直接无条件 `apt-get update` 会在 runner 网络抖动时**卡死**（2026-10-26 实测：
-      # ubuntu py3.13 卡在 "Install ffmpeg (Linux)" 23 分钟，连 job 的
-      # timeout-minutes: 15 都没触发）→ 所以：先探测、每次 apt 外面套 `timeout`、
-      # 失败重试 3 次。这里红了就说明 runner 真没 ffmpeg，比后面 40 例静默 skip 好。
+      # ubuntu-latest 镜像**不带** ffmpeg；用 apt 装要拉 87 个包 / 173MB，runner 网络慢时
+      # 单个包就能耗 3 分钟（2026-10-26 实测：三次重试全被 timeout 打断）。
+      # 改用预编译静态包：从 GitHub 自家 Releases 下载（无 apt 依赖），通常十几秒。
+      # 每一步都套 `timeout`，网络再差也不会挂住整轮。
       - name: Install ffmpeg (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -77,17 +76,21 @@ jobs:
             echo "ffmpeg already present: $(ffmpeg -version | head -n 1)"
             exit 0
           fi
+          url="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz"
           for attempt in 1 2 3; do
-            echo "::group::apt attempt ${attempt}"
-            if timeout 240 sudo apt-get update -qq &&
-               timeout 240 sudo apt-get install -y --no-install-recommends ffmpeg; then
+            echo "::group::download attempt ${attempt}"
+            if timeout 300 curl -fsSL --retry 2 -o /tmp/ffmpeg.tar.xz "$url" &&
+               timeout 120 tar -xJf /tmp/ffmpeg.tar.xz -C /tmp; then
               echo "::endgroup::"
               break
             fi
             echo "::endgroup::"
-            echo "apt attempt ${attempt} failed; sleeping 10s"
+            echo "download attempt ${attempt} failed; sleeping 10s"
             sleep 10
           done
+          bin_dir="$(find /tmp -maxdepth 2 -type d -name bin -path '*ffmpeg*' | head -n 1)"
+          test -n "$bin_dir"
+          sudo install -m 0755 "$bin_dir/ffmpeg" "$bin_dir/ffprobe" /usr/local/bin/
           command -v ffmpeg
           command -v ffprobe
 
