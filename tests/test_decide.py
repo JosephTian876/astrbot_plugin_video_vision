@@ -136,8 +136,8 @@ def test_reject_action_never_needs_ffmpeg_or_cache():
     cfg = VideoConfig(max_size_mb=13.0, oversize_action="reject")
     plan = classify(size_mb=20.0, duration_sec=2.0, config=cfg)
 
-    assert plan.action == "reject" and plan.reason_code == "rejected"
-    assert plan.kind == "rejected" and plan.blocked is True
+    assert plan.action == "reject" and plan.reason_code == "rejected_size"
+    assert plan.kind == "rejected_size" and plan.blocked is True
     assert plan.needs_ffmpeg is False and plan.cache_eligible is False
     assert describe(plan) == "体积 20.0MB > 闸门 13.0MB → 拒绝"
 
@@ -312,7 +312,7 @@ def test_reject_wins_over_missing_ffmpeg():
     """顺序契约：配置拒绝优先于"没有 ffmpeg"，否则用户会收到一条他不需要的错误。"""
     cfg = VideoConfig(max_size_mb=13.0, oversize_action="reject")
     plan = classify(size_mb=20.0, duration_sec=2.0, config=cfg, has_ffmpeg=False)
-    assert plan.reason_code == "rejected"
+    assert plan.reason_code == "rejected_size"
 
 
 def test_oversize_without_duration_blocks_a_blind_compression():
@@ -397,9 +397,64 @@ def test_judgement_carries_the_facts_it_was_given():
 
 
 def test_kind_vocabulary_is_unchanged():
-    """要求：``MediaToolError.KINDS`` 的对外取值集合一个都不许变。"""
+    """要求：``MediaToolError.KINDS`` 的对外取值集合一个都不许变。
+
+    ``rejected_*`` 三条是**判决期**（配置拒绝）的分类，与执行期的
+    ``MediaToolError.KINDS`` 不相交。0.2.1 只有一个笼统的 ``rejected``，
+    现在按「体积 / 时长 / 两者」拆开 —— 动机见
+    :func:`test_reject_distinguishes_size_from_duration`。
+    """
     extra = set(decide.KIND_OF_CODE.values()) - MediaToolError.KINDS
-    assert extra == {"rejected"}  # 只属于 injector 的配置拒绝
+    assert extra == set(decide.REJECT_CODES)
+    assert all(code.startswith("rejected") for code in extra)
+    assert not (MediaToolError.KINDS & set(decide.REJECT_CODES))
+
+
+def test_reject_distinguishes_size_from_duration():
+    """回归（ARCH-REVIEW §4.1）：仅超时长被拒不能说"超过体积上限"。
+
+    0.2.1 把 oversize 与 overlong 都映射成 ``rejected`` → "it exceeds the size
+    limit"。于是"视频太长被拒"告诉模型"它太大了"，模型会去劝用户压小体积 ——
+    和 ``ae222e4`` 修掉的那类错误归因一模一样。
+    """
+    overlong = classify(
+        size_mb=1.0,
+        duration_sec=10.0,
+        config=VideoConfig(
+            max_size_mb=1000.0, max_duration_sec=1.0, oversize_action="reject"
+        ),
+    )
+    assert overlong.reason_code == "rejected_duration"
+    assert overlong.kind == "rejected_duration"
+    assert explain(overlong.kind) == "its duration exceeds the limit"
+    assert "size" not in explain(overlong.kind)
+
+    oversize = classify(
+        size_mb=20.0,
+        duration_sec=1.0,
+        config=VideoConfig(
+            max_size_mb=13.0, max_duration_sec=0.0, oversize_action="reject"
+        ),
+    )
+    assert oversize.reason_code == "rejected_size"
+    assert explain(oversize.kind) == "it exceeds the size limit"
+
+    both = classify(
+        size_mb=20.0,
+        duration_sec=10.0,
+        config=VideoConfig(
+            max_size_mb=13.0, max_duration_sec=1.0, oversize_action="reject"
+        ),
+    )
+    assert both.reason_code == "rejected_size_and_duration"
+    assert explain(both.kind) == "it exceeds the size and duration limits"
+
+    # 三条短语互不相同 —— 否则"拆开"没有意义
+    assert len({explain(code) for code in decide.REJECT_CODES}) == 3
+    # 没有码时的兜底文案必须诚实（不猜体积/时长）
+    assert explain("rejected") == (
+        "it was rejected by the configured size or duration policy"
+    )
 
 
 def test_every_code_has_a_phrase():
@@ -414,7 +469,7 @@ def test_every_code_has_a_phrase():
         "rejected",
         "no_ffmpeg",
         "unknown_duration",
-    }
+    } | set(decide.REJECT_CODES)
     for code in codes:
         assert explain(code), code
 

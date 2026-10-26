@@ -193,8 +193,87 @@ def test_reject_action_does_not_run_ffmpeg(
         make_placeholder(noisy_video), config=cfg, logger=stub_logger
     )
     assert outcome.ok is False
-    assert outcome.kind == "rejected"
+    assert outcome.kind == "rejected_size"
     assert "拒绝" in outcome.reason
+
+
+def test_reject_reason_distinguishes_size_from_duration(
+    monkeypatch, tmp_path, make_placeholder, stub_logger
+):
+    """回归（ARCH-REVIEW §4.1）：仅超时长被拒时，注入给模型的短语不能说体积。
+
+    这条用例走**真实链路**（``prepare_video`` → ``hooks._short_reason``），
+    断言的是模型最终收到的那句话 —— 0.2.1 在这里说 "it exceeds the size limit"，
+    模型于是建议用户压小体积，而真正该做的是截短时长。
+    """
+    from vv_plugin.core import injector
+    from vv_plugin.core.config import VideoConfig
+    from vv_plugin.hooks.llm_request import _short_reason
+
+    path = tmp_path / "long.mp4"
+    path.write_bytes(b"\x00" * 2048)
+    placeholder = make_placeholder(str(path))
+    # 探测结果由这里给定：体积远小于闸门、时长超过上限
+    monkeypatch.setattr(injector, "file_size_mb", lambda _path: 1.0)
+    monkeypatch.setattr(injector, "probe_duration", lambda _path, _probe: 10.0)
+
+    def prepare(**overrides):
+        options = {
+            "max_size_mb": 1000.0,
+            "max_duration_sec": 1.0,
+            "oversize_action": "reject",
+            "ffmpeg_path": str(tmp_path / "no-ffmpeg"),
+        }
+        options.update(overrides)
+        return injector.prepare_video(
+            placeholder, config=VideoConfig(**options), logger=stub_logger
+        )
+
+    overlong = prepare()
+    assert overlong.kind == "rejected_duration"
+    phrase = _short_reason(overlong.reason, overlong.kind)
+    assert phrase == "its duration exceeds the limit"
+    assert "size" not in phrase
+
+    oversize = prepare(max_duration_sec=0.0, max_size_mb=0.5)
+    assert oversize.kind == "rejected_size"
+    assert _short_reason(oversize.reason, oversize.kind) == "it exceeds the size limit"
+
+    both = prepare(max_size_mb=0.5)
+    assert both.kind == "rejected_size_and_duration"
+    assert (
+        _short_reason(both.reason, both.kind)
+        == "it exceeds the size and duration limits"
+    )
+
+
+def test_reject_phrase_without_a_code_stays_honest(
+    monkeypatch, tmp_path, make_placeholder, stub_logger
+):
+    """没有机器可读码时不能猜"太大"：只能说实话（体积或时长策略拒绝）。"""
+    from vv_plugin.core import injector
+    from vv_plugin.core.config import VideoConfig
+    from vv_plugin.hooks.llm_request import _short_reason
+
+    path = tmp_path / "long.mp4"
+    path.write_bytes(b"\x00" * 2048)
+    monkeypatch.setattr(injector, "file_size_mb", lambda _path: 1.0)
+    monkeypatch.setattr(injector, "probe_duration", lambda _path, _probe: 10.0)
+    outcome = injector.prepare_video(
+        make_placeholder(str(path)),
+        config=VideoConfig(
+            max_size_mb=1000.0,
+            max_duration_sec=1.0,
+            oversize_action="reject",
+            ffmpeg_path=str(tmp_path / "no-ffmpeg"),
+        ),
+        logger=stub_logger,
+    )
+    assert outcome.ok is False
+
+    phrase = _short_reason(outcome.reason)  # 刻意不传 kind
+    assert phrase == "it was rejected by the configured size or duration policy"
+    assert "exceeds the size" not in phrase
 
 
 # --------------------------------------------------------------- ffmpeg 参数

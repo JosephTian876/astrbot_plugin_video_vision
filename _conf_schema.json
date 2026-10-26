@@ -29,7 +29,9 @@
     "description": "视觉服务 API Key",
     "type": "string",
     "default": "",
-    "hint": "视觉服务的密钥。仅 openai_compat 模式使用。"
+    "secret": true,
+    "obvious_hint": true,
+    "hint": "视觉服务的密钥。仅 openai_compat 模式使用。面板里默认以密码框显示；插件日志只打后 4 位。"
   },
   "openai_model": {
     "description": "视觉模型",
@@ -57,15 +59,15 @@
   },
   "vision_describe_prompt": {
     "description": "通用描述提示词",
-    "type": "string",
+    "type": "text",
     "default": "请详细描述这段视频：场景、人物/物体、动作、画面中的文字、字幕与关键时间点。你的描述会被转交给另一个看不到视频的模型，请客观具体、保留关键细节。",
-    "hint": "用户没有附带文字问题时使用的提示词。"
+    "hint": "用户没有附带文字问题时使用的提示词。长模板，面板里是可拖拽宽高的多行文本框。"
   },
   "vision_qa_prompt": {
     "description": "带问题提示词模板",
-    "type": "string",
+    "type": "text",
     "default": "用户发来一段视频，并问：「{question}」\n请认真观看视频后直接、具体地回答用户的问题。如果问题与视频内容无关，请简要说一句，再描述视频的主要内容。",
-    "hint": "用户附带文字问题时使用的模板，{question} 会被替换为用户原话。"
+    "hint": "用户附带文字问题时使用的模板，{question} 会被替换为用户原话。长模板，面板里是可拖拽宽高的多行文本框。"
   },
   "vision_verify_ssl": {
     "description": "校验视觉服务 SSL 证书",

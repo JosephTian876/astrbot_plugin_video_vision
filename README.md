@@ -82,13 +82,13 @@ Responses API（`/responses`）同样实测支持：视频用 `input_image` + da
 | `enable` | `true` | 总开关 |
 | `provider_mode` | `openai_compat` | `openai_compat`（默认）/ `gemini_native`。视觉服务三项没配齐时**自动降级为 `gemini_native`**，因此老配置直接升级不会失效 |
 | `openai_base_url` | `""` | 视觉服务**完整接口地址**，写全到 `/chat/completions` 或 `/responses`（按结尾自动选协议）；只填到 `/v1` 兜底前者 |
-| `openai_api_key` | `""` | 视觉服务密钥 |
+| `openai_api_key` | `""` | 视觉服务密钥。面板里是**密码框**（schema `secret: true`），日志只打后 4 位 |
 | `openai_model` | `gemini-3.8-flash-high` | 视觉模型，须支持视频 |
 | `openai_timeout_sec` | `180` | 视觉服务超时（上传约 7-9s/MB）。既是单阶段超时，也是单个视频的整体硬上限 |
 | `openai_max_tokens` | `2048` | 视觉回答 token 上限 |
 | `vision_with_question` | `true` | 把用户随视频附带的文字一起发给视觉模型 |
-| `vision_describe_prompt` | 见 schema | 无附带文字时的通用描述提示词 |
-| `vision_qa_prompt` | 见 schema | 带问题提示词模板，`{question}` 会被替换 |
+| `vision_describe_prompt` | 见 schema | 无附带文字时的通用描述提示词（长文本，面板里是多行文本框） |
+| `vision_qa_prompt` | 见 schema | 带问题提示词模板，`{question}` 会被替换（长文本，面板里是多行文本框） |
 | `vision_verify_ssl` | `true` | 校验视觉服务证书；中转站证书有问题时可关（自担风险） |
 | `require_gemini_provider` | `true` | **仅 gemini_native 模式生效**，建议保持开启 |
 | `additional_provider_types` | `[]` | **仅 gemini_native 模式生效**：在默认 Gemini 系白名单外额外放行的 provider type（如走 OpenAI 协议的 Gemini 代理）。填错可能被上游 422 拒收 |
@@ -102,7 +102,7 @@ Responses API（`/responses`）同样实测支持：视频用 `input_image` + da
 | `handle_quoted_video` | `true` | 是否处理引用消息里的视频 |
 | `treat_file_as_video` | `true` | **把视频文件附件也当作视频处理**（见下方「QQ 把视频当文件发」） |
 | `hide_local_path` | `true` | **注入后抹除占位文本中的本机路径**（见下方「别把路径喂给模型」） |
-| `notify_on_failure` | `true` | 失败时追加一句简短说明给模型 |
+| `notify_on_failure` | `true` | 失败时追加一句简短说明给模型（`[Video attachment was skipped: …]`；"太长被拒"与"太大被拒"是两个不同的短语，见下） |
 | `max_compress_seconds` | `45.0` | 压缩耗时**墙钟**上限（超时终止整棵进程树），超时则降级 |
 | `ffmpeg_path` | `""` | 留空则从 PATH 查找；也可填所在目录 |
 | `cache_enabled` | `true` | 启用压缩缓存 |
@@ -317,6 +317,12 @@ MIME   : video/mp4（压缩产物，固定为 mp4）
   `compress_max_mb=15.0 超过体积闸门 max_size_mb=13.0，已按闸门的 90% 收敛为 11.7`
   —— 一个旋钮只有一个生效值（0.2.1 曾先夹到 13.0、再降到 11.7，打出两条都在说
   "已修正"的提示，而生效值等于哪一条都没写全）。
+- **失败分类**（`分类:` 行）是机器可读的：`corrupt` / `empty` / `not_found` /
+  `duration` / `too_large` / `timeout` / `exit_code` / `missing`，以及配置拒绝的
+  三条 —— `rejected_size`（体积超闸门）/ `rejected_duration`（时长超上限）/
+  `rejected_size_and_duration`（两者都超）。注入给模型的那句话按分类取
+  （`it exceeds the size limit` / `its duration exceeds the limit` / …）：
+  **"太长被拒"不会被告知"它太大了"**，否则模型会去劝用户压体积。
 
 ---
 

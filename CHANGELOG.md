@@ -157,6 +157,20 @@
 - 新增 `tests/test_ci.py`（14 例）：用 PyYAML 解析 workflow 并断言 pin 的版本、
   矩阵、超时、artifact 与 `VV_REQUIRE_FFMPEG`；上面三处不稳点修复也写成回归断言。
 
+### 配置面板与文案
+
+- `openai_api_key` 在 schema 里加 `"secret": true`：面板以密码框显示。此前插件
+  在日志里费劲打码、面板却明文显示密钥，自相矛盾。顺带加 `obvious_hint`。
+- `vision_describe_prompt` / `vision_qa_prompt` 的 `type` 从 `string` 改为
+  `text`：面板渲染成可拖拽宽高的多行文本框（长模板不再需要横向滚动）。
+- **「仅超时长被拒」不再说"超过体积上限"。** 0.2.1 把 oversize 与 overlong 都
+  映射成同一个 `rejected` → `it exceeds the size limit`，于是"视频太长被拒"
+  告诉模型"它太大了"，模型会去劝用户压小体积（ARCH-REVIEW §4.1）。现在判决码
+  拆成 `rejected_size` / `rejected_duration` / `rejected_size_and_duration`，
+  各有一句英文短语；`/videotest` 的 `分类:` 行也随之更精确。没有机器可读码时
+  （只有一句 reason）不猜是体积还是时长，只说
+  `it was rejected by the configured size or duration policy`。
+
 ## 0.2.0
 
 新增 **openai_compat 模式**：配置文件可自定义 OpenAI 兼容视觉服务商。

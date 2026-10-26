@@ -57,7 +57,15 @@ def test_short_reason_keeps_the_four_categories_distinct():
         ("corrupt", "the video file appears to be corrupt"),
         ("empty", "the video file is empty"),
         ("too_large", "it exceeds the size limit"),
-        ("rejected", "it exceeds the size limit"),
+        # 「按配置拒绝」按体积/时长/两者拆成三条（0.2.1 只有笼统的一条，
+        # 于是"仅超时长"也被告知 "it exceeds the size limit"）
+        ("rejected_size", "it exceeds the size limit"),
+        ("rejected_duration", "its duration exceeds the limit"),
+        (
+            "rejected_size_and_duration",
+            "it exceeds the size and duration limits",
+        ),
+        ("rejected", "it was rejected by the configured size or duration policy"),
         ("missing", "the file could not be read"),
         ("duration", "its duration could not be read"),
     ],

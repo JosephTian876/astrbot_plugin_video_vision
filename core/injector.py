@@ -30,7 +30,7 @@ from typing import Any
 from astrbot.api import logger as _log
 
 from .config import VideoConfig
-from .decide import MediaPlan, classify
+from .decide import REJECT_CODES, REJECT_REASON_PREFIX, MediaPlan, classify
 from .media import (
     OUTPUT_SUFFIX,
     CompressCache,
@@ -391,8 +391,8 @@ def _blocked_reason(plan: MediaPlan, config: VideoConfig, source: str) -> str:
     """
     if plan.reason_code in {"empty", "corrupt"}:
         return f"{plan.note}: {source}"
-    if plan.reason_code == "rejected":
-        return f"按配置拒绝（{plan.note}）"
+    if plan.reason_code in REJECT_CODES:
+        return f"{REJECT_REASON_PREFIX}（{plan.note}）"
     if plan.reason_code == "no_ffmpeg":
         hint = (
             f"配置的 ffmpeg_path 无效: {config.ffmpeg_path}"

@@ -285,6 +285,10 @@ _SCHEMA_TYPE_TO_PY = {
     "int": int,
     "float": float,
     "string": str,
+    #: ``text`` 是 AstrBot 对"长字符串"的类型名（面板渲染成可拖拽的多行 textarea），
+    #: 读进来仍然是 ``str``（``work/astrbot-upstream/docs/zh/dev/star/guides/
+    #: plugin-config.md``：type 支持 string / text / int / float / …）。
+    "text": str,
     "list": list,
 }
 
@@ -306,6 +310,29 @@ def test_every_schema_key_is_consumed_by_from_mapping():
     cfg, notices = VideoConfig.from_mapping_detailed(raw)
     assert notices == []
     assert cfg == VideoConfig.from_mapping(raw)
+
+
+def test_api_key_field_is_masked_in_the_panel():
+    """回归：插件在日志里给密钥打码，面板却明文显示（自相矛盾）。
+
+    AstrBot 的 ``secret`` 只遮**显示**、不改值，且只对字符串字段生效
+    （``work/astrbot-upstream/docs/zh/dev/star/guides/plugin-config.md``）。
+    这里同时保证"只有字符串字段敢设 secret"，免得哪天设到数值字段上静默失效。
+    """
+    schema = load_schema()
+    assert schema["openai_api_key"]["secret"] is True
+    for key, field_schema in schema.items():
+        if field_schema.get("secret"):
+            assert field_schema["type"] in {"string", "text", "list"}, key
+
+
+def test_long_prompt_templates_use_a_textarea():
+    """回归：两个长模板挤在单行 input 里，改一个字要横向滚动。"""
+    schema = load_schema()
+    for key in ("vision_describe_prompt", "vision_qa_prompt"):
+        assert schema[key]["type"] == "text", key
+        # 长模板：单行 input 装不下（默认值本身就有 70+ 字符，改起来要横向滚动）
+        assert len(schema[key]["default"]) > 60, key
 
 
 # --------------------------------------------------------------- 未知键 / 收敛

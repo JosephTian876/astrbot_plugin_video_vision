@@ -120,6 +120,11 @@ def _short_reason(reason: str, kind: str = "") -> str:
     phrase = decide.explain(kind)
     if phrase:
         return phrase
+    # ---- 「按配置拒绝」：没有码时只能说来实话，绝不猜"太大"还是"太长" ----
+    # 生产方（``injector._blocked_reason``）与这里共用同一个前缀常量；
+    # 判决本身会给 ``rejected_size`` / ``rejected_duration`` 三条码，走上面那张表。
+    if reason.startswith(decide.REJECT_REASON_PREFIX):
+        return decide.explain("rejected")
     # ---- 本地视频处理（两种模式共用）：只有"没有码"时才走文本回退 ----
     if "超时" in reason or "timeout" in low or "timed out" in low:
         return decide.explain("timeout")

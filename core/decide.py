@@ -57,8 +57,7 @@ ACTION_LABELS: dict[str, str] = {
 }
 
 #: 机器可读分类 -> 注入给模型的英文短语（**不含本机路径**）。这张表就是 0.2.1
-#: ``hooks._SHORT_REASONS`` 的内容，一个键都没增删 —— 它对外可见（模型收到的
-#: 提示语），重构不许改字。
+#: ``hooks._SHORT_REASONS`` 的内容 —— 它对外可见（模型收到的提示语），重构不许改字。
 #:
 #: 刻意**不收录**三个键，理由各不相同：
 #: - ``other``：``MediaToolError`` 的兜底桶，它的 reason 里往往还有更具体的信息
@@ -77,14 +76,38 @@ SHORT_REASONS: dict[str, str] = {
     "duration": "its duration could not be read",
     "too_large": "it exceeds the size limit",
     "size": "it exceeds the size limit",
-    "rejected": "it exceeds the size limit",
     "missing": "the file could not be read",
+    # 「按配置拒绝」必须分成三条：0.2.1 把 oversize 与 overlong 都报成
+    # "it exceeds the size limit"，于是"视频太长被拒"告诉模型"它太大了"，
+    # 模型会去劝用户压小体积 —— 错误归因（ARCH-REVIEW §4.1）。
+    "rejected_size": "it exceeds the size limit",
+    "rejected_duration": "its duration exceeds the limit",
+    "rejected_size_and_duration": "it exceeds the size and duration limits",
+    # 没有码时（例如上游只给了一句 reason）不能猜是体积还是时长，只能说真话。
+    "rejected": "it was rejected by the configured size or duration policy",
 }
+
+#: 「按配置拒绝」的三条判决码（体积 / 时长 / 两者）。``rejected*`` 前缀是契约：
+#: ``injector._blocked_reason`` 用它渲染原因，``hooks._short_reason`` 用
+#: :data:`REJECT_REASON_PREFIX` 在**没有码**时兜底。
+REJECT_CODES: frozenset[str] = frozenset(
+    {"rejected_size", "rejected_duration", "rejected_size_and_duration"}
+)
+
+#: ``injector._blocked_reason`` 渲染「按配置拒绝」时的前缀。生产方与消费方共用
+#: 这一个常量，避免"文案一改、兜底分支静默失效"。
+REJECT_REASON_PREFIX = "按配置拒绝"
 
 #: 判决码 -> 对外失败分类（``PrepareOutcome.kind``）。取值集合**一个都没变**：
 #: 测试、日志与 ``/videotest`` 的「分类:」行都依赖它。不会失败的判决不在表里。
+#: ``rejected_*`` 三条是 0.2.1 之后新拆的（原来只有 ``rejected``），对外 kind 因此
+#: 更精确：``/videotest`` 的「分类:」行会写 ``rejected_duration`` 而不是笼统的
+#: ``rejected``。``MediaToolError.KINDS`` 与它们不相交（执行期 vs 判决期）。
 KIND_OF_CODE: dict[str, str] = {
-    "empty": "empty", "corrupt": "corrupt", "rejected": "rejected",
+    "empty": "empty", "corrupt": "corrupt",
+    "rejected_size": "rejected_size",
+    "rejected_duration": "rejected_duration",
+    "rejected_size_and_duration": "rejected_size_and_duration",
     "no_ffmpeg": "not_found", "unknown_duration": "duration",
     "too_large": "too_large",
 }
@@ -144,7 +167,7 @@ class MediaPlan:
     """
 
     action: str  # as-is | compress | truncate | reject（后三者同 oversize_action）
-    reason_code: str  # ok | oversize | overlong | empty | corrupt | rejected | ...
+    reason_code: str  # ok | oversize | overlong | empty | corrupt | rejected_* | ...
     size_mb: float = 0.0
     duration_sec: float = 0.0
     truncate_to_sec: float = 0.0  # 0 = 不截断
@@ -165,7 +188,7 @@ class MediaPlan:
     @property
     def blocked(self) -> bool:
         """执行期会直接失败。``too_large`` 不算：那是 as-is 执行期的硬检查。"""
-        blocked = {"empty", "corrupt", "rejected", "no_ffmpeg", "unknown_duration"}
+        blocked = {"empty", "corrupt", "no_ffmpeg", "unknown_duration"} | REJECT_CODES
         return self.reason_code in blocked
 
     @property
@@ -242,7 +265,16 @@ def classify(
     code = "oversize" if oversize else "overlong"
 
     if config.oversize_action == "reject":
-        return MediaPlan(action="reject", **facts, reason_code="rejected", note=note)
+        # 拒绝的原因必须分得清"太大"和"太长"：模型据此给用户的建议完全不同
+        # （压缩体积 vs 截短时长）。0.2.1 三条都用笼统的 ``rejected``，
+        # 于是"仅超时长"被告知 "it exceeds the size limit"（ARCH-REVIEW §4.1）。
+        if oversize and overlong:
+            reject_code = "rejected_size_and_duration"
+        elif oversize:
+            reject_code = "rejected_size"
+        else:
+            reject_code = "rejected_duration"
+        return MediaPlan(action="reject", **facts, reason_code=reject_code, note=note)
 
     # 压缩目标也可能撞编码上限（compress_max_mb 的上界远大于 13.5MB 原始体积）
     target_note = ""
