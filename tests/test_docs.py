@@ -132,6 +132,25 @@ def test_videotest_example_matches_the_new_report():
     assert "l10_probe.mp4" not in README
 
 
+def test_the_verdict_label_in_the_docs_is_not_the_one_the_companion_deletes():
+    """README 的示例必须用 `结论`：`判定   :` 会被陪伴插件在发出前删掉。
+
+    证据与守卫源码见 ``tests/test_interop.py`` 的模块说明。
+    """
+    from vv_plugin.core.diagnostics import VERDICT_LABEL
+
+    assert VERDICT_LABEL == "结论   :"
+    assert f"{VERDICT_LABEL} 体积 21.8MB > 闸门 13.0MB → 压缩" in README
+    # 示例正文里不能留旧标签（正文里出现"判定"只允许是在解释它为什么不能用）
+    assert "判定   : 体积" not in README
+    assert "判定   : 未超限" not in README
+    # 兼容性表格里必须点名这条出站文本约束（否则读者不知道为什么不能改回「判定」）
+    assert "出站文本不长得像复核字段" in README
+    assert "user_memory.py:9174-9210" in README
+    assert "test_interop.py" in README
+    assert "跨插件兼容" in CHANGELOG
+
+
 def test_videotest_honesty_lines_are_documented():
     """0.2.1 新增的三类"说清楚"：corrupt 判定、未知后缀警示、配置修正回显。"""
     assert "无法解析（时长读取失败）→ 会以 corrupt 失败" in README
