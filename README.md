@@ -117,10 +117,16 @@ Responses API（`/responses`）同样实测支持：视频用 `input_image` + da
 | `ffmpeg_max_concurrency` | `2` | 进程内**全局**（跨会话）同时进行的 ffmpeg 转码数（0-8）。**`0` = 关闭限流**，行为回到 0.2.1 |
 | `ffmpeg_queue_timeout_sec` | `30.0` | 单个视频**等待槽位**的上限（1-600，不含转码本身）。超时 -> 失败分类 `busy` |
 | `ffmpeg_singleflight` | `true` | 同一内容 + 同一组压缩参数的并发转码只做一次（**依赖 `cache_enabled`**） |
-| `vision_cache_enabled` | `true` | 视觉理解结果缓存。**只在 `openai_compat` 生效**（`gemini_native` 不查不写），**只对完全相同的重复投递命中**（视频标识 = 源 + 压缩参数 + 最终 prompt + 端点 + 模型 + max_tokens），纯内存、重启即失效 |
+| `vision_cache_enabled` | `true` | 视觉理解结果缓存。**只在 `openai_compat` 生效**（`gemini_native` 不查不写），**只对完全相同的重复投递命中**（视频标识 = 源 + 压缩参数，再加**声明 MIME**、最终 prompt、端点、模型、max_tokens、**API key 指纹**），纯内存、重启即失效 |
 | `vision_cache_ttl_sec` | `600.0` | 条目存活时长（60-86400）。命中**不**续期 |
 | `vision_cache_max_entries` | `64` | 条目上限（1-1024），超出按 LRU 淘汰；64 条约 1MB |
 | `debug_log` | `false` | 详细调试日志（缓存计数只在这个级别可见；限流摘要在 `/videotest` 真的排过队时也会多一行） |
+
+> **上面 6 个 0.3.0 新键填错类型会告警（只一次）**：`"false"` / `"0.5"` / `"abc"`
+> 这类值过去被**静默**转换 —— `ffmpeg_max_concurrency="false"` → **2**（限流反而
+> 开着）、`"0.5"` → **0**（限流被关掉）、`vision_cache_enabled="abc"` → **False**
+> （缓存被关）。现在生效值**不变**，但启动日志会多一条 `配置提示:`，把**你填的原值**
+> 与**实际生效值**写在同一句里；同一个「键名 + 原值」在进程内只提示一次，不刷屏。
 
 ### 两个体积旋钮怎么配合
 
@@ -217,26 +223,37 @@ Responses API（`/responses`）同样实测支持：视频用 `input_image` + da
   `the server is busy processing other videos`）—— 它**不是** `timeout`，
   别去调 `max_compress_seconds`，该调的是并发上限或本项。
 
-### 排队发生在事件循环侧（不是线程池里）
+### 排队发生在事件循环侧（worker 跑在 ffmpeg 专属执行器）
 
 `core/limits.py` 的 `SlotLimiter` 用 `asyncio.Queue` 预填 `limit` 个令牌，
 钩子里是：
 
 ```python
-async with limiter.slot(name=name):
-    outcome = await asyncio.to_thread(prepare_video, ...)
+async with limiter.slot(name=name) as slot:
+    # 取到槽 -> 提交到 ffmpeg 专属执行器 -> worker 真正结束才还槽
+    outcome = await slot.wait_for_worker(limiter.submit(prepare_video, ...))
 ```
 
-**没有**把 `threading.Semaphore` 塞进 `prepare_video`。理由就是上面那条：默认
-执行器是全进程共享的，在 worker 里睡觉等于把核心的 media/TTS/ASR 一起饿死
-（2 核只有 6 个线程）。`tests/test_limits.py` 用 AST 锁住"每个
-`to_thread(prepare_video)` 都在槽内"，并专门测了取消/超时**不吞令牌**
-（槽位永久 -1 会让全站慢慢卡死）。
+**`wait_for_worker` 不是装饰**：外层被取消（框架超时、用户撤回）时，槽位必须留在
+**还在跑的 ffmpeg 线程**手里，由它的 done-callback 归还。少了这一层，`async with`
+会当场还令牌，而 ffmpeg 子进程还在跑 —— 真实并发于是越过 `limit`（实测 `limit=1`
+峰值 **2**）。照抄时把提交**包在** `wait_for_worker` 里，不要只 `await` 提交结果。
+
+**没有**把 `threading.Semaphore` 塞进 `prepare_video`：那样 2 核机器的 6 个默认
+线程里会有 4 个在"睡觉"，把核心的 media/TTS/ASR 一起饿死。提交走
+`SlotLimiter.submit` —— `max_workers == limit` 的**专属**执行器，不是
+`asyncio.to_thread` 那个**全进程共享**的默认池：池被核心占满时，后者会让任务躺在
+池队列里无限期排队，而槽位已经被取走（`wait_for_worker` 对 worker 的等待没有
+超时）。`tests/test_limits.py` 用 AST 锁住"每个阻塞提交都在槽内"，并专门测了
+取消/超时**不吞令牌**（槽位永久 -1 会让全站慢慢卡死）。
 
 - 排队 INFO 与超时 WARNING 都带 **视频名**（`slot(name=…)` → `视频=a.mp4`），
   线上能直接定位"是哪条视频排了 28 秒"；不带名字时不留空尾巴。
-- **小于 1 秒一律渲染成毫秒**（`10ms` / `900ms`）：`ffmpeg_queue_timeout_sec=0.01`
-  的文案不会再写成「排队等待转码超过 0s」，`/videotest` 里同一句话也走同一个格式化函数。
+- **小于 1 秒一律渲染成毫秒**（`10ms` / `400ms`）：排队摘要、超时文案、缓存命中的
+  「TTL 剩 Xs」与 `/videotest` 的报告共用同一个 `format_seconds()`，不会再出现
+  「排队等待转码超过 0s」或「TTL 剩 0s」。`ffmpeg_queue_timeout_sec` 的配置下限是
+  **1.0s**，所以排队这条最常见的是 `1.0s` / `12.3s`；亚秒形态出现在缓存 TTL 剩余
+  与直接构造的边界用例里。
 
 ### 同一文件并发只转码一次（`ffmpeg_singleflight`）
 
@@ -283,11 +300,16 @@ async with limiter.slot(name=name):
 | `/videotest` 第 2 次 | **完全相同** | **+1** | 2（不变） | 2（不变） | `STUB#4` |
 | 4 路**并发**完全相同 | 同时发起 | **+1**（其余 3 路等 leader 的结果） | 1 | 0 | 全是 `STUB#1` |
 
-key 是六个维度的 sha256：
+key 是**六个语义维度 + 两条身份维度**的 sha256（`KEY_VERSION=2`）：
 
 ```
-v1 | 视频标识 | 最终 prompt | 协议 | 端点 URL | 模型 | max_tokens
+v2 | 视频标识 | 声明 MIME | 最终 prompt | 协议 | 端点 URL | 模型 | max_tokens | API key 指纹
 ```
+
+> **v2 为什么要多两条**（AUDIT-VV-R9 §2.2/§2.3，两条都实测过串味）：
+> `视频标识` 只有"源哈希 + 压缩参数"，**不含发给端点的 MIME** —— 同一份字节改名
+> `.mov` 后与 `.mp4` 共用一条缓存，第 2 次 **0 次 `POST`** 就拿到了 `.mp4` 那次的
+> 答案；`api_key` 同理（换 key 后仍然命中旧答案）。现在少了任何一条都会 miss。
 
 - **视频标识**（`VideoInjection.content_key`）＝ 模型实际看到的画面，取
   **「源 + 参数」而不是产物字节**：
@@ -300,12 +322,22 @@ v1 | 视频标识 | 最终 prompt | 协议 | 端点 URL | 模型 | max_tokens
   同源同参 = 3 个不同的产物哈希。取产物哈希会让 `cache_enabled=false` 时
   视觉缓存**永不命中**（这正是 0.3.0 第一版的缺陷，已修）。压缩参数变了 =
   模型看到的画面变了 = 仍然必须换 key。
+- **声明 MIME**：`guess_video_mime(used_path)`，也就是 data URI 里那个前缀
+  （`data:video/mp4` vs `data:video/quicktime`）。它由**后缀**决定，所以"同一份
+  字节另存为 `.mov` 再发"是一次新的声明 —— 端点若按 MIME 拒绝或差别对待，复用的
+  旧答案会把失败掩盖掉。
 - **最终 prompt**：`build_vision_prompt()` 的输出（已折叠用户问题 + 两个模板）。
   只哈希原始 question 会漏掉模板改动。
 - **端点**：`(协议, 最终 URL)` —— 换端点/换协议回答会变。
 - **模型 / max_tokens**：换模型=换回答；上限不同输出可能被截断。
-- **不进 key**：API key（换密钥不改变语义）、超时、SSL 开关、视频文件名（QQ 每次
-  落地名不同，放进去等于永不命中）、会话 ID（跨会话共享正是收益来源）。
+- **API key 指纹**：`sha256(openai_api_key)[:12]`（48 bit）。**原文不进 key** ——
+  载荷会进 `json.dumps`，明文多留一处就多一处泄漏面；而 12 位足够区分"换了 key"。
+  为什么换 key 要换缓存：中转站（本项目文档承认的部署形态）会按 key 路由到不同
+  后端/模型，换 key 之后命中旧答案，等于"用户修正了一个错 key，第一次重复投递
+  还是拿到错 key 时的回答"。
+- **不进 key**：API key 的**原文**、`openai_timeout_sec`、`vision_verify_ssl`、
+  视频文件名（QQ 每次落地名不同，放进去等于永不命中）、会话 ID（跨会话共享正是
+  收益来源）。
 
 行为细节：
 
@@ -329,8 +361,10 @@ v1 | 视频标识 | 最终 prompt | 协议 | 端点 URL | 模型 | max_tokens
   但**不写缓存** —— 下一次投递会重新请求。它是"并发去重"，与串行命中是两条路径：
   前者不产生缓存条目、后者靠 TTL；`vision_cache_enabled=false` 时**两者都没有**。
 - 命中日志里的剩余 TTL **小于 1 秒时按毫秒打印**（`TTL 剩 400ms`），不会出现「TTL 剩 0s」。
-- `vision_cache_enabled=false` → **完全不建缓存对象**、`content_key` 也不算，
-  注入决策与既有日志行为与 0.2.1 等价（唯一例外见下节）。
+- `vision_cache_enabled=false` → **完全不建缓存对象**、`content_key` 也不算。
+  **只有另外两个 0.3.0 开关也关闭、其余键保持 0.2.1 原值时**，注入决策与既有
+  日志行为才与 0.2.1 等价（口径与那条唯一例外见下节）—— 只关这一个键，限流队列
+  与 singleflight 仍然生效、仍然会打日志。
 
 ### 三条开关 = 回到 0.2.1
 
@@ -368,9 +402,10 @@ ffmpeg_queue_timeout_sec(30s)+max_compress_seconds(60s) 已吃掉视觉服务超
 
 `LimiterStats`（等待次数 / 最长等待 / 超时次数）与 `VisionCacheStats`（命中 /
 未命中 / 写入 / 淘汰 / 过期）在 `debug_log=true` 时逐次写进日志。`/videotest` 只在
-**真的排过队或被排队超时拒过**时多一行 `排队   :` 摘要（例如
-`排队 3 次，最长 12.3s，累计 20.0s，超时 1 次`）；正常路径的报告格式**一字不变**
-（`LimiterStats.summary()` 为空串就不渲染）。
+**真的排过队或被排队超时拒过**时多一行 `队列   :` 摘要（例如
+`队列   : 排队 3 次，最长 12.3s，累计 20.0s，超时 1 次`）—— 标签与
+`core/diagnostics.py` 的实现逐字一致（写成「排队」会读成「排队: 排队 3 次…」）；
+正常路径的报告格式**一字不变**（`LimiterStats.summary()` 为空串就不渲染）。
 
 ---
 

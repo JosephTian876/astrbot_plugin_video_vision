@@ -105,14 +105,22 @@
 - **`/videotest` 绕过缓存，不是受益场景**：诊断必须反映真实链路，同一文件连跑两次
   = **两次真实 `POST`**（+1 / +1），两次回复来自两次不同的服务端回答；缓存条目在
   诊断前后原样保留（不读、不写）。
-- key = 六个维度的 sha256：**视频标识**（新增 `VideoInjection.content_key`：直通
-  `as-is:<源文件哈希>`、压缩 `<action>:<压缩签名>`，签名 = 源内容哈希 +
-  `compress_max_mb` + `crf` + `preset` + `truncate_to`，**与压缩缓存 key 同源**；
-  **不是**产物哈希 —— 同一源同参每次压出来的字节都不一样，取产物哈希会让
-  `cache_enabled=false` 时永不命中，已修）+ **最终 prompt**（`build_vision_prompt()`
-  的输出，已折叠用户问题与模板）+ **端点协议** + **端点 URL** + **模型** +
-  **max_tokens**。
-  另带 `KEY_VERSION`：载荷结构一变，旧条目自动失效。
+- key = **六个语义维度 + 两条身份维度**的 sha256：**视频标识**（新增
+  `VideoInjection.content_key`：直通 `as-is:<源文件哈希>`、压缩 `<action>:<压缩签名>`，
+  签名 = 源内容哈希 + `compress_max_mb` + `crf` + `preset` + `truncate_to`，**与压缩
+  缓存 key 同源**；**不是**产物哈希 —— 同一源同参每次压出来的字节都不一样，取产物
+  哈希会让 `cache_enabled=false` 时永不命中，已修）+ **声明 MIME** +
+  **最终 prompt**（`build_vision_prompt()` 的输出，已折叠用户问题与模板）+
+  **端点协议** + **端点 URL** + **模型** + **max_tokens** + **API key 指纹**
+  （`sha256[:12]`）。
+  另带 `KEY_VERSION`：载荷结构一变，旧条目自动失效（这次升到 **v2**）。
+- **补两条曾经真串味的维度**（AUDIT-VV-R9 §2.2/§2.3）：
+  `content_key` 只有"源哈希 + 压缩参数"、**不含声明给端点的 MIME**，而 MIME 是按
+  后缀猜的 —— 同一份字节改名 `.mov` 与 `.mp4` 曾共用一条缓存，第 2 次 **0 次
+  `POST`** 就拿到了 `.mp4` 那次的答案（端点按 MIME 拒绝/差别对待时，失败会被缓存
+  掩盖）；`api_key` 同样不在 key 里，换 key 后仍命中旧答案（走中转站按 key 路由的
+  用户"改对 key 之后，第一次重复投递还是拿到错 key 时的回答"）。现在两条都进 key，
+  换任何一个都必然 miss；旧条目由 `KEY_VERSION=2` 整批作废。
   为什么不用 `"v1|…"` 拼接：prompt 是用户文本，朴素拼接会让
   `video="a|b", prompt="c"` 与 `video="a", prompt="b|c"` 拼出同一个 key，
   所以走规范化 JSON（`tests/test_vision_cache.py::test_key_separates_field_boundaries`）。
@@ -138,7 +146,9 @@
   本缓存省掉的是上传 + 推理，省不掉本地 ffmpeg。这个组合启动时打一条 WARNING
   说明代价（逐视频刷会淹没日志）。
 - `vision_cache_enabled=false` → **完全不建缓存对象**、`content_key` 也不计算、
-  钩子不查不写：注入决策与既有日志行为与 0.2.1 等价（唯一例外见开头）。
+  钩子不查不写。注意口径：**只有另外两个 0.3.0 开关也关闭、其余键保持 0.2.1 原值
+  时**，注入决策与既有日志行为才与 0.2.1 等价（唯一例外见开头）；只关这一个键，
+  限流队列与 singleflight 仍然生效。
 - 新增模块 `core/vision_cache.py`（纯标准库、零 AstrBot 依赖）。
 
 ### 3. 删掉废弃的 `@register`
@@ -166,6 +176,12 @@
 
 ### 4. 其他
 
+- **六个新键的类型垃圾不再静默**（AUDIT-VV-R9 §6.2）：`"false"` / `"0.5"` / `"abc"`
+  这类值过去一律静默回落（`ffmpeg_max_concurrency="false"` → **2**、`"0.5"` → **0**
+  = 限流被关、`vision_cache_enabled="abc"` → **False**），84 个探针里 **58 个**毫无
+  提示。生效值**不变**，但启动日志会多一条 `配置提示:` WARNING，把用户写的原值与
+  最终生效值写在同一句里；同一个「键名 + 原值」在进程内只提示一次（改成一个**新的**
+  错值会重新提示）。
 - 既有 **441** 条用例全部保留并绿，新增用例覆盖上述限流、singleflight、视觉缓存
   与"没有装饰器也能被识别"。
 - 改这几个新键都需要**重载插件**（limiter / 缓存在 `__init__` 里建）。
