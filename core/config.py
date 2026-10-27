@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import json
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields, replace
@@ -328,6 +329,152 @@ def _unknown_key_notices(data: Mapping[str, Any]) -> list[str]:
     return ["忽略未知配置键（请检查拼写）: " + ", ".join(unknown)]
 
 
+#: 0.3.0 六个新键各自期望的类型（``int`` / ``float`` / ``bool``）。
+#:
+#: 只覆盖这六个：它们是 0.3.0 新增的旋钮，而 WebUI 的输入框与手改的 JSON 都
+#: 很容易写出 ``"false"`` / ``"0.5"`` 这类值 —— 旧实现会**静默**把它们变成
+#: 默认值或 False（AUDIT-VV-R9 §6.2：84 个探针里 58 个毫无提示，用户看到的
+#: 是"限流反而开着"或"缓存被关掉"）。老键的启动日志保持不变，免得把一条都
+#: 不看的长日志再拉长。
+_COERCION_KINDS: dict[str, str] = {
+    "ffmpeg_max_concurrency": "int",
+    "ffmpeg_queue_timeout_sec": "float",
+    "ffmpeg_singleflight": "bool",
+    "vision_cache_enabled": "bool",
+    "vision_cache_ttl_sec": "float",
+    "vision_cache_max_entries": "int",
+}
+
+#: ``_as_bool`` 认得的"开"与"关"写法（与那个函数里的词表逐字一致）。
+_TRUE_WORDS = frozenset({"1", "true", "yes", "on", "是", "开"})
+_FALSE_WORDS = frozenset({"0", "false", "no", "off", "否", "关"})
+
+#: 「(键名, 原值) 已经提示过」的进程级账本 —— 同一个错值只吵**一次**。
+#:
+#: 为什么要账本：提示在每次 ``from_mapping_detailed`` 里都会重新算出来，而插件
+#: 重载 / 诊断路径可能反复构造配置。没有账本，一个 ``"false"`` 能把日志刷成瀑布。
+#: 键里带**原值**，所以用户改成一个**新**的错值（``"false"`` → ``"0.5"``）仍会
+#: 重新提示，不会因为"这个键报过一次"就把后面的错都吞掉。
+_COERCION_SEEN: set[tuple[str, str]] = set()
+
+
+def reset_coercion_warnings() -> None:
+    """清空「已提示过」的账本（测试用；将来要"重载后重放提示"也从这里清）。"""
+    _COERCION_SEEN.clear()
+
+
+def _raw_text(value: Any) -> str:
+    """把用户写的原始值渲染成一句里读得懂的样子（``"false"`` / ``0.5`` / ``null``）。
+
+    用 ``json.dumps`` 而不是 ``str()``：字符串要带引号（否则
+    ``ffmpeg_singleflight=false`` 分不清用户写的是布尔还是字符串），``None``
+    要显示成 ``null``（用户看到的就是这个词）。不可序列化的对象退化成类型名，
+    **绝不**为了打一条告警而抛异常 —— 告警路径必须比配置本身更耐操。
+    """
+    try:
+        text = json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return type(value).__name__
+    return text if len(text) <= 48 else text[:45] + "..."
+
+
+def _bool_text(value: bool) -> str:
+    return "true" if value else "false"
+
+
+def _default_text(value: Any) -> str:
+    """生效值的可读形式：布尔用 ``true/false``，整数原样，浮点至少带一位小数。"""
+    if isinstance(value, bool):
+        return _bool_text(value)
+    if isinstance(value, int):
+        return str(value)
+    return _mb_text(float(value))
+
+
+def _coercion_notice(key: str, kind: str, raw: Any, final: Any) -> str | None:
+    """``key`` 的用户原值 ``raw`` 是否被**悄悄**变成了 ``final``；是则返回提示。
+
+    只在四种情况下返回提示（它们正是旧实现最容易把人带沟里的地方）：
+
+    1. **根本不是数字/布尔**（``"false"`` / ``null`` / ``[]``）—— 回落默认值；
+    2. **能解析但不是整数**（``"0.5"``）—— ``int()`` 截断成 0，等于把限流关了；
+    3. **字符串不在布尔词表里**（``"abc"`` / ``"1e9"``）—— ``_as_bool`` 一律当 False；
+    4. **布尔写进数值键**（``ffmpeg_max_concurrency=true``）—— ``float()`` 当 1 用。
+
+    返回值里**必须同时**出现用户写的值与最终生效值（AUDIT §6.2 要的口径：
+    "你填的 X 被当作 Y"）。越界收敛**不**在这里报 —— 那是
+    :func:`_range_notices` 的活，两条一起打等于同一个旋钮报两次。
+    """
+    if kind == "bool":
+        if isinstance(raw, bool):
+            return None
+        if isinstance(raw, str):
+            word = raw.strip().lower()
+            if word in _TRUE_WORDS or word in _FALSE_WORDS:
+                return None  # 词表里的写法：本意被忠实翻译，没有"被转换"
+            return (
+                f"{key}={_raw_text(raw)} 不是布尔值，已当作 {_bool_text(final)}"
+                "（只认 true/false）"
+            )
+        if isinstance(raw, (int, float)):
+            if raw in (0, 1):
+                return None  # 0/1 是常见的布尔写法，语义没变
+            return (
+                f"{key}={_raw_text(raw)} 不是布尔值，已当作 {_bool_text(final)}"
+                "（只认 true/false）"
+            )
+        return (
+            f"{key}={_raw_text(raw)} 不是布尔值，"
+            f"已当作默认值 {_bool_text(final)}（只认 true/false）"
+        )
+
+    unit = "整数" if kind == "int" else "数字"
+    low, high = _NUMERIC_BOUNDS[key]
+    if isinstance(raw, bool):  # True/False 会被 float() 悄悄当成 1/0
+        if not low <= (1.0 if raw else 0.0) <= high:
+            return None  # 越界：_range_notices 负责（同一字段不许报两条）
+        return (
+            f"{key}={_raw_text(raw)} 不是{unit}，"
+            f"已当作 {_default_text(final)}（true/false 不能当数值用）"
+        )
+    number = _as_float_or_none(raw)
+    if number is None:
+        return (
+            f"{key}={_raw_text(raw)} 不是{unit}，"
+            f"已当作默认值 {_default_text(final)}"
+        )
+    if not low <= number <= high:
+        return None  # 越界：_range_notices 已经写过"已收敛为 X"
+    if kind == "int" and float(final) != number:
+        return f"{key}={_raw_text(raw)} 带小数，已当作整数 {int(final)}（小数不保留）"
+    return None
+
+
+def _coercion_notices(
+    data: Mapping[str, Any], config: VideoConfig, *, remember: bool = True
+) -> list[str]:
+    """六个新键的类型垃圾提示；同一个 ``(键名, 原值)`` 在进程内只出现一次。
+
+    ``remember=False`` 时不读写账本（调用方会丢弃这些提示，例如
+    :meth:`VideoConfig.from_mapping`）。
+    """
+    notices: list[str] = []
+    for key, kind in _COERCION_KINDS.items():
+        if key not in data:  # 没写这个键 = 用户接受默认值，不是"被转换"
+            continue
+        raw = data[key]
+        text = _coercion_notice(key, kind, raw, getattr(config, key))
+        if text is None:
+            continue
+        if remember:
+            signature = (key, _raw_text(raw))
+            if signature in _COERCION_SEEN:
+                continue
+            _COERCION_SEEN.add(signature)
+        notices.append(text)
+    return notices
+
+
 @dataclass(frozen=True)
 class VideoConfig:
     """插件运行配置。所有字段都可由用户在 WebUI 调整。"""
@@ -411,22 +558,31 @@ class VideoConfig:
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> VideoConfig:
-        """从 WebUI 配置字典构造，容错处理缺失/非法值。"""
-        config, _notices = cls.from_mapping_detailed(raw)
+        """从 WebUI 配置字典构造，容错处理缺失/非法值。
+
+        ``remember=False``：这条路径**丢弃**提示，所以也不许消费"同一个错值只
+        提示一次"的账本 —— 否则先跑一次 ``from_mapping`` 就能把真正的启动告警
+        （``main.VideoVisionPlugin.__init__`` 走 ``from_mapping_detailed``）吞掉。
+        """
+        config, _notices = cls.from_mapping_detailed(raw, remember=False)
         return config
 
     @classmethod
     def from_mapping_detailed(
-        cls, raw: Mapping[str, Any] | None
+        cls, raw: Mapping[str, Any] | None, *, remember: bool = True
     ) -> tuple[VideoConfig, list[str]]:
         """同 :meth:`from_mapping`，另外返回可读的配置告警。
 
-        告警覆盖两类默认完全静默的问题：
+        告警覆盖三类默认完全静默的问题：
 
         1. **未知 / 拼错的配置键**（0.2.0 里拼错 ``max_size_mb`` 会无声地
             回到默认值，用户只会奇怪"为什么配置没生效"）；
         2. **被上下界收敛的数值**（``inf`` / ``1e999`` / 多打几个零），以及
-           被体积闸门收敛的 ``compress_max_mb``。
+           被体积闸门收敛的 ``compress_max_mb``；
+        3. **六个 0.3.0 新键的类型垃圾**（``"false"`` / ``"0.5"`` / ``"abc"``）：
+           它们会被强制转换（或回落默认值），旧实现一声不吭 —— 于是
+           ``ffmpeg_max_concurrency="false"`` 看起来像"关掉限流"，实际是 2
+           （AUDIT-VV-R9 §6.2）。同一个 ``(键名, 原值)`` 只提示一次。
 
         ``compress_max_mb`` 在这里就**一次算成最终值**（见
         :func:`_resolve_compress_mb`）：出一个数、发一条提示，提示里同时有原值
@@ -554,6 +710,7 @@ class VideoConfig:
             ),
             vision_verify_ssl=_as_bool(data.get("vision_verify_ssl"), True),
         )
+        notices.extend(_coercion_notices(data, config, remember=remember))
         return config, notices
 
     def normalized(self) -> tuple[VideoConfig, list[str]]:
