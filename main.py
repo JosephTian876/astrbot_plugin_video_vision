@@ -45,7 +45,8 @@ except ImportError:  # pragma: no cover
 from .core import diagnostics
 from .core.config import VideoConfig
 from .core.decide import classify
-from .core.injector import prepare_video
+from .core.injector import PrepareOutcome, prepare_video
+from .core.limits import NULL_LIMITER, QueueTimeout, SlotLimiter
 from .core.media import (
     file_size_mb,
     probe_duration,
@@ -127,6 +128,46 @@ class VideoVisionPlugin(Star):
             logger.warning("[VideoVision] 配置已自动修正: %s", warning)
 
         self.cache_root: str = _resolve_cache_root()
+
+        #: ffmpeg 并发限流（**进程内全局、跨会话**）。
+        #: ``ffmpeg_max_concurrency=0`` -> 不建这个对象，钩子用 ``NULL_LIMITER``
+        #: （不建令牌队列、不加任何 await、日志零新增）—— 逐字节回到 0.2.1。
+        self.limiter: SlotLimiter | None = (
+            SlotLimiter(
+                self.config.ffmpeg_max_concurrency,
+                queue_timeout=self.config.ffmpeg_queue_timeout_sec,
+                logger=logger,
+                debug=self.config.debug_log,
+            )
+            if self.config.ffmpeg_max_concurrency > 0
+            else None
+        )
+        if self.limiter is not None:
+            logger.info(
+                "[VideoVision] ffmpeg 并发上限=%d，排队上限=%.0fs"
+                "（原先的上限只是默认线程池的 min(32, cpu+4)）",
+                self.limiter.limit,
+                self.limiter.queue_timeout,
+            )
+
+        #: ``ffmpeg_singleflight=true`` 但没有压缩缓存 = 自相矛盾：没有可共享的
+        #: 产物，flight 只能被跳过（``core/injector._prepare_video`` 里逐视频
+        #: 打一条 debug）。**启动时告警一次**：逐视频刷 WARNING 会淹没日志，
+        #: 静默跳过又会让用户以为"开了但没生效"（AUDIT-030 §C.1-7）。
+        self.singleflight_effective = bool(
+            self.config.ffmpeg_singleflight
+            and self.config.cache_enabled
+            and self.cache_root
+        )
+        if self.config.ffmpeg_singleflight and not self.singleflight_effective:
+            logger.warning(
+                "[VideoVision] ffmpeg_singleflight=true，但没有可用的压缩缓存"
+                "（cache_enabled=%s，cache_root=%s）：同一文件的并发转码**不会**被"
+                "合并（每次各压一份，与 0.2.1 相同）。要生效请开启 cache_enabled；"
+                "想消除这条提示就把 ffmpeg_singleflight 设为 false。",
+                self.config.cache_enabled,
+                "已配置" if self.cache_root else "空",
+            )
 
         ffmpeg, ffprobe = resolve_ffmpeg_tools(self.config.ffmpeg_path)
         self.ffmpeg = ffmpeg
@@ -387,14 +428,25 @@ class VideoVisionPlugin(Star):
         )
 
         started = time.monotonic()
-        outcome = await asyncio.to_thread(
-            prepare_video,
-            VideoPlaceholder(name=os.path.basename(target), path=target),
-            config=cfg,
-            cache_root=self.cache_root,
-            logger=logger,
-            debug=cfg.debug_log,
-        )
+        slots = self.limiter if self.limiter is not None else NULL_LIMITER
+        try:
+            # 计时起点在**取槽之前**：报告里的"准备成功（X s）"必须包含排队时间，
+            # 否则高峰期会出现"报告 1.8s、用户实际等了 12s"的静默谎言。
+            async with slots.slot(name=os.path.basename(target)):
+                outcome = await asyncio.to_thread(
+                    prepare_video,
+                    VideoPlaceholder(name=os.path.basename(target), path=target),
+                    config=cfg,
+                    cache_root=self.cache_root,
+                    logger=logger,
+                    debug=cfg.debug_log,
+                )
+        except QueueTimeout as exc:
+            outcome = PrepareOutcome(
+                False,
+                reason=f"排队等待转码超过 {exc.timeout:.0f}s（limit={exc.limit}）",
+                kind="busy",
+            )
         elapsed = time.monotonic() - started
 
         vision = None

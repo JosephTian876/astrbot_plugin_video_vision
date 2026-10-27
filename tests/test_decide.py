@@ -495,6 +495,24 @@ def test_plan_codes_resolve_to_the_same_phrase_as_their_kind():
     )
 
 
+def test_busy_is_its_own_phrase_and_does_not_reuse_timeout():
+    """0.3.0：排队超时是 ``busy``，**不是** ``timeout``。
+
+    复用 ``timeout``（"ffmpeg timed out while transcoding"）会把用户引向
+    ``max_compress_seconds`` —— 归因错误：真正该调的是
+    ``ffmpeg_max_concurrency`` / ``ffmpeg_queue_timeout_sec``。
+    """
+    assert decide.SHORT_REASONS["busy"] == (
+        "the server is busy processing other videos"
+    )
+    assert explain("busy") == "the server is busy processing other videos"
+    assert explain("busy") != explain("timeout")
+    assert "busy" not in MediaToolError.KINDS
+    # ASCII、无冒号、无路径（``test_all_phrases_are_path_free_and_english`` 的逐字要求）
+    phrase = explain("busy")
+    assert phrase.isascii() and ":" not in phrase and "\\" not in phrase
+
+
 def test_all_phrases_are_path_free_and_english():
     for phrase in decide.SHORT_REASONS.values():
         assert "\\" not in phrase and ":" not in phrase

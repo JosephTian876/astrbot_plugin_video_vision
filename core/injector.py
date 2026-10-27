@@ -37,6 +37,7 @@ from astrbot.api import logger as _log
 
 from .config import VideoConfig
 from .decide import REJECT_CODES, REJECT_REASON_PREFIX, MediaPlan, classify
+from .limits import SingleFlight
 from .media import (
     OUTPUT_SUFFIX,
     CompressCache,
@@ -49,6 +50,14 @@ from .media import (
     resolve_ffmpeg_tools,
 )
 from .placeholder import VideoPlaceholder
+
+#: 进程级 singleflight：同一份内容 + 同一组压缩参数**只转码一次**。
+#:
+#: 键就是下面 ``cache_key``（内容哈希 + 压缩参数 + ``truncate_to``），不再另算
+#: 一遍 —— 若按"只有内容哈希"去重，就会把"同一视频、不同压缩参数"也合并掉。
+#: 只用 ``threading.Event``：``prepare_video`` 跑在 worker 线程里，跨线程碰
+#: ``asyncio`` 原语会 ``attached to a different loop``（见 ``core/limits.py``）。
+SINGLEFLIGHT = SingleFlight()
 
 
 @dataclass(frozen=True)
@@ -300,9 +309,28 @@ def _prepare_video(
     # ---- 实时压缩 ----
     # 注意：mkdtemp 也可能抛 OSError（磁盘满 / 权限），它必须留在 try 内，
     # 由外层 prepare_video 兜住 —— 0.2.0 把它放在 try 之外，直接穿出契约。
-    temp_dir: str | None = None
-    try:
+    temp_dirs: list[str] = []
+    flight_enabled = bool(
+        config.ffmpeg_singleflight and cache is not None and cache_key
+    )
+    if config.ffmpeg_singleflight and not flight_enabled:
+        # 逐视频只打一条 debug：启动时 `main` 已经用 WARNING 说过这件事
+        # （ffmpeg_singleflight=true + 没有缓存 = 自相矛盾，见 AUDIT-030 §C.1-7）。
+        log.debug(
+            "[VideoVision] ffmpeg_singleflight=true 但压缩缓存不可用"
+            "（cache_enabled=%s，cache_root=%s），本次跳过 singleflight",
+            config.cache_enabled,
+            "已配置" if cache_root else "空",
+        )
+
+    def _compress_once() -> str:
+        """跑一次压缩并把产物发布到缓存；失败抛 ``MediaToolError``。
+
+        临时目录在**这里**创建（而不是在飞行之前）：只有真的要动手压缩的线程
+        才需要它 —— follower 直接复用 leader 已发布到缓存的产物，不建临时目录。
+        """
         temp_dir = tempfile.mkdtemp(prefix="vv_compress_")
+        temp_dirs.append(temp_dir)
         produced = Path(temp_dir) / f"out{OUTPUT_SUFFIX}"
         dbg(
             "开始压缩 | 目标上限=%.1fMB CRF=%s preset=%s 截断到=%.1fs 超时=%.0fs",
@@ -312,19 +340,50 @@ def _prepare_video(
             truncate_to,
             config.max_compress_seconds,
         )
+        compress_video(
+            source,
+            produced,
+            max_mb=config.compress_max_mb,
+            crf=config.compress_crf,
+            preset=config.compress_preset,
+            max_duration_sec=truncate_to,
+            ffmpeg=ffmpeg,
+            ffprobe=ffprobe,
+            timeout=config.max_compress_seconds,
+        )
+        if cache is not None and cache_key:
+            return cache.put(cache_key, produced)
+        return str(produced)
+
+    def _cached_artifact() -> str | None:
+        """leader 是否已把**可共享**的产物放进缓存（follower 醒来后查一次）。"""
+        if cache is None or not cache_key:
+            return None
+        return cache.get(cache_key)
+
+    def _on_takeover(exc: BaseException | None) -> None:
+        log.warning(
+            "[VideoVision] 同一文件的另一次转码失败（%s），本条改为自行转码",
+            exc,
+        )
+
+    try:
         compress_started = time.monotonic()
         try:
-            compress_video(
-                source,
-                produced,
-                max_mb=config.compress_max_mb,
-                crf=config.compress_crf,
-                preset=config.compress_preset,
-                max_duration_sec=truncate_to,
-                ffmpeg=ffmpeg,
-                ffprobe=ffprobe,
-                timeout=config.max_compress_seconds,
-            )
+            if flight_enabled:
+                # 键 = 上面已经算好的 cache_key（内容哈希 + 压缩参数 + truncate_to）。
+                # 临界区同时包住 compress_video 与 cache.put —— 否则 follower
+                # 醒来时缓存里还没有产物（AUDIT-030 §C.1-6）。
+                final_path = SINGLEFLIGHT.run(
+                    cache_key,
+                    _compress_once,
+                    probe=_cached_artifact,
+                    wait_timeout=config.max_compress_seconds + 5.0,
+                    on_join=lambda: dbg("加入同一文件的转码 %s", cache_key),
+                    on_takeover=_on_takeover,
+                )
+            else:
+                final_path = _compress_once()
         except MediaToolError as exc:
             return PrepareOutcome(
                 False, reason=f"压缩失败: {exc}", kind=exc.kind
@@ -333,10 +392,6 @@ def _prepare_video(
             return PrepareOutcome(
                 False, reason=f"压缩异常: {exc}", kind="internal"
             )
-
-        final_path = str(produced)
-        if cache is not None and cache_key:
-            final_path = cache.put(cache_key, produced)
 
         new_size = file_size_mb(final_path)
         expected_duration = plan.expected_duration_sec
@@ -389,8 +444,8 @@ def _prepare_video(
     finally:
         # 产物此刻已编码进内存（data URI）或已移入缓存，临时文件不再需要。
         # 放在 finally 里，任何提前 return / 异常路径都不会泄漏临时目录。
-        if temp_dir is not None:
-            _cleanup(temp_dir)
+        for directory in temp_dirs:
+            _cleanup(directory)
 
 
 def _blocked_reason(plan: MediaPlan, config: VideoConfig, source: str) -> str:

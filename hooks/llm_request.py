@@ -49,7 +49,8 @@ from astrbot.api import logger
 
 from ..core import decide
 from ..core.config import VideoConfig
-from ..core.injector import VideoInjection, prepare_video
+from ..core.injector import PrepareOutcome, VideoInjection, prepare_video
+from ..core.limits import NULL_LIMITER, QueueTimeout
 from ..core.openai_vision import analyze_videos
 from ..core.placeholder import (
     is_attachment_line,
@@ -208,6 +209,7 @@ async def build_video_blocks(
     *,
     config: VideoConfig,
     cache_root: str,
+    limiter: Any | None = None,
 ) -> tuple[list[PreparedVideo], set[int], list[str]]:
     """扫描占位符并准备视频（探测/压缩/编码），两种模式共用这一段管线。
 
@@ -215,6 +217,12 @@ async def build_video_blocks(
     ffmpeg 子进程并做文件 I/O；若直接在事件循环里调用，一次最长
     ``max_compress_seconds``（默认 45 秒）的压缩会把整个 AstrBot 卡住 ——
     期间所有会话的消息都不被处理。
+
+    ``limiter``（``core.limits.SlotLimiter``）的排队发生在**事件循环侧**：
+    ``asyncio.to_thread`` 用的是**全进程共享**的默认执行器（2 核只有
+    ``min(32, cpu+4) = 6`` 个线程，核心的 media / TTS / ASR 都在里面），
+    把等待塞进 worker 等于让 4 个线程睡觉、把核心功能一起饿死。
+    传 ``None`` 等价于不限流（用 ``NULL_LIMITER``，不建队列、不等待）。
 
     返回形状固定为 **3 元组**，所有提前返回分支也必须凑满三个元素
     （0.1.3 修过一次漏了第三项的 bug：调用方解包会抛
@@ -282,6 +290,8 @@ async def build_video_blocks(
     consumed: set[int] = set()
     failures: list[str] = []
     seen_paths: set[str] = set()
+    #: 限流关掉时用空实现：``async with`` 立即返回，不建队列、不打日志
+    slots = limiter if limiter is not None else NULL_LIMITER
 
     for index, placeholder in selected:
         # 同一文件出现多次（例如既引用又重发）时只送一次，省带宽与 token
@@ -291,14 +301,28 @@ async def build_video_blocks(
             continue
         seen_paths.add(key)
 
-        outcome = await asyncio.to_thread(
-            prepare_video,
-            placeholder,
-            config=config,
-            cache_root=cache_root,
-            logger=logger,
-            debug=config.debug_log,
-        )
+        try:
+            # 槽位只包住**这一次** prepare（不许嵌套取槽）；等待全部在事件
+            # 循环侧，worker 线程里没有任何 Semaphore。
+            async with slots.slot(name=placeholder.name):
+                outcome = await asyncio.to_thread(
+                    prepare_video,
+                    placeholder,
+                    config=config,
+                    cache_root=cache_root,
+                    logger=logger,
+                    debug=config.debug_log,
+                )
+        except QueueTimeout as exc:
+            # 排队超时是**独立的失败分类**：不复用 timeout（那句会把用户引向
+            # max_compress_seconds，归因错误）。
+            outcome = PrepareOutcome(
+                False,
+                reason=(
+                    f"排队等待转码超过 {exc.timeout:.0f}s（limit={exc.limit}）"
+                ),
+                kind="busy",
+            )
         if outcome.ok and outcome.injection is not None:
             inj = outcome.injection
             prepared.append(PreparedVideo(index, placeholder.name, inj))
@@ -641,7 +665,11 @@ async def _handle(plugin: Any, event: Any, req: Any) -> None:
             len(iter_placeholders(_parts_of(req))),
         )
     prepared, consumed, failures = await build_video_blocks(
-        _parts_of(req), config=config, cache_root=cache_root
+        _parts_of(req),
+        config=config,
+        cache_root=cache_root,
+        # 插件实例上的限流器（``ffmpeg_max_concurrency=0`` 时为 None -> 不限流）
+        limiter=getattr(plugin, "limiter", None),
     )
 
     # ---- 模式分支：原生注入 vs 视觉服务理解 ----

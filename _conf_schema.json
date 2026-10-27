@@ -204,10 +204,28 @@
     "default": 512,
     "hint": "超出后按最久未使用淘汰（16-65536）。注意：**单个产物大于本值时不会进缓存**（放进去也会被自己挤掉），这类视频每次都会重新压缩。"
   },
+  "ffmpeg_max_concurrency": {
+    "description": "ffmpeg 并发转码上限",
+    "type": "int",
+    "default": 2,
+    "hint": "进程内**全局**（跨会话）同时进行的 ffmpeg 转码数，范围 0-8。默认 2：2 核机器上单个 ffmpeg 只用掉约 44%-77% 的 CPU（本机实测），两个槽位大体喂满而不超订（2 核实测：总耗时与不限持平 15.09s vs 14.91s、单个 ffmpeg 的槽内时长 11.70s → 3.77s、峰值 ffmpeg 进程 6 → 2；设成 1 反而慢 22%）。填 **0 = 关闭限流**，行为完全回到 0.2.1（那时的上限其实是默认线程池的 min(32, cpu+4)：2 核 = 6 个并发）。排队发生在事件循环侧，不占用 AstrBot 的默认线程池。改这项需要重载插件。"
+  },
+  "ffmpeg_queue_timeout_sec": {
+    "description": "排队等待上限（秒）",
+    "type": "float",
+    "default": 30.0,
+    "hint": "单个视频**等待空闲槽位**的最长时间（1-600，不含转码本身）。超时后的失败分类是 busy（注入给模型的话是 the server is busy processing other videos），不是 ffmpeg 超时 —— 别去调 max_compress_seconds，该调的是并发上限或本项。默认 30s：视觉服务超时 openai_timeout_sec 只管上传+推理，本地排队(30s)+压缩(45s) 已经吃掉它一半以上的预算就会被启动日志告警。"
+  },
+  "ffmpeg_singleflight": {
+    "description": "同一文件并发只转码一次",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，同一份内容 + 同一组压缩参数（内容哈希 | compress_max_mb | crf | preset | truncate_to）的并发转码只做一次（即 singleflight：排队的请求复用 leader 的产物），其余请求等它把产物放进 cache_enabled 的压缩缓存后直接复用。**依赖 cache_enabled**：缓存关掉就没有可共享的产物 —— 启动时打一条 WARNING（配置自相矛盾），每个视频再打一条 debug 说明本次已跳过。leader 失败时按分类处理：确定性失败（文件损坏 / 缺 ffmpeg / 体积越界）原样返回，瞬时失败（超时 / 退出码）让等待者自己重试一次。"
+  },
   "debug_log": {
     "description": "详细调试日志",
     "type": "bool",
     "default": false,
-    "hint": "输出每个视频的探测、压缩、注入耗时与体积，排障时开启。"
+    "hint": "输出每个视频的探测、压缩、注入耗时与体积，排障时开启。限流器的 waits / 超时次数 / 峰值并发与视觉缓存的命中数也只在这个级别可见（/videotest 不渲染它们）。"
   }
 }

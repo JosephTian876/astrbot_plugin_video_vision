@@ -1,5 +1,75 @@
 # 更新日志
 
+## 0.3.0
+
+新增 **3 个配置项**与两处新行为（ffmpeg 并发限流 + 同一文件并发只转码一次）。
+
+**两条开关都默认保守、且都能单独退回 0.2.1 的逐字节行为**：
+`ffmpeg_max_concurrency=0`（不限流）、`ffmpeg_singleflight=false`（不共享转码）。
+两条各有专门用例（`tests/test_limits.py` / `tests/test_injector.py` / `tests/test_hooks.py`）。
+
+### 1. ffmpeg 并发限流：`ffmpeg_max_concurrency` / `ffmpeg_queue_timeout_sec` / `ffmpeg_singleflight`
+
+- **原先的上限不是"无限"，而是默认线程池的 `min(32, (os.cpu_count() or 1) + 4)`**。
+  `asyncio.to_thread` 的实现是 `loop.run_in_executor(None, …)`，用的是**全进程共享**
+  的默认 `ThreadPoolExecutor`：2 核小机器 = **6** 个线程、16 核 = 20。
+  而 AstrBot 核心自己就在这个池里跑图片/音视频转码（`core/utils/media_utils.py`）、
+  TTS、自托管 ASR 与工具调用。所以 2 核机器上"多会话同时发视频"的真实后果是
+  **6 个 ffmpeg 同时跑**，而单个 ffmpeg 在 2 核上只用掉约 **44%-77%** 的 CPU
+  （本机实测 3 个 18MB/18s 源：median 43.9% / 50.8% / 77.4%，p95 69% / 85% / 89%）
+  —— 是明显超订 + 6 份源文件与 base64 同时常驻。
+- **本机 2 核实测**（`SetProcessAffinityMask(0x3)` 把**进程树**钉在 2 个逻辑核上，
+  默认执行器设成 6 线程 = 2 核 AstrBot 的 `min(32, cpu+4)`，8 个**内容各不相同**的
+  720p/18s 源（每份约 18MB），统一走压缩路径（`max_size_mb=2.0` /
+  `compress_max_mb=1.8` / CRF 28），**真 ffmpeg**，每组 3 次取中位）：
+
+  | 限流 | n=8 总耗时 | 单个 ffmpeg 槽内时长（中位/最大） | 端到端等待（中位/最大） | 排队（中位） | 峰值 ffmpeg |
+  |---|---|---|---|---|---|
+  | 不限（池上限 6） | 14.91s | 11.70 / 14.91s | 11.70 / 14.91s | 0s | 6 |
+  | **2（新默认）** | **15.09s（+1.3%）** | **3.77 / 3.95s** | **9.32 / 15.09s** | 5.47s | **2** |
+  | 1 | 18.19s（+22%） | 2.28 / 2.41s | 10.15 / 18.19s | 7.91s | 1 |
+
+  读法（**别读错口径**）：
+  - **总吞吐基本不变**（14.91 → 15.09s，+1.3%）；`limit=1` 才真的变慢（+22%）——
+    单个 ffmpeg 用不满 2 个核，串行等于让一半机器空转。所以默认是 2。
+  - **峰值进程 6 → 2**，单个 ffmpeg 的槽内时长 11.70s → 3.77s（约 3 倍）——
+    它不再和另外 5 个 ffmpeg 抢那 2 个核。
+  - **端到端等待：中位 11.70 → 9.32s（−20%），最大 14.91 → 15.09s（不变）**。
+    所谓"尾延迟降 64%"**不成立**：那个数字只统计**拿到槽之后**的时长（就是上表的
+    "槽内时长"列），不是用户实际等的时间。用户最多仍要等一个 makespan；限流买到
+    的是**资源确定性**（峰值进程/内存、单条 ffmpeg 的时长、可解释的 `busy` 降级），
+    不是"最慢的那个人更快"。
+- **排队放在事件循环侧**（`core/limits.SlotLimiter`：`asyncio.Queue` 预填 `limit`
+  个令牌，FIFO，取消/超时不吞令牌）。**没有**把 `threading.Semaphore` 塞进
+  `prepare_video`：那样 2 核机器的 6 个线程里会有 4 个在"睡觉"，把核心的
+  media/TTS/ASR 一起饿死。`tests/test_limits.py` 用 AST 锁住这一点。
+- **排队超时是独立的失败分类 `busy`**（注入给模型：
+  `the server is busy processing other videos`），**不复用** `timeout`：后者那句是
+  "ffmpeg timed out while transcoding"，会把用户引向 `max_compress_seconds`，
+  而归因其实是并发/排队 —— 该调的是 `ffmpeg_max_concurrency` /
+  `ffmpeg_queue_timeout_sec`。`/videotest` 的「分类:」行因此多一种取值。
+- **`/videotest` 也排队**，且报告里的"准备成功（X s）"计时起点移到**取槽之前**，
+  让耗时包含排队时间（高峰期不会再出现"报告 1.8s、实际等了 12s"）。
+- **`ffmpeg_singleflight`（默认 true）**：同一份内容 + 同一组压缩参数的并发转码
+  只做一次，键就是压缩缓存已有的那个 key（内容哈希 | compress_max_mb | crf |
+  preset | truncate_to）—— 不额外读文件、不复制 `decide` 的知识。临界区同时包住
+  `compress_video` 与 `cache.put`，否则 follower 醒来时缓存里还没有产物。
+  **依赖 `cache_enabled`**：缓存关掉就没有可共享的产物 —— 启动时打一条 **WARNING**
+  （配置自相矛盾），每个视频再打一条 debug 说明"本次已跳过"，两个线程各压一次。
+  leader 失败时分流：确定性失败（`not_found` / `duration` / `corrupt` / `empty` /
+  `too_large`）让 follower 原样承接（重试只会把 45s 超时乘以 N）；瞬时失败
+  （`timeout` / `exit_code` / `other`）或 follower 等待超时，允许它自己接管**一次**。
+  `SINGLEFLIGHT` 的登记表在 `finally` 里只摘自己那条 flight，不会误删后来者。
+- 新增 `ffmpeg_queue_timeout_sec`（默认 30s）与一条 `normalized()` 告警：本地
+  `排队 + 压缩` 吃掉 `openai_timeout_sec` 一半以上时显式提示 —— 因为视觉服务超时
+  只管上传+推理，本地这两段发生在它之前（最坏情况会顶穿它）。
+
+### 2. 其他
+
+- 既有 **441** 条用例全部保留并绿，新增用例覆盖上述限流与 singleflight。
+- 改这几个新键需要**重载插件**（limiter 在 `__init__` 里建）。
+- 新增模块 `core/limits.py`（限流 + singleflight），在 `core/` 下、不 import astrbot。
+
 ## 0.2.1
 
 修复两轮审查（静态审查 + 真机 196 用例 + 对抗验证）确认的缺陷。

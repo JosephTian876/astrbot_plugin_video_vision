@@ -501,3 +501,102 @@ def test_second_pass_does_not_inject_twice(tiny_video, stub_logger, tmp_path):
     asyncio.run(hooks.handle_llm_request(plugin, event, req))
 
     assert len(req.extra_user_content_parts) == first
+
+
+# ------------------------------------------------- 0.3.0：排队超时 -> busy
+
+
+def test_queue_timeout_is_reported_as_busy(tiny_video, stub_logger):
+    """限流排队超时 -> ``busy`` 短语，**不是** ``timed out while transcoding``。
+
+    走真实 ``SlotLimiter``：另起一个协程占住唯一的槽，``build_video_blocks``
+    的 ``ffmpeg_queue_timeout_sec`` 到点后必须产出 ``ok=False kind="busy"``，
+    而不是让 ffmpeg 真跑起来（那样限流形同虚设）。
+    """
+    from vv_plugin.core.limits import SlotLimiter
+
+    async def scenario():
+        limiter = SlotLimiter(1, queue_timeout=0.01, logger=stub_logger)
+        gate = asyncio.Event()
+        holding = asyncio.Event()
+
+        async def holder():
+            async with limiter.slot():
+                holding.set()
+                await gate.wait()
+
+        task = asyncio.create_task(holder())
+        await asyncio.wait_for(holding.wait(), timeout=5)
+        parts = [_TextPart(f"[Video Attachment: name a.mp4, path {tiny_video}]")]
+        try:
+            return await hooks.build_video_blocks(
+                parts,
+                config=VideoConfig(provider_mode="gemini_native"),
+                cache_root="",
+                limiter=limiter,
+            )
+        finally:
+            gate.set()
+            await task
+
+    prepared, consumed, failures = asyncio.run(scenario())
+
+    assert prepared == []
+    assert consumed == set()
+    assert failures == ["the server is busy processing other videos"]
+    assert "timed out while transcoding" not in " ".join(failures)
+    # 排队超时的那条 WARNING 必须出现且只出现一次
+    queued = [
+        item for item in stub_logger.messages("warning") if "ffmpeg 排队超时" in item
+    ]
+    assert len(queued) == 1, stub_logger.records
+    assert "limit=1" in queued[0]
+
+
+# -------------------------------- 0.3.0：0 = 关闭限流，逐字节等价 0.2.1
+
+
+def test_unlimited_matches_the_limited_pipeline_byte_for_byte(tiny_video, stub_logger):
+    """``ffmpeg_max_concurrency=0``（``limiter=None``）必须与开限流**逐字节**相同。
+
+    "0 = 回到 0.2.1"不能只是口头承诺：同一份输入分别走
+    ``NULL_LIMITER`` 与真实 ``SlotLimiter``（无竞争），产物字节、注入的
+    data URI、体积、动作标签必须完全一致；并且不限流那条**不建队列、不打
+    排队日志**（``SlotLimiter(0)._acquire`` 直接 return）。
+    """
+    from vv_plugin.core.limits import NULL_LIMITER, SlotLimiter
+    from vv_plugin.core.media import content_hash
+
+    config = VideoConfig(provider_mode="gemini_native")
+
+    def prepare(limiter):
+        parts = [_TextPart(f"[Video Attachment: name a.mp4, path {tiny_video}]")]
+        return asyncio.run(
+            hooks.build_video_blocks(
+                parts, config=config, cache_root="", limiter=limiter
+            )
+        )
+
+    unlimited, consumed_u, failures_u = prepare(None)
+    limited_limiter = SlotLimiter(2, queue_timeout=30.0, logger=stub_logger)
+    limited, consumed_l, failures_l = prepare(limited_limiter)
+
+    assert failures_u == [] and failures_l == []
+    assert consumed_u == consumed_l == {0}
+    injection_u = unlimited[0].injection
+    injection_l = limited[0].injection
+
+    # 真正发出去的字节必须一模一样（不是"看起来差不多"）
+    assert injection_u.data_uri == injection_l.data_uri
+    assert content_hash(injection_u.used_path) == content_hash(injection_l.used_path)
+    assert injection_u.action == injection_l.action
+    assert injection_u.size_mb == injection_l.size_mb
+    assert injection_u.duration_sec == injection_l.duration_sec
+
+    # 不限流：没有令牌队列、没有等待、没有排队日志
+    assert NULL_LIMITER._queue is None, "关闭限流时不许建 asyncio.Queue"
+    assert not [m for m in stub_logger.messages("info") if "ffmpeg 排队" in m]
+    # 开限流但无竞争：同样不排队（waits 只统计真的等过的）
+    assert limited_limiter.stats.waits == 0
+    assert limited_limiter.inflight == 0
+    assert limited_limiter.available == 2

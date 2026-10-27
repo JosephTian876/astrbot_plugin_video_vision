@@ -27,6 +27,22 @@ MAX_COMPRESS_SECONDS_CEILING = 600.0
 OPENAI_TIMEOUT_SEC_CEILING = 3600.0
 OPENAI_MAX_TOKENS_CEILING = 100000
 
+#: 0.3.0：ffmpeg 并发限流。默认 2 的依据是**本机 2 核实测**（钉 2 个逻辑核 +
+#: 6 线程默认执行器 + 8 个内容各不相同的 720p/18s 源，每组 3 次取中位）：
+#: 单个 ffmpeg 只用掉约 44%-77% 的 CPU，2 个槽位大体喂满；限量到 2 之后
+#: makespan 与"不限"持平（15.09s vs 14.91s，+1.3%），单个 ffmpeg 的槽内时长
+#: 11.70s → 3.77s，峰值 ffmpeg 进程 6 → 2；而 limit=1 会让总耗时 +22%
+#: （单个 ffmpeg 用不满 2 个核，串行等于让一半机器空转）。
+#: **不写成 cpu_count 公式**：配置默认值必须可预测、可文档化、可被
+#: ``test_schema_defaults_match_dataclass_defaults`` 逐字校验。
+FFMPEG_CONCURRENCY_CEILING = 8
+
+#: 单个视频**等待槽位**的上限（不含转码本身）。取 30s 的理由：
+#: openai_compat 下一次成功请求的预算是"本地（排队 + 压缩）+ 上传（7-9s/MB ×
+#: 压缩目标 8MB ≈ 56-72s）+ 推理"，再叠加 ``max_compress_seconds=45``；排队上限
+#: 若也给 60s，最坏情况会顶穿 ``openai_timeout_sec=180``。
+QUEUE_TIMEOUT_CEILING = 600.0
+
 VALID_OVERSIZE_ACTIONS = ("compress", "reject", "truncate")
 VALID_PRESETS = ("ultrafast", "veryfast", "faster", "fast", "medium", "slow")
 
@@ -214,6 +230,10 @@ _NUMERIC_BOUNDS: dict[str, tuple[float, float]] = {
     "max_compress_seconds": (1.0, MAX_COMPRESS_SECONDS_CEILING),
     "openai_timeout_sec": (10.0, OPENAI_TIMEOUT_SEC_CEILING),
     "openai_max_tokens": (64, OPENAI_MAX_TOKENS_CEILING),
+    # ---- 0.3.0 ----
+    #: 0 = 关闭限流（逐字节回到 0.2.1）
+    "ffmpeg_max_concurrency": (0, FFMPEG_CONCURRENCY_CEILING),
+    "ffmpeg_queue_timeout_sec": (1.0, QUEUE_TIMEOUT_CEILING),
 }
 
 
@@ -322,6 +342,18 @@ class VideoConfig:
     cache_enabled: bool = True
     cache_max_mb: int = 512
     debug_log: bool = False
+
+    # -------- 0.3.0：ffmpeg 并发限流（进程内全局、跨会话）--------
+    #: 同时进行的 ffmpeg 转码数。**0 = 关闭限流**（逐字节回到 0.2.1：
+    #: 上限只剩默认线程池的 ``min(32, cpu+4)``）。
+    #: 排队发生在**事件循环侧**（``core/limits.SlotLimiter``），不占用默认
+    #: 线程池 —— 那个池是全进程共享的，2 核只有 6 个线程。
+    ffmpeg_max_concurrency: int = 2
+    #: 单个视频等待槽位的上限（不含转码本身）。超时 -> ``kind="busy"``。
+    ffmpeg_queue_timeout_sec: float = 30.0
+    #: 同一内容哈希的并发转码只做一次。依赖 ``cache_enabled``：
+    #: 缓存关掉就没有可共享的产物，followers 只能自己压（会打一条 DEBUG）。
+    ffmpeg_singleflight: bool = True
 
     # -------- 视觉服务商（provider_mode=openai_compat 时生效）--------
     provider_mode: str = "openai_compat"
@@ -441,6 +473,19 @@ class VideoConfig:
                 maximum=CACHE_MAX_MB_CEILING,
             ),
             debug_log=_as_bool(data.get("debug_log"), False),
+            ffmpeg_max_concurrency=_as_int(
+                data.get("ffmpeg_max_concurrency"),
+                2,
+                minimum=0,
+                maximum=FFMPEG_CONCURRENCY_CEILING,
+            ),
+            ffmpeg_queue_timeout_sec=_as_float(
+                data.get("ffmpeg_queue_timeout_sec"),
+                30.0,
+                minimum=1.0,
+                maximum=QUEUE_TIMEOUT_CEILING,
+            ),
+            ffmpeg_singleflight=_as_bool(data.get("ffmpeg_singleflight"), True),
             provider_mode=_as_choice(
                 data.get("provider_mode"), "openai_compat", VALID_PROVIDER_MODES
             ),
@@ -529,6 +574,21 @@ class VideoConfig:
                 f"compress_max_mb({self.compress_max_mb:g}) 不小于 "
                 f"cache_max_mb({self.cache_max_mb:g})：超过缓存预算的压缩产物"
                 "不会被缓存（每次都会重新压缩）"
+            )
+
+        # 0.3.0：本地排队 + 压缩发生在视觉调用**之前**，而 openai_timeout_sec
+        # 只管后者。两者相加吃掉一半以上预算时，最坏情况会顶穿视觉服务超时
+        # （AUDIT-030 §E-2），必须显式告警而不是让用户去猜。
+        if (
+            self.effective_provider_mode == "openai_compat"
+            and self.ffmpeg_queue_timeout_sec + self.max_compress_seconds
+            >= self.openai_timeout_sec * 0.5
+        ):
+            warnings.append(
+                f"ffmpeg_queue_timeout_sec({self.ffmpeg_queue_timeout_sec:g}s)"
+                f"+max_compress_seconds({self.max_compress_seconds:g}s) 已吃掉"
+                f"视觉服务超时预算(openai_timeout_sec={self.openai_timeout_sec:g}s)"
+                " 的一半以上，建议调小其中一项（排队上限或压缩上限）"
             )
 
         crf = self.compress_crf

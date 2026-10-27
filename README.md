@@ -109,7 +109,10 @@ Responses API（`/responses`）同样实测支持：视频用 `input_image` + da
 | `ffmpeg_path` | `""` | 留空则从 PATH 查找；也可填所在目录 |
 | `cache_enabled` | `true` | 启用压缩缓存 |
 | `cache_max_mb` | `512` | 缓存上限，超出按 LRU 淘汰（下限 16；**单个产物大于此值时不进缓存**） |
-| `debug_log` | `false` | 详细调试日志 |
+| `ffmpeg_max_concurrency` | `2` | 进程内**全局**（跨会话）同时进行的 ffmpeg 转码数（0-8）。**`0` = 关闭限流**，行为回到 0.2.1 |
+| `ffmpeg_queue_timeout_sec` | `30.0` | 单个视频**等待槽位**的上限（1-600，不含转码本身）。超时 -> 失败分类 `busy` |
+| `ffmpeg_singleflight` | `true` | 同一内容 + 同一组压缩参数的并发转码只做一次（**依赖 `cache_enabled`**） |
+| `debug_log` | `false` | 详细调试日志（限流/缓存的计数也只在这个级别可见） |
 
 ### 两个体积旋钮怎么配合
 
@@ -144,6 +147,99 @@ Responses API（`/responses`）同样实测支持：视频用 `input_image` + da
 
 **Token 消耗很低**：约 72–108 token / 秒视频
 （14 秒视频 ≈ 1000 token，跟一张 720p 图片差不多）。
+
+---
+
+## 并发、排队与缓存
+
+### 先说清楚"原来的并发上限"是什么
+
+`asyncio.to_thread` 的实现是 `loop.run_in_executor(None, …)` —— 用的是**全进程
+共享**的默认 `ThreadPoolExecutor`，大小 `min(32, cpu+4)`（2 核小机器 = **6**、
+16 核 = 20）。AstrBot 核心自己就在这个池里跑图片/音视频转码、TTS、自托管 ASR
+与工具调用。所以：
+
+- 2 核机器上"3 个群同时发视频"的真实后果是**最多 6 个 ffmpeg 同时跑**；
+- 单个 ffmpeg 在 2 核上只用掉约 **44%-77%** 的 CPU（本机实测 3 个 18MB/18s 源：
+  median 43.9% / 50.8% / 77.4%，p95 69% / 85% / 89%）—— 6 个并发是**明显超订**，
+  外加 6 份源文件与 base64 常驻（13MB 源 → 17.33MB 字符串）；
+- 上限**不是"无限"**，但也从来没人按核数算过它。
+
+`ffmpeg_max_concurrency` 就是把这个"隐式的池上限"换成**显式的、按核数选过的**数字。
+
+### 2 核实测（`SetProcessAffinityMask(0x3)` 钉核 + 6 线程默认执行器模拟 2 核 AstrBot）
+
+本机（Intel Ultra 7 255H / 16 逻辑核）把**进程树**钉在 2 个逻辑核上（子进程继承），
+默认执行器设成 6 线程（= 2 核机器的 `min(32, cpu+4)`），8 个**内容各不相同**的
+720p/18s 源（每份约 18MB）同时发，统一走压缩路径（`max_size_mb=2.0`、
+`compress_max_mb=1.8`、CRF 28），真 ffmpeg，每组 3 次取中位：
+
+| 限流 | n=8 总耗时 | 单个 ffmpeg 的槽内时长（中位/最大） | 端到端等待（中位/最大） | 排队（中位） | 峰值 ffmpeg |
+|---|---|---|---|---|---|
+| 不限（池上限 6） | 14.91s | 11.70 / 14.91s | 11.70 / 14.91s | 0s | 6 |
+| **2（默认）** | **15.09s（+1.3%）** | **3.77 / 3.95s** | **9.32 / 15.09s** | 5.47s | **2** |
+| 1 | 18.19s（+22%） | 2.28 / 2.41s | 10.15 / 18.19s | 7.91s | 1 |
+
+读法（**别读错口径**）：
+
+- **总吞吐基本不变**（15.09 vs 14.91s，+1.3%）；**`limit=1` 才是真的变慢**
+  （+22%）—— 单个 ffmpeg 用不满 2 个核（见上），串行等于让一半机器空转。
+  所以默认值是 **2**：两个槽位大体把 2 核喂满；不是 1，也不是 `cpu_count` 公式
+  （配置默认值必须可预测、可文档化、可被测试逐字校验）。
+- **峰值进程 6 → 2**；**单个 ffmpeg 的槽内时长 11.70 → 3.77s（约 3 倍）**
+  —— 这两条才是限流买到的资源确定性（内存峰值同样按比例下降）。
+- **端到端等待：中位 11.70 → 9.32s（−20%），最大 14.91 → 15.09s（不变）**。
+  所以"尾延迟降 64%"这种说法**不成立**：那个数字只统计**拿到槽之后**的时长
+  （就是上表的"槽内时长"列），不是用户实际等的时间。用户实际最多仍要等一个
+  makespan；限流不会让最慢的那个人更快，只是让**没有人**被迫和另外 5 个 ffmpeg
+  一起抢 2 个核。
+- 代价：**高峰期单条请求最多多等 `ffmpeg_queue_timeout_sec`**（默认 30s）。
+  排队超时的失败分类是 **`busy`**（注入给模型的话是
+  `the server is busy processing other videos`）—— 它**不是** `timeout`，
+  别去调 `max_compress_seconds`，该调的是并发上限或本项。
+
+### 排队发生在事件循环侧（不是线程池里）
+
+`core/limits.py` 的 `SlotLimiter` 用 `asyncio.Queue` 预填 `limit` 个令牌，
+钩子里是：
+
+```python
+async with limiter.slot(name=name):
+    outcome = await asyncio.to_thread(prepare_video, ...)
+```
+
+**没有**把 `threading.Semaphore` 塞进 `prepare_video`。理由就是上面那条：默认
+执行器是全进程共享的，在 worker 里睡觉等于把核心的 media/TTS/ASR 一起饿死
+（2 核只有 6 个线程）。`tests/test_limits.py` 用 AST 锁住"每个
+`to_thread(prepare_video)` 都在槽内"，并专门测了取消/超时**不吞令牌**
+（槽位永久 -1 会让全站慢慢卡死）。
+
+### 同一文件并发只转码一次（`ffmpeg_singleflight`）
+
+两个群同时发**同一段视频**时，0.2.1 会各压一次（实测 2 次 `ffmpeg`、6 次
+`ffprobe`、2 份 base64）。现在：键 = 压缩缓存已有的那个 key（内容哈希 |
+`compress_max_mb` | `crf` | `preset` | `truncate_to`），临界区同时包住
+`compress_video` 与 `cache.put`，follower 醒来后直接复用 leader 已发布的缓存产物。
+
+- **只依赖 `cache_enabled`**：缓存关掉就没有可共享的产物，这时启动日志会有一条
+  **WARNING**（配置自相矛盾：开了 singleflight 却没有缓存），每个视频再打一条
+  debug 说明"本次已跳过"；两个线程各压一次（与 0.2.1 相同）；
+- leader 失败时分流：确定性失败（`not_found` / `duration` / `corrupt` /
+  `empty` / `too_large`）**原样返回**（重试只会把 45s 超时乘以 N）；
+  瞬时失败（`timeout` / `exit_code` / `other`）或等待超时 → follower
+  **自己接管一次**；
+- 两个线程拿到的是**同一个缓存产物**（`used_path` 相同），不是各压一份。
+
+### 两条开关 = 逐字节回到 0.2.1
+
+| 开关 | 关掉之后 |
+|---|---|
+| `ffmpeg_max_concurrency = 0` | 不建令牌队列、不加任何等待、日志零新增 |
+| `ffmpeg_singleflight = false` | 压缩块不经过 flight，两个线程各压一次 |
+
+`LimiterStats`（等待次数 / 总等待 / 最大等待 / 超时次数 / 峰值并发）**只从
+`debug_log` 的日志里看得到** —— `/videotest` 的报告格式被测试锁死，本轮刻意
+不往里加新行。
 
 ---
 
@@ -322,11 +418,16 @@ MIME   : video/mp4（压缩产物，固定为 mp4）
   —— 一个旋钮只有一个生效值（0.2.1 曾先夹到 13.0、再降到 11.7，打出两条都在说
   "已修正"的提示，而生效值等于哪一条都没写全）。
 - **失败分类**（`分类:` 行）是机器可读的：`corrupt` / `empty` / `not_found` /
-  `duration` / `too_large` / `timeout` / `exit_code` / `missing`，以及配置拒绝的
-  三条 —— `rejected_size`（体积超闸门）/ `rejected_duration`（时长超上限）/
+  `duration` / `too_large` / `timeout` / `exit_code` / `missing` / `busy`，以及配置
+  拒绝的三条 —— `rejected_size`（体积超闸门）/ `rejected_duration`（时长超上限）/
   `rejected_size_and_duration`（两者都超）。注入给模型的那句话按分类取
   （`it exceeds the size limit` / `its duration exceeds the limit` / …）：
-  **"太长被拒"不会被告知"它太大了"**，否则模型会去劝用户压体积。
+  **"太长被拒"不会被告知"它太大了"**，否则模型会去劝用户压体积。`busy` 是
+  "排队等槽位超时"（`the server is busy processing other videos`），与 `timeout`
+  （ffmpeg 自己超时）是两回事。
+- **`准备成功（X s）` 的耗时含排队时间**（计时起点在取槽之前）：高峰期这个数字
+  会比 ffmpeg 实际耗时大，差值就是排队。`/videotest` 与真实消息走**同一个**
+  `ffmpeg_max_concurrency` 槽位，所以诊断结果与线上一致。
 
 ---
 
@@ -400,6 +501,7 @@ astrbot_plugin_video_vision/
 │   ├── diagnostics.py      `/videotest` 的报告、启动日志与用法文本（纯渲染，零 AstrBot）
 │   ├── media.py            ffmpeg/ffprobe 封装、压缩、缓存
 │   ├── injector.py         执行 decide 的 MediaPlan（压缩编排 + data URI 编码）
+│   ├── limits.py           ffmpeg 并发限流（async 令牌）+ 同文件 singleflight（线程事件）
 │   ├── openai_vision.py    OpenAI 兼容视觉服务客户端（实测格式见模块说明）
 │   └── placeholder.py      占位文本解析
 └── hooks/
@@ -437,10 +539,16 @@ CI 里设了 **`VV_REQUIRE_FFMPEG=1`**：缺 ffmpeg 时相关用例**失败**而
 - gemini_native 模式：仅支持 **Gemini 系** provider（依赖其按 MIME 构造媒体 Part 的行为），
   且模型必须声明 **audio** 模态；走 OpenAI 协议的 Gemini 代理需在
   `additional_provider_types` 中显式放行。
-- 不支持多视频并行压缩；单条消息的视频串行处理（openai_compat 的视觉调用是并发的）。
+- 不支持多视频串行以外的压缩调度：**同一条消息里的视频仍然是一个一个处理**
+  （跨会话才有并发，并受 `ffmpeg_max_concurrency` 约束；openai_compat 的视觉
+  调用是并发的）。高峰期单条请求最多多等 `ffmpeg_queue_timeout_sec`。
+- **限流与缓存都只在进程内**：`ffmpeg_max_concurrency` 是**本进程**的闸门，
+  不是全局资源锁；多开 AstrBot 实例时机器上仍会有 `实例数 × limit` 个 ffmpeg。
+  视觉结果缓存同理 —— 纯内存、重启即失效，不跨进程共享。
 - 压缩缓存按源文件内容哈希做 key，**单个产物大于 `cache_max_mb` 时不会进缓存**，
   这类视频每次都会重新压缩。0.2.1 是**直接跳过它**（缓存里的其它条目不受影响）；
-  0.2.0 相反：会先放进去、再被自己挤掉，还会连带清空其它条目。
+  0.2.0 相反：会先放进去、再被自己挤掉，还会连带清空其它条目。这类产物也**无法**
+  被 singleflight 共享（没有可共享的位置），等待者会自己再压一次。
 - `/videotest` 只检查"路径存在且是文件"，**不校验扩展名**：给什么文件它就把什么
   按视频编码并发送（openai_compat 下会真的 POST 出去）。0.2.1 起报告里会有
   `提醒   :` 行 + `MIME   : … (推断)` 明说这件事，但**行为不变**（不会改成拒绝）。

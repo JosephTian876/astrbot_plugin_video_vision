@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import shutil
 import tempfile
+import threading
+import time
 
 import pytest
 
@@ -592,3 +594,223 @@ def test_kill_process_tree_covers_posix():
 
     runner = textwrap.dedent(inspect.getsource(media._run_ffmpeg))
     assert "start_new_session" in runner
+
+
+# ------------------------------------------------- 0.3.0：同一文件只转码一次
+#
+# 键 = injector 里**已经算好**的那个压缩缓存 key（内容哈希 + 压缩参数 +
+# truncate_to），临界区同时包住 compress_video 与 cache.put —— 否则 follower
+# 醒来时缓存里还没有产物。
+#
+# 这里的 ``_run_ffmpeg`` 被换成"阻塞到放行、再把源文件拷成产物"的假实现：
+# 真 ffmpeg 会跑几百毫秒，两个线程的重叠窗口不可控；换成 Event 之后
+# "两个线程真的同时在压缩"这件事由 gate 保证，而不是靠 sleep 撞运气。
+
+
+def _race_two_prepares(
+    monkeypatch,
+    make_placeholder,
+    stub_logger,
+    source: str,
+    cfg: VideoConfig,
+    cache_root: str,
+    *,
+    expect_spawns: int,
+    expect_join_log: bool,
+):
+    spawns: list[list[str]] = []
+    gate = threading.Event()
+    lock = threading.Lock()
+
+    def fake_run(args, timeout):
+        with lock:
+            spawns.append(list(args))
+        gate.wait(10)  # 两个线程必须真的重叠，由 gate 保证
+        shutil.copyfile(source, args[-1])
+
+    monkeypatch.setattr(media, "_run_ffmpeg", fake_run)
+
+    outcomes: list[PrepareOutcome] = []
+    outcome_lock = threading.Lock()
+
+    def worker() -> None:
+        outcome = prepare_video(
+            make_placeholder(source),
+            config=cfg,
+            cache_root=cache_root,
+            logger=stub_logger,
+            debug=cfg.debug_log,
+        )
+        with outcome_lock:
+            outcomes.append(outcome)
+
+    first = threading.Thread(target=worker, name="first")
+    second = threading.Thread(target=worker, name="second")
+    first.start()
+    # 等 leader 真的进入压缩（否则 second 会直接走缓存命中，测不到重叠）
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        with lock:
+            if len(spawns) >= 1:
+                break
+        time.sleep(0.005)
+    assert spawns, "leader 没有进入压缩"
+
+    second.start()
+    if expect_join_log:
+        # follower 加入同一 flight 的那条 debug 日志就是"临界区真的被共享"的证据
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if any("加入同一文件的转码" in item for item in stub_logger.messages("info")):
+                break
+            time.sleep(0.005)
+    else:
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            with lock:
+                if len(spawns) >= expect_spawns:
+                    break
+            time.sleep(0.005)
+    gate.set()
+    first.join(15)
+    second.join(15)
+    assert not first.is_alive() and not second.is_alive(), "线程没有按时结束"
+    return spawns, outcomes
+
+
+def test_singleflight_dedupes_two_identical_prepare_calls(
+    media_tools, ffmpeg_dir, noisy_video, tmp_path, make_placeholder, stub_logger,
+    monkeypatch,
+):
+    """两个线程同时准备**同一个文件** -> ffmpeg 只起 1 次（现状是 2 次）。"""
+    cfg = VideoConfig(
+        ffmpeg_path=ffmpeg_dir,
+        max_size_mb=0.25,
+        compress_max_mb=0.2,
+        debug_log=True,
+    )
+    spawns, outcomes = _race_two_prepares(
+        monkeypatch,
+        make_placeholder,
+        stub_logger,
+        noisy_video,
+        cfg,
+        str(tmp_path / "cache"),
+        expect_spawns=1,
+        expect_join_log=True,
+    )
+
+    assert len(spawns) == 1, f"ffmpeg 起了 {len(spawns)} 次"
+    assert [item.ok for item in outcomes] == [True, True], [o.reason for o in outcomes]
+    # 两个线程拿到的是**同一个缓存产物**（不是各压一份）
+    assert len({item.injection.used_path for item in outcomes}) == 1
+    joins = [
+        item for item in stub_logger.messages("info") if "加入同一文件的转码" in item
+    ]
+    assert len(joins) == 1, stub_logger.records
+
+
+def test_singleflight_disabled_keeps_two_spawns(
+    media_tools, ffmpeg_dir, noisy_video, tmp_path, make_placeholder, stub_logger,
+    monkeypatch,
+):
+    """``ffmpeg_singleflight=false`` 必须逐字节回到 0.2.1：两个线程各压一次。"""
+    cfg = VideoConfig(
+        ffmpeg_path=ffmpeg_dir,
+        max_size_mb=0.25,
+        compress_max_mb=0.2,
+        ffmpeg_singleflight=False,
+        debug_log=True,
+    )
+    spawns, outcomes = _race_two_prepares(
+        monkeypatch,
+        make_placeholder,
+        stub_logger,
+        noisy_video,
+        cfg,
+        str(tmp_path / "cache"),
+        expect_spawns=2,
+        expect_join_log=False,
+    )
+
+    assert len(spawns) == 2, f"ffmpeg 起了 {len(spawns)} 次"
+    assert [item.ok for item in outcomes] == [True, True]
+    assert not [
+        item for item in stub_logger.messages("info") if "加入同一文件的转码" in item
+    ]
+
+
+def test_singleflight_is_skipped_when_the_cache_is_off(
+    media_tools, ffmpeg_dir, noisy_video, tmp_path, make_placeholder, stub_logger,
+    monkeypatch,
+):
+    """``cache_enabled=false`` 时没有可共享的产物 —— 两个线程各压一次（fail-open）。"""
+    cfg = VideoConfig(
+        ffmpeg_path=ffmpeg_dir,
+        max_size_mb=0.25,
+        compress_max_mb=0.2,
+        cache_enabled=False,
+        debug_log=True,
+    )
+    spawns, outcomes = _race_two_prepares(
+        monkeypatch,
+        make_placeholder,
+        stub_logger,
+        noisy_video,
+        cfg,
+        str(tmp_path / "cache"),
+        expect_spawns=2,
+        expect_join_log=False,
+    )
+
+    assert len(spawns) == 2
+    assert [item.ok for item in outcomes] == [True, True]
+    # 但要有一条 debug 说明"已跳过"，而不是静默什么都不做
+    assert any("singleflight" in item for item in stub_logger.messages("debug"))
+
+
+def test_singleflight_does_not_change_the_produced_bytes(
+    media_tools, ffmpeg_dir, noisy_video, tmp_path, make_placeholder, stub_logger,
+    monkeypatch,
+):
+    """开关 singleflight 不许改变产物字节（AUDIT-030 §D.3-4 的等价回归）。
+
+    用"把源文件拷成产物"的假 ffmpeg 保证字节确定性（真 ffmpeg 的 mp4 里可能
+    带时间戳），然后比较 ``content_hash(used_path)`` 与 data URI：开与关必须
+    逐字节相同 —— flight 只影响"谁来跑"，不许影响"跑出什么"。
+    """
+    from vv_plugin.core import injector
+    from vv_plugin.core.media import content_hash
+
+    def fake_run(args, timeout):
+        shutil.copyfile(noisy_video, args[-1])
+
+    monkeypatch.setattr(media, "_run_ffmpeg", fake_run)
+
+    def once(flight: bool):
+        cfg = VideoConfig(
+            ffmpeg_path=ffmpeg_dir,
+            max_size_mb=0.25,
+            compress_max_mb=0.2,
+            ffmpeg_singleflight=flight,
+        )
+        return prepare_video(
+            make_placeholder(noisy_video),
+            config=cfg,
+            cache_root=str(tmp_path / ("on" if flight else "off")),
+            logger=stub_logger,
+            debug=cfg.debug_log,
+        )
+
+    on = once(True)
+    off = once(False)
+    assert on.ok and off.ok, (on.reason, off.reason)
+
+    assert content_hash(on.injection.used_path) == content_hash(
+        off.injection.used_path
+    )
+    assert on.injection.data_uri == off.injection.data_uri
+    assert on.injection.action == off.injection.action
+    assert on.injection.size_mb == off.injection.size_mb
+    # flight 登记表必须清空（不泄漏 Event）
+    assert injector.SINGLEFLIGHT.pending == 0

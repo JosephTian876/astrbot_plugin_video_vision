@@ -30,6 +30,9 @@ OPENAI_MAX_TOKENS_CEILING = getattr(config_mod, "OPENAI_MAX_TOKENS_CEILING", 100
 OPENAI_TIMEOUT_SEC_CEILING = getattr(
     config_mod, "OPENAI_TIMEOUT_SEC_CEILING", 3600.0
 )
+#: 0.3.0 新增：ffmpeg 并发限流（AUDIT-030 §C.1）
+FFMPEG_CONCURRENCY_CEILING = getattr(config_mod, "FFMPEG_CONCURRENCY_CEILING", 8)
+QUEUE_TIMEOUT_CEILING = getattr(config_mod, "QUEUE_TIMEOUT_CEILING", 600.0)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -67,6 +70,8 @@ NUMERIC_FIELDS = (
     "cache_max_mb",
     "openai_timeout_sec",
     "openai_max_tokens",
+    "ffmpeg_max_concurrency",
+    "ffmpeg_queue_timeout_sec",
 )
 
 
@@ -84,8 +89,12 @@ def test_from_mapping_survives_garbage(value):
     assert 16 <= cfg.cache_max_mb <= CACHE_MAX_MB_CEILING
     assert 10.0 <= cfg.openai_timeout_sec <= OPENAI_TIMEOUT_SEC_CEILING
     assert 64 <= cfg.openai_max_tokens <= OPENAI_MAX_TOKENS_CEILING
+    assert 0 <= cfg.ffmpeg_max_concurrency <= FFMPEG_CONCURRENCY_CEILING
+    assert 1.0 <= cfg.ffmpeg_queue_timeout_sec <= QUEUE_TIMEOUT_CEILING
     assert isinstance(cfg.max_video_count, int)
     assert isinstance(cfg.cache_max_mb, int)
+    assert isinstance(cfg.ffmpeg_max_concurrency, int)
+    assert isinstance(cfg.ffmpeg_queue_timeout_sec, float)
 
 
 def test_from_mapping_accepts_non_mapping():
@@ -120,6 +129,13 @@ def test_json_1e999_does_not_break_plugin_loading():
         ("openai_timeout_sec", 1, 10.0),
         ("openai_max_tokens", 10**9, OPENAI_MAX_TOKENS_CEILING),
         ("openai_max_tokens", 1, 64),
+        # ---- 0.3.0：ffmpeg 并发限流 ----
+        ("ffmpeg_max_concurrency", 99, FFMPEG_CONCURRENCY_CEILING),
+        ("ffmpeg_max_concurrency", float("inf"), FFMPEG_CONCURRENCY_CEILING),
+        ("ffmpeg_max_concurrency", -3, 0),  # 0 = 关闭限流
+        ("ffmpeg_max_concurrency", 0, 0),
+        ("ffmpeg_queue_timeout_sec", 10**9, QUEUE_TIMEOUT_CEILING),
+        ("ffmpeg_queue_timeout_sec", 0, 1.0),
     ],
 )
 def test_numeric_bounds(field_name, value, expected):
@@ -130,6 +146,110 @@ def test_numeric_bounds(field_name, value, expected):
 def test_compress_budget_never_exceeds_gate():
     cfg = VideoConfig.from_mapping({"max_size_mb": 10, "compress_max_mb": 999})
     assert cfg.compress_max_mb <= cfg.max_size_mb
+
+
+# -------------------------------------------- 0.3.0 新增键：边界 / 垃圾值
+
+
+#: 0.3.0 的三个 ffmpeg 限流键与其 (默认值, 下界, 上界)
+NEW_CONCURRENCY_KEYS = {
+    "ffmpeg_max_concurrency": (2, 0, FFMPEG_CONCURRENCY_CEILING),
+    "ffmpeg_queue_timeout_sec": (30.0, 1.0, QUEUE_TIMEOUT_CEILING),
+}
+
+#: 明确"取不到数字"的垃圾值：必须**回落默认值**（不是收敛到边界）
+NON_NUMERIC_GARBAGE = [
+    None, "", "   ", "abc", [], (), {}, {"a": 1}, b"bytes", object(),
+    float("nan"),
+]
+
+
+def test_new_keys_garbage_falls_back_to_the_default():
+    """垃圾值一律回落默认（``2`` / ``30.0``），绝不抛异常。"""
+    for key, (default, _low, _high) in NEW_CONCURRENCY_KEYS.items():
+        for value in NON_NUMERIC_GARBAGE:
+            cfg = VideoConfig.from_mapping({key: value})
+            assert getattr(cfg, key) == default, (key, value)
+
+
+def test_new_keys_out_of_range_is_clamped():
+    """越界值收敛到边界（``_NUMERIC_BOUNDS`` 里必须有这几条）。"""
+    for key, (_default, low, high) in NEW_CONCURRENCY_KEYS.items():
+        for value in GARBAGE_VALUES:
+            cfg = VideoConfig.from_mapping({key: value})
+            assert low <= getattr(cfg, key) <= high, (key, value)
+    bounds = config_mod._NUMERIC_BOUNDS
+    assert bounds["ffmpeg_max_concurrency"] == (0, FFMPEG_CONCURRENCY_CEILING)
+    assert bounds["ffmpeg_queue_timeout_sec"] == (1.0, QUEUE_TIMEOUT_CEILING)
+
+
+def test_new_keys_clamping_produces_one_readable_notice():
+    """与既有 ``_range_notices`` 风格一致：一条，写出原值与边界。"""
+    cfg, notices = VideoConfig.from_mapping_detailed({"ffmpeg_max_concurrency": 99})
+    assert cfg.ffmpeg_max_concurrency == FFMPEG_CONCURRENCY_CEILING
+    hits = [item for item in notices if "ffmpeg_max_concurrency" in item]
+    assert hits == [
+        f"ffmpeg_max_concurrency=99 高于上限 {FFMPEG_CONCURRENCY_CEILING:g}，"
+        f"已收敛为 {FFMPEG_CONCURRENCY_CEILING:g}"
+    ]
+
+
+def test_ffmpeg_singleflight_is_a_bool_that_defaults_to_true():
+    """``ffmpeg_singleflight`` 默认 true；关闭必须是显式的 false。"""
+    assert VideoConfig().ffmpeg_singleflight is True
+    assert VideoConfig.from_mapping({}).ffmpeg_singleflight is True
+    for value in (False, 0, "false", "off", "no", "否"):
+        cfg = VideoConfig.from_mapping({"ffmpeg_singleflight": value})
+        assert cfg.ffmpeg_singleflight is False, value
+    # 非字符串/非数值类型 -> 回落默认 true（``_as_bool`` 对 ``enable`` 等键同源）
+    for value in (None, [], {}, object()):
+        assert VideoConfig.from_mapping(
+            {"ffmpeg_singleflight": value}
+        ).ffmpeg_singleflight is True
+    # 字符串按 ``_as_bool`` 的词表判定：不在「开」词表里的一律算假，
+    # 与 ``enable`` / ``cache_enabled`` 等既有布尔键完全一致。
+    for value in ("", "abc", "0", "false"):
+        assert VideoConfig.from_mapping(
+            {"ffmpeg_singleflight": value}
+        ).ffmpeg_singleflight is False
+
+
+def test_queue_budget_warning_fires_only_when_it_really_eats_the_budget():
+    """排队 + 压缩吃掉视觉超时预算的一半以上时必须显式告警（C.4-6）。
+
+    默认值 30 + 45 = 75 < 180/2 的 90，**不许**无端告警。
+    """
+    default_cfg = VideoConfig(
+        provider_mode="openai_compat",
+        openai_base_url="https://example.invalid/v1",
+        openai_api_key="sk-x",
+    )
+    _, warnings = default_cfg.normalized()
+    assert warnings == []
+
+    tight = VideoConfig(
+        provider_mode="openai_compat",
+        openai_base_url="https://example.invalid/v1",
+        openai_api_key="sk-x",
+        ffmpeg_queue_timeout_sec=60.0,
+        max_compress_seconds=45.0,
+        openai_timeout_sec=180.0,
+    )
+    _, tight_warnings = tight.normalized()
+    assert any("ffmpeg_queue_timeout_sec" in item for item in tight_warnings), (
+        tight_warnings
+    )
+    assert any("openai_timeout_sec" in item for item in tight_warnings)
+
+    # gemini_native 不调用视觉服务：这条告警不适用
+    native = VideoConfig(
+        provider_mode="gemini_native",
+        ffmpeg_queue_timeout_sec=60.0,
+        max_compress_seconds=45.0,
+        openai_timeout_sec=180.0,
+    )
+    _, native_warnings = native.normalized()
+    assert not any("openai_timeout_sec" in item for item in native_warnings)
 
 
 # ------------------------------------------------------------------ normalized

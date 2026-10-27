@@ -23,9 +23,29 @@ def squash(text: str) -> str:
 
 
 def test_version_is_bumped():
-    assert "version: 0.2.1" in METADATA
+    """0.3.0：六个新配置键 + 两处新行为（限流 / 视觉缓存）+ 删 ``@register``。"""
+    assert "version: 0.3.0" in METADATA
     assert CHANGELOG.startswith("# 更新日志")
+    assert "## 0.3.0" in CHANGELOG
+    # 历史条目必须保留（用户升级时要能查旧版本改了什么）
     assert "## 0.2.1" in CHANGELOG
+
+
+def test_changelog_030_lists_the_three_changes_and_the_falsified_claim():
+    """F.2 要求的五段：六个键、限流、缓存、删装饰器、既有用例全绿。
+
+    另外必须写清**被证伪的说法**：追问不重发视频时插件根本不运行，
+    所以"连续追问更快"不成立。
+    """
+    section = CHANGELOG.split("## 0.3.0", 1)[1].split("## 0.2.1", 1)[0]
+    for needle in (
+        "ffmpeg_max_concurrency",
+        "ffmpeg_queue_timeout_sec",
+        "ffmpeg_singleflight",
+        # 修正审计 §B.1 的前提：上限不是"无限"，而是默认线程池的 min(32, cpu+4)
+        "min(32",
+    ):
+        assert needle in section, needle
 
 
 def test_changelog_021_lists_the_fixed_items():
@@ -230,3 +250,35 @@ def test_videotest_entry_points_are_documented_honestly():
     assert "先单独发一个视频" in USAGE_TEXT
     assert "再发送 /videotest" not in USAGE_TEXT
     assert "先发视频再发命令" in CHANGELOG
+
+
+# ---------------------------------------------------- 0.3.0：限流 / 缓存文档
+
+
+def test_schema_hints_explain_the_concurrency_knobs():
+    """面板 hint 必须把语义说全：0=关闭、排队上限、singleflight 依赖缓存。"""
+    max_hint = SCHEMA["ffmpeg_max_concurrency"]["hint"]
+    assert "并发" in max_hint
+    assert "0" in max_hint and "关闭" in max_hint
+    queue_hint = SCHEMA["ffmpeg_queue_timeout_sec"]["hint"]
+    assert "排队" in queue_hint
+    assert "busy" in queue_hint
+    flight_hint = SCHEMA["ffmpeg_singleflight"]["hint"]
+    assert "singleflight" in flight_hint
+    assert "cache_enabled" in flight_hint
+
+
+def test_readme_documents_the_concurrency_section():
+    assert "## 并发、排队与缓存" in README
+    for needle in (
+        "ffmpeg_max_concurrency",
+        "ffmpeg_queue_timeout_sec",
+        "ffmpeg_singleflight",
+        # 审计 §B.1 要求修正的说法：上限不是"无限"，而是默认线程池
+        "min(32, cpu+4)",
+        # 失败分类表里要有 busy
+        "busy",
+    ):
+        assert needle in README, needle
+    assert "无限并发" not in README
+    assert "不会压出超预算的文件" not in README

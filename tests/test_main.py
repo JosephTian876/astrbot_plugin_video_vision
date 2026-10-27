@@ -508,3 +508,101 @@ def test_config_property_is_a_video_config():
     assert isinstance(plugin.config, VideoConfig)
     # normalized() 会把压缩上限压到闸门以下
     assert plugin.config.compress_max_mb < plugin.config.max_size_mb
+
+
+# --------------------------------------------------- 0.3.0：限流 / 缓存装配
+
+
+class _RecordingLimiter:
+    """记录进出次数的限流器替身（``SlotLimiter`` 的鸭子类型）。"""
+
+    def __init__(self) -> None:
+        self.limit = 2
+        self.queue_timeout = 30.0
+        self.entered = 0
+        self.exited = 0
+
+    def slot(self, name: str = ""):
+        recorder = self
+
+        class _Slot:
+            async def __aenter__(self):
+                recorder.entered += 1
+                return None
+
+            async def __aexit__(self, *exc):
+                recorder.exited += 1
+                return False
+
+        return _Slot()
+
+
+def test_plugin_builds_the_limiter_from_config(stub_logger):
+    """``ffmpeg_max_concurrency`` 决定**有没有**限流器；0 = 完全不建。"""
+    off = make_plugin(_Context(), ffmpeg_max_concurrency=0)
+    assert off.limiter is None, "0 表示关闭限流（逐字节等价 0.2.1）"
+
+    on = make_plugin(
+        _Context(), ffmpeg_max_concurrency=2, ffmpeg_queue_timeout_sec=12.0
+    )
+    assert on.limiter is not None
+    assert on.limiter.limit == 2
+    assert on.limiter.queue_timeout == 12.0
+
+
+def test_diagnose_uses_the_limiter(media_tools, tiny_video, stub_logger):
+    """``/videotest`` 也必须排队（否则诊断结果与真实链路不一致）。"""
+    plugin = make_plugin(_Context(), provider_mode="gemini_native")
+    point_to_ffmpeg(plugin, media_tools)
+    plugin.cache_root = str(Path(tiny_video).parent / "cache")
+    limiter = _RecordingLimiter()
+    plugin.limiter = limiter
+
+    report = run(plugin._diagnose(tiny_video, event=_Event()))
+
+    assert limiter.entered == 1, "一次诊断只能占一个槽"
+    assert limiter.exited == 1
+    assert "✅ 准备成功" in report
+
+
+def test_diagnose_keeps_working_without_a_limiter(media_tools, tiny_video, stub_logger):
+    """限流关掉时 ``/videotest`` 行为不变（0 = 关闭）。"""
+    plugin = make_plugin(_Context(), provider_mode="gemini_native")
+    point_to_ffmpeg(plugin, media_tools)
+    plugin.cache_root = str(Path(tiny_video).parent / "cache")
+    plugin.limiter = None
+
+    report = run(plugin._diagnose(tiny_video, event=_Event()))
+
+    assert "✅ 准备成功" in report
+
+
+def test_singleflight_with_the_cache_off_warns_once_at_startup(stub_logger):
+    """``ffmpeg_singleflight=true`` + ``cache_enabled=false`` 是自相矛盾的配置。
+
+    没有缓存就没有可共享的产物，singleflight 只能被跳过（见
+    ``core/injector._prepare_video``）。这时必须**在启动时告警一次**：
+    逐视频刷 WARNING 会淹没日志，静默跳过又会让用户以为"开了但没生效"
+    （AUDIT-030 §C.1-7）。
+    """
+    plugin = make_plugin(_Context(), ffmpeg_singleflight=True, cache_enabled=False)
+    warnings = [m for m in stub_logger.messages("warning") if "singleflight" in m]
+    assert len(warnings) == 1, stub_logger.records
+    assert "cache_enabled" in warnings[0]
+    # 插件照常装配（只是这条组合不生效），不是错误
+    assert plugin.config.ffmpeg_singleflight is True
+    assert plugin.limiter is not None
+    # 生效状态是显式记录的，不是"猜"出来的
+    assert plugin.singleflight_effective is False
+
+    # 默认配置（缓存开）不许刷这条
+    stub_logger.clear()
+    default_plugin = make_plugin(_Context())
+    assert not [m for m in stub_logger.messages("warning") if "singleflight" in m]
+    assert default_plugin.singleflight_effective is True
+
+    # 显式关掉 singleflight 之后也不许刷（用户已经明确选择）
+    stub_logger.clear()
+    off = make_plugin(_Context(), ffmpeg_singleflight=False, cache_enabled=False)
+    assert not [m for m in stub_logger.messages("warning") if "singleflight" in m]
+    assert off.singleflight_effective is False

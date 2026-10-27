@@ -17,11 +17,12 @@ description: |
   - 超出体积闸门时自动用 ffmpeg 压缩
   - 超长视频自动截断
   - 压缩结果按内容哈希缓存，重试不重复压缩
+  - ffmpeg 并发限流（默认 2）+ 同一文件并发只转码一次
   - 注入后抹除占位文本里的本机路径，避免诱导模型自己去解析文件
   - 全链路失败降级：视频处理出错绝不影响正常文字对话
   - 与「我会永远陪着你」陪伴体系兼容
   - 附带 /videotest 调试指令，可逐步查看处理耗时
-version: 0.2.1
+version: 0.3.0
 author: JosephTian876
 repo: https://github.com/JosephTian876/astrbot_plugin_video_vision
 short_desc: 让模型直接看懂视频（Gemini 原生 / OpenAI 兼容双模式），而非抽帧

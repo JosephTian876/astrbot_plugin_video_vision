@@ -79,6 +79,11 @@ SHORT_REASONS: dict[str, str] = {
     "duration": "its duration could not be read",
     "too_large": "it exceeds the size limit",
     "missing": "the file could not be read",
+    # 0.3.0：**等待槽位**超时，与 ffmpeg 自己超时是两件事。复用 ``timeout``
+    # （"ffmpeg timed out while transcoding"）会把用户引向 ``max_compress_seconds``
+    # —— 归因错误：真正该调的是 ``ffmpeg_max_concurrency`` /
+    # ``ffmpeg_queue_timeout_sec``（AUDIT-030 §C.1-4）。
+    "busy": "the server is busy processing other videos",
     # 「按配置拒绝」必须分成三条：0.2.1 把 oversize 与 overlong 都报成
     # "it exceeds the size limit"，于是"视频太长被拒"告诉模型"它太大了"，
     # 模型会去劝用户压小体积 —— 错误归因（ARCH-REVIEW §4.1）。
