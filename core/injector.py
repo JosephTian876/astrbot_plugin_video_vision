@@ -448,6 +448,19 @@ def _prepare_video(
             exc,
         )
 
+    def _on_overdue() -> None:
+        """leader 超过等待预算还没结束：只**告警**，不另起一份（P2-1）。
+
+        旧实现（VERIFY-VV-R9 §3.3）在这里另起一份：超时路径把 leader 的登记删了，
+        同一个 key 于是出现两个并发 leader（实测 ``concurrent_peak=2``）。
+        现在唯一的后果是"这条消息多等一会儿"，而且能查得到是谁慢。
+        """
+        log.warning(
+            "[VideoVision] 同一文件的转码超过 %.0fs 仍未结束（%s），本条继续等待",
+            config.max_compress_seconds + 5.0,
+            cache_key,
+        )
+
     try:
         compress_started = time.monotonic()
         try:
@@ -462,6 +475,7 @@ def _prepare_video(
                     wait_timeout=config.max_compress_seconds + 5.0,
                     on_join=lambda: dbg("加入同一文件的转码 %s", cache_key),
                     on_takeover=_on_takeover,
+                    on_overdue=_on_overdue,
                 )
             else:
                 final_path = _compress_once()

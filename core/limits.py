@@ -522,8 +522,12 @@ class SingleFlight:
       （``probe`` 就是 ``cache.get``；它拿不到时才会自己重跑）；
     * leader 抛确定性失败（``not_found`` / ``duration`` / ``corrupt`` /
       ``empty`` / ``too_large``）-> follower 原样抛出**同一个异常对象**；
-    * leader 抛瞬时失败（``timeout`` / ``exit_code`` / ``other``）或 follower
-      等待超时 -> follower **自己接管一次**（成为新 leader），最多一次；
+    * leader 抛瞬时失败（``timeout`` / ``exit_code`` / ``other``）-> follower
+      **自己接管一次**（成为新 leader），最多一次；
+    * follower 等待超时 -> **只放弃这一轮等待**，继续等**同一个** leader；
+      登记只有 leader 自己能在 ``_lead`` 的 ``finally`` 里摘（VERIFY-VV-R9 P2-1：
+      旧实现在超时路径 ``_discard`` 掉了 leader 正在跑的那条登记，于是 follower
+      重入 ``_enter`` 后自己成了第二个 leader，实测 ``concurrent_peak=2``）；
     * 无论成功失败，``finally`` 里摘掉的永远是**自己那条** flight。
     """
 
@@ -546,26 +550,57 @@ class SingleFlight:
         wait_timeout: float = 60.0,
         on_join: Callable[[], None] | None = None,
         on_takeover: Callable[[BaseException | None], None] | None = None,
+        on_overdue: Callable[[], None] | None = None,
     ) -> Any:
-        """执行 ``work``（同 key 只一个真跑）；返回 leader 或缓存里的产物。"""
+        """执行 ``work``（同 key 只一个真跑）；返回 leader 或缓存里的产物。
+
+        Args:
+            key: 去重键（同 key 的并发调用共享一次 ``work``）。
+            work: 真正干活的函数（同步、可能很慢）。
+            probe: leader 成功后取共享产物的函数；返回 ``None`` 表示产物没进
+                共享位置（例如超过 ``cache_max_mb``），follower 才会自己重跑。
+            wait_timeout: 单轮等待 leader 的秒数。**不是**"等这么久就接管"：
+                超时只结束**这一轮**等待，随后继续等同一个 leader（契约要求同 key
+                并发恒为 1）。``<=0`` 表示不设预算 —— 一直等到 leader 结束。
+            on_join: 第一次加入别人的 flight 时回调（日志用）。
+            on_takeover: leader 瞬时失败后本调用改为自行转码时回调（日志用）。
+            on_overdue: leader 超过 ``wait_timeout`` 仍未结束时回调**一次**
+                （leader 可能卡住；本调用仍会继续等）。
+
+        Returns:
+            ``work()`` 的返回值，或 leader 发布到共享位置的产物。
+        """
         timeout = max(0.0, float(wait_timeout))
         attempts = 0
+        announced = False
+        overdue = False
         while True:
             flight, is_leader = self._enter(key)
             if is_leader:
                 return self._lead(key, flight, work)
 
-            if on_join is not None:
+            if on_join is not None and not announced:
+                announced = True
                 on_join()
-            finished = flight.event.wait(timeout)
+            finished = flight.event.wait(timeout if timeout > 0 else None)
 
-            if finished and flight.error is None:
+            if not finished:
+                # 等待超时：**不动登记表**（P2-1 的唯一根因就是这里删了）。
+                # 删掉正在跑的 leader 的登记 -> 下一轮 ``_enter`` 自己当 leader ->
+                # 同一个 key 两份并发。这里改成继续等同一个 leader：并发恒为 1，
+                # 而 leader 的临界区本身有界（ffprobe 30s + max_compress_seconds）。
+                if on_overdue is not None and not overdue:
+                    overdue = True
+                    on_overdue()
+                continue
+
+            if flight.error is None:
                 if probe is not None:
                     value = probe()
                     if value is not None:
                         return value
                 # 产物没进共享位置（例如超过 cache_max_mb）：没有可共享的东西
-            elif finished:
+            else:
                 kind = failure_kind(flight.error)
                 if kind in DETERMINISTIC_FAILURE_KINDS:
                     raise flight.error
@@ -577,6 +612,8 @@ class SingleFlight:
                 # 这时行为等价于没有 singleflight，绝不会无限重试。
                 return work()
             attempts += 1
+            # 到这里 leader **已经结束**（``event`` 已 set），摘的是那条结束的登记：
+            # 让下一次 ``_enter`` 干净地登记自己那条，而不是复用一条死 flight。
             self._discard(key, flight)
 
     # ---------------------------------------------------------------- 内部

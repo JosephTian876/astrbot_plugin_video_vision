@@ -507,45 +507,148 @@ def test_singleflight_follower_retries_transient_failure_once():
     assert flight.pending == 0
 
 
-def test_singleflight_follower_timeout_takes_over():
-    """#12：leader 卡住不返回 -> follower 等到上限后接管。"""
+def test_singleflight_follower_timeout_waits_for_the_same_leader():
+    """#12：leader 跑得比 ``wait_timeout`` 久 -> follower **继续等**，不许另起一份。
+
+    旧实现（VERIFY-VV-R9 §3.3）：等待超时就 ``_discard(key, flight)`` ——
+    删掉的正是 leader 还在跑的那条登记；follower 重入 ``_enter`` 时自己成了第二个
+    leader（实测 ``concurrent_peak=2, work_starts=2``）。契约要求同 key 并发恒为 1，
+    所以超时路径只能"放弃这一轮等待"，登记只有 leader 自己能摘。
+    """
     flight = SingleFlight()
     started = threading.Event()
-    in_second_work = threading.Event()
+    follower_joined = threading.Event()
+    overdue = threading.Event()
+    release = threading.Event()
+    store: dict[str, str] = {}
     calls: list[str] = []
     results: list[str] = []
-    release = threading.Event()
+    leader_results: list[str] = []
     lock = threading.Lock()
 
     def work() -> str:
-        name = threading.current_thread().name
         with lock:
-            calls.append(name)
-        if name == "leader":
-            started.set()
-            assert release.wait(10)
-            return "leader-done"
-        in_second_work.set()
-        return "follower-took-over"
+            calls.append(threading.current_thread().name)
+        started.set()
+        assert release.wait(10), "用例没有放行 leader"
+        store["k"] = "leader-done"
+        return "leader-done"
 
-    def run_leader() -> None:
-        results.append(flight.run("k", work, probe=lambda: "never", wait_timeout=10.0))
+    def run(timeout: float, on_join=None, on_overdue=None) -> str:
+        return flight.run(
+            "k",
+            work,
+            probe=lambda: store.get("k"),
+            wait_timeout=timeout,
+            on_join=on_join,
+            on_overdue=on_overdue,
+        )
 
-    leader = threading.Thread(target=run_leader, name="leader")
+    leader = threading.Thread(
+        target=lambda: leader_results.append(run(10.0)), name="leader"
+    )
     leader.start()
     assert started.wait(5)
-
-    def run_follower() -> None:
-        results.append(flight.run("k", work, probe=lambda: "never", wait_timeout=0.05))
-
-    follower = threading.Thread(target=run_follower, name="follower")
+    follower = threading.Thread(
+        target=lambda: results.append(
+            run(0.05, follower_joined.set, overdue.set)
+        ),
+        name="follower",
+    )
     follower.start()
-    follower.join(10)
-    assert in_second_work.is_set()
-    assert results == ["follower-took-over"], results
-    assert calls == ["leader", "follower"], calls
+    assert follower_joined.wait(5)
+    # 等 follower 的等待预算真的到期（不睡墙钟：超时路径会调 on_overdue）
+    assert overdue.wait(5), "follower 的等待预算没有到期"
+    with lock:
+        starts_while_leader_runs = list(calls)
+    assert starts_while_leader_runs == ["leader"], (
+        f"follower 超时后另起了一份 work: {starts_while_leader_runs}"
+    )
+    assert flight.pending == 1, "登记表里应当只有 leader 那条"
     release.set()
     leader.join(10)
+    follower.join(10)
+    assert calls == ["leader"], calls
+    assert leader_results == ["leader-done"]
+    assert results == ["leader-done"], "follower 必须拿到 leader 的产物"
+    assert flight.pending == 0
+
+
+def test_singleflight_follower_takes_over_only_after_the_leader_finished():
+    """leader 结束但产物没进共享位置（``probe`` 拿不到）-> follower 串行接管一次。"""
+    flight = SingleFlight()
+    first_started = threading.Event()
+    second_started = threading.Event()
+    release_first = threading.Event()
+    release_second = threading.Event()
+    results: list[str] = []
+
+    def first_work() -> str:
+        first_started.set()
+        assert release_first.wait(10)
+        return "first"
+
+    def second_work() -> str:
+        second_started.set()
+        assert release_second.wait(10)
+        return "second"
+
+    leader = threading.Thread(
+        target=lambda: results.append(
+            flight.run("k", first_work, probe=lambda: None, wait_timeout=10.0)
+        )
+    )
+    leader.start()
+    assert first_started.wait(5)
+
+    follower = threading.Thread(
+        target=lambda: results.append(
+            flight.run("k", second_work, probe=lambda: None, wait_timeout=0.05)
+        )
+    )
+    follower.start()
+    # follower 的超时**不该**让它现在就跑：leader 还在飞
+    assert not second_started.wait(0.3), "leader 还在跑，follower 不许接管"
+    assert flight.pending == 1
+
+    release_first.set()
+    leader.join(10)
+    # leader 结束且没有可共享产物 -> follower 这时才登记自己那条并开跑
+    assert second_started.wait(5), "leader 结束后 follower 没有接管"
+    assert flight.pending == 1, "接管后应当恰好有一条新登记"
+
+    release_second.set()
+    follower.join(10)
+    assert flight.pending == 0
+    assert sorted(results) == ["first", "second"], results
+
+
+def test_a_finished_leader_does_not_remove_a_newer_flight():
+    """``_discard`` 的 ``is flight`` 守卫：迟到的 leader 不许删掉后登记的同 key flight。
+
+    真实竞态：``_lead`` 的 finally 先 ``event.set()``、再 ``_discard``；被唤醒的
+    follower 可能在这中间已经登记了自己那条（它成了新 leader）。那次**迟到**的
+    ``_discard`` 必须什么都没删 —— 否则同 key 立刻又能起第二个。
+
+    端到端的那一半（"leader 结束且没有可共享产物 -> follower 串行接管"）在
+    :func:`test_singleflight_follower_takes_over_only_after_the_leader_finished`。
+    """
+    flight = SingleFlight()
+
+    first, first_is_leader = flight._enter("k")
+    assert first_is_leader is True
+    flight._discard("k", first)  # 第一条（已经结束的 leader）摘掉自己
+    assert flight.pending == 0
+
+    second, second_is_leader = flight._enter("k")
+    assert second_is_leader is True and second is not first
+    assert flight.pending == 1
+
+    flight._discard("k", first)  # 迟到的 leader：不许删掉 second
+    assert flight.pending == 1
+    assert flight._flights["k"] is second
+
+    flight._discard("k", second)
     assert flight.pending == 0
 
 
@@ -559,60 +662,6 @@ def test_singleflight_registry_is_empty_after_the_flight():
     with pytest.raises(_MediaToolError):
         flight.run("boom", _boom("corrupt"), wait_timeout=5.0)
     assert flight.pending == 0
-
-
-def test_a_finished_leader_does_not_remove_a_newer_flight():
-    """``finally`` 只摘自己那条：后来的 flight 不能被先结束的调用删掉。"""
-    flight = SingleFlight()
-    release_first = threading.Event()
-    first_started = threading.Event()
-    second_started = threading.Event()
-    release_second = threading.Event()
-    takeover_seen: list[BaseException | None] = []
-
-    def first_work() -> str:
-        first_started.set()
-        assert release_first.wait(10)
-        return "first"
-
-    def second_work() -> str:
-        second_started.set()
-        assert release_second.wait(10)
-        return "second"
-
-    results: list[str] = []
-
-    leader = threading.Thread(
-        target=lambda: results.append(
-            flight.run("k", first_work, probe=lambda: None, wait_timeout=10.0)
-        )
-    )
-    leader.start()
-    assert first_started.wait(5)
-
-    follower = threading.Thread(
-        target=lambda: results.append(
-            flight.run(
-                "k",
-                second_work,
-                probe=lambda: None,
-                wait_timeout=0.05,
-                on_takeover=takeover_seen.append,
-            )
-        )
-    )
-    follower.start()
-    assert second_started.wait(5)  # follower 已经接管并登记了新 flight
-
-    release_first.set()
-    leader.join(10)
-    # 第一条 flight 结束，但登记表里仍应有 follower 自己那条
-    assert flight.pending == 1
-
-    release_second.set()
-    follower.join(10)
-    assert flight.pending == 0
-    assert sorted(results) == ["first", "second"]
 
 
 # ======================================= 结构守卫：限流只在 async 层
