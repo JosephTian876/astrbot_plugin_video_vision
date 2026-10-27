@@ -34,6 +34,7 @@ from .decide import (
     describe,
 )
 from .injector import PrepareOutcome
+from .limits import format_seconds
 from .media import OUTPUT_MIME, guess_video_mime, suffix_of
 from .openai_vision import build_vision_prompt
 from .placeholder import VIDEO_SUFFIXES
@@ -434,8 +435,12 @@ def render_report(
     if inj.note:
         lines.append(f"说明: {inj.note}")
     lines.append("")
+    # 用 format_seconds 而不是 ``%.0f``：0.05MB 的视频算出来是 0.4s，``%.0f``
+    # 会渲染成「约 0s」——"不许把 0.4 秒写成 0 秒"这条规则在排队/TTL 链路早就
+    # 生效了，这里曾经遗漏（ARCH-VV-C2 P2-5）。
     lines.append(
-        f"预计上传耗时: 约 {est_upload:.0f}s（{budget_name} {budget:.0f}s）"
+        f"预计上传耗时: 约 {format_seconds(est_upload)}"
+        f"（{budget_name} {budget:.0f}s）"
     )
     if est_upload > budget:
         hint = "openai_timeout_sec" if is_openai else "provider timeout"

@@ -154,7 +154,7 @@ def test_render_report_is_byte_exact_for_the_documented_example():
         "MIME   : video/mp4（压缩产物，固定为 mp4）\n"
         "说明: 体积 21.8MB > 闸门 13.0MB -> 1.8MB\n"
         "\n"
-        "预计上传耗时: 约 14s（provider 预算 180s）\n"
+        "预计上传耗时: 约 14.3s（provider 预算 180s）\n"
         "✅ 在预算内"
     )
 
@@ -309,7 +309,7 @@ def test_render_report_shows_credentials_prompt_and_vision_result():
     assert "① Gemini 系 provider 校验 → openai_compat 不适用" in report
     assert "② audio 模态校验 → openai_compat 不适用" in report
     assert "prompt : 请详细描述这段视频" in report
-    assert "预计上传耗时: 约 7s（视觉服务预算 180s）" in report
+    assert "预计上传耗时: 约 7.4s（视觉服务预算 180s）" in report
     assert "✅ 视觉调用成功（1.2s | token 262+17）" in report
     assert "— 视觉模型回复节选 —" in report
     # 节选截断到 400 字符 + 一个省略号
@@ -342,6 +342,46 @@ def test_vision_failure_line_is_rendered_after_the_budget():
     )
 
     assert report.endswith("❌ 视觉调用失败: 视觉服务请求超时")
+
+
+@pytest.mark.parametrize(
+    ("size_mb", "expected"),
+    [
+        (0.05, "400ms"),  # 0.4s：旧写法 %.0f 渲染成「约 0s」，与 format_seconds 的存在理由自相矛盾
+        (1.79, "14.3s"),  # <60s：一位小数
+        (20.0, "160s"),  # >=60s：整数秒
+    ],
+)
+def test_upload_estimate_is_never_rounded_down_to_zero(size_mb, expected):
+    """「预计上传耗时」必须走 ``format_seconds``（P2-5）。
+
+    旧渲染用 ``%.0f``：0.05MB 的视频打「预计上传耗时: 约 0s」—— 而
+    ``format_seconds``（排队/TTL 那条链路早就在用）存在的理由正是"不许把 0.4 秒
+    写成 0 秒"。这里把三档边界一起锁住，免得下次又退回去。
+    """
+    cfg = VideoConfig(
+        max_size_mb=13.0,
+        compress_max_mb=8.0,
+        max_duration_sec=0.0,
+        provider_mode="gemini_native",
+    )
+    probe = make_probe(size_mb=size_mb, duration_sec=1.0)
+
+    report = render_report(
+        cfg=cfg,
+        mode="gemini_native",
+        probe=probe,
+        plan=classify(
+            size_mb=size_mb, duration_sec=1.0, config=cfg, mime_or_suffix=".mp4"
+        ),
+        outcome=PrepareOutcome(
+            True, make_injection(size_mb=size_mb, action="as-is", note="")
+        ),
+        elapsed_sec=0.01,
+    )
+
+    assert f"预计上传耗时: 约 {expected}（provider 预算 180s）" in report, report
+    assert "约 0s" not in report
 
 
 def test_over_budget_hint_names_the_right_knob(monkeypatch):
@@ -534,7 +574,13 @@ def test_videotest_usage_inserts_the_reason_before_the_warning_block():
 
 
 def test_diagnostics_does_not_import_astrbot_or_hooks():
-    """``core/`` 不得回头依赖上层：不 import ``astrbot``，也不 import ``hooks``。"""
+    """``core/`` 不得回头依赖上层：不 import ``astrbot``，也不 import ``hooks``。
+
+    依赖集合是**精确锁定**的（新增一条就要在这里显式登记，顺带想一遍方向对不对）。
+    ``.limits`` 是 0.3.0 加的：报告的「预计上传耗时」必须走 ``format_seconds``
+    （ARCH-VV-C2 P2-5），而那个纯函数住在 ``core/limits.py`` —— 同层、零第三方依赖、
+    也不反向 import 本模块。
+    """
     tree = ast.parse(MODULE_PATH.read_text(encoding="utf-8"))
     imported: set[str] = set()
     for node in ast.walk(tree):
@@ -554,6 +600,7 @@ def test_diagnostics_does_not_import_astrbot_or_hooks():
         ".config",
         ".decide",
         ".injector",
+        ".limits",
         ".media",
         ".openai_vision",
         ".placeholder",

@@ -66,6 +66,8 @@
 - **小于 1 秒不再渲染成「0s」**（VERIFY-A P3-2 / VERIFY-B P3）：新增
   `limits.format_seconds()`，`0.01s` → `10ms`、`0.9s` → `900ms`；`QueueTimeout`
   的文案、排队超时 WARNING、缓存命中的「TTL 剩 Xs」、启动日志的排队上限全走它。
+  **`/videotest` 的「预计上传耗时」也补上了**（ARCH-VV-C2 P2-5：旧写法 `%.0f` 会把
+  0.05MB 的视频渲染成「约 0s」，与这个函数的存在理由自相矛盾）。
 - **`/videotest` 多一行排队摘要**（VERIFY-A P3-3）：`LimiterStats.summary()` 只在
   **真的排过队或超时过**时非空（`排队 3 次，最长 12.3s，累计 20.0s，超时 1 次`），
   正常路径报告格式一字不变。

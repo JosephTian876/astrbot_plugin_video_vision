@@ -503,7 +503,7 @@ prompt : （gemini_native 不调用视觉服务，无 prompt）
 MIME   : video/mp4（压缩产物，固定为 mp4）
 说明: 体积 21.8MB > 闸门 13.0MB -> 1.8MB
 
-预计上传耗时: 约 14s（provider 预算 180s）
+预计上传耗时: 约 14.3s（provider 预算 180s）
 ✅ 在预算内
 ```
 
