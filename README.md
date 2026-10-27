@@ -403,6 +403,19 @@ ffmpeg_queue_timeout_sec(30s)+max_compress_seconds(60s) 已吃掉视觉服务超
 `ffmpeg_queue_timeout_sec + max_compress_seconds >= openai_timeout_sec × 0.5`
 且 `provider_mode` 实际为 `openai_compat` 时出现。
 
+**除它之外还有两处"三开关全关也看得见"的修正**（都是 0.3.0 收官轮改的，与开关无关，
+且都属"原来那句文案是错的"）：
+
+1. **本地 IO 失败不再被说成"超限"**：中文 locale 下 ffmpeg 的 `拒绝访问。` 曾让
+   `short_reason` 命中 `拒绝` 分支，用户看到 "it exceeds the size limit"（英文 locale
+   得到正确的 "compression failed"）。现在权限/磁盘失败有专门文案
+   （`local file access was denied` / `the local disk is full`），未知失败落回中性
+   `compression failed`。**这句文案会出现在注入给模型的上下文里**，所以它是可观测差异。
+2. **配置写错类型会有一条 WARNING**：`ffmpeg_max_concurrency="false"`（被当 2）、
+   `"0.5"`（被当 0）、`vision_cache_enabled="abc"`（被当 false）以前**静默**吞掉，
+   现在各打一条一次性 `配置提示:`，说明"你填的 X 被当成 Y"。生效值与 0.2.1 相同，
+   只是不再无声。
+
 `LimiterStats`（等待次数 / 最长等待 / 超时次数）与 `VisionCacheStats`（命中 /
 未命中 / 写入 / 淘汰 / 过期）在 `debug_log=true` 时逐次写进日志。`/videotest` 只在
 **真的排过队或被排队超时拒过**时多一行 `队列   :` 摘要（例如

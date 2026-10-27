@@ -11,12 +11,13 @@
 并让其余键保持 0.2.1 的原值时，**注入决策与既有日志行为等价**：9 个素材 × 11 组
 配置的 198 条 `prepare_video` + 40 份
 `/videotest` 报告 + 3 次钩子端到端（共 241 条观测）与 0.2.1（`c00f6a2`）逐字段
-比较 **0 差异**。**唯一的例外**是与这三个开关无关的一条新告警：旧键
-`max_compress_seconds` 与 `ffmpeg_queue_timeout_sec` 的预算冲突时
-（`30 + 60 >= openai_timeout_sec / 2`），`VideoConfig.normalized()` 会多一条
-**预算告警**（启动 WARNING + `/videotest` 的 `配置修正:` 行）；0.2.1 的默认
-`max_compress_seconds=45` 不触发。下面的措辞因此一律写「注入决策与既有日志行为
-等价」，不写「逐字节等价」。
+比较 **0 差异**。**与这三个开关无关的例外共有三处**（详见 §4"其他"）：
+① 旧键 `max_compress_seconds` 与 `ffmpeg_queue_timeout_sec` 的预算冲突时
+（`30 + 60 >= openai_timeout_sec / 2`）`VideoConfig.normalized()` 多一条
+**预算告警**（启动 WARNING + `/videotest` 的 `配置修正:` 行；0.2.1 默认的 45 不触发）；
+② 本地 IO 失败不再被误报成"超限"（权限/磁盘各有专门文案）；
+③ 配置值类型写错时多一条一次性 `配置提示:` WARNING（生效值不变）。
+所以下面的措辞一律写「注入决策与既有日志行为等价」，不写「逐字节等价」。
 三条各有专门用例（`tests/test_limits.py` / `tests/test_injector.py` /
 `tests/test_hooks.py` / `tests/test_vision_cache.py`）。
 
@@ -90,9 +91,16 @@
   `SINGLEFLIGHT` 的登记表只有 leader 自己的 `finally` 能摘，follower 绝不删别人的登记。
 - 新增 `ffmpeg_queue_timeout_sec`（默认 30s）与一条 `normalized()` 告警：本地
   `排队 + 压缩` 吃掉 `openai_timeout_sec` 一半以上时显式提示 —— 因为视觉服务超时
-  只管上传+推理，本地这两段发生在它之前（最坏情况会顶穿它）。**它就是开头那条
+  只管上传+推理，本地这两段发生在它之前（最坏情况会顶穿它）。**它是开头那条
   「唯一的例外」**：不属于三个开关中的任何一个，三开关全关时只要旧配置的
   `max_compress_seconds` 够大（60）仍然会出现。
+- 另外两处**与开关无关**的可观测差异（收官轮改的，都是"原来那句文案是错的"）：
+  ① 本地 IO 失败不再被说成超限 —— 中文 locale 的 `拒绝访问。` 曾命中 `拒绝` 分支，
+  用户看到 "it exceeds the size limit"，现在权限/磁盘各有专门文案
+  （`local file access was denied` / `the local disk is full`），未知失败落回中性的
+  `compression failed`；这段文案会进注入给模型的上下文，所以是可观测差异。
+  ② 配置值类型写错（`"false"` 塞进整数键、`"abc"` 塞进布尔键）以前静默吞掉，现在各打
+  一条一次性 `配置提示:` WARNING 说明"你填的 X 被当成 Y"；生效值与 0.2.1 相同。
 
 ### 2. 视觉理解结果缓存：`vision_cache_enabled` / `vision_cache_ttl_sec` / `vision_cache_max_entries`
 
