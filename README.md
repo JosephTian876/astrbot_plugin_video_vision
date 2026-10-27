@@ -26,7 +26,7 @@
 - **压缩缓存**：按源文件内容哈希缓存，重试/重复发送不重复压缩
 - **ffmpeg 并发限流**：进程内**全局**上限（默认 2），排队超时降级为 `busy`；
   不再是"最多 6 个 ffmpeg 一起抢 2 个核"（原上限只是默认线程池的 `min(32, cpu+4)`）
-- **视觉结果缓存**：完全相同的重复投递不再重付一次上传 + 推理（TTL 600s / LRU 64 条，纯内存）
+- **视觉结果缓存（仅 `openai_compat`）**：同一视频 + 同一提问 + 同一模型/prompt 的**重复投递**不再重付一次上传 + 推理（TTL 600s / LRU 64 条，纯内存）；`/videotest` **绕过**缓存
 - **全链路失败降级**：视频处理出错**绝不影响**正常文字对话
 - **不污染对话历史**：注入的视频块标记为非持久化，不会在后续轮次被重发
 - **`/videotest` 诊断指令**：逐步查看处理耗时、体积、provider 与三道闸门
@@ -117,7 +117,7 @@ Responses API（`/responses`）同样实测支持：视频用 `input_image` + da
 | `ffmpeg_max_concurrency` | `2` | 进程内**全局**（跨会话）同时进行的 ffmpeg 转码数（0-8）。**`0` = 关闭限流**，行为回到 0.2.1 |
 | `ffmpeg_queue_timeout_sec` | `30.0` | 单个视频**等待槽位**的上限（1-600，不含转码本身）。超时 -> 失败分类 `busy` |
 | `ffmpeg_singleflight` | `true` | 同一内容 + 同一组压缩参数的并发转码只做一次（**依赖 `cache_enabled`**） |
-| `vision_cache_enabled` | `true` | 视觉理解结果缓存。**只对完全相同的重复投递命中**（视频字节 + 最终 prompt + 端点 + 模型 + max_tokens），纯内存、重启即失效 |
+| `vision_cache_enabled` | `true` | 视觉理解结果缓存。**只在 `openai_compat` 生效**（`gemini_native` 不查不写），**只对完全相同的重复投递命中**（视频字节 + 最终 prompt + 端点 + 模型 + max_tokens），纯内存、重启即失效 |
 | `vision_cache_ttl_sec` | `600.0` | 条目存活时长（60-86400）。命中**不**续期 |
 | `vision_cache_max_entries` | `64` | 条目上限（1-1024），超出按 LRU 淘汰；64 条约 1MB |
 | `debug_log` | `false` | 详细调试日志（限流/缓存的计数也只在这个级别可见） |
@@ -240,14 +240,33 @@ async with limiter.slot(name=name):
 
 ### 视觉理解结果缓存（`vision_cache_enabled` / `vision_cache_ttl_sec` / `vision_cache_max_entries`）
 
+> **只在 `openai_compat` 生效**：`gemini_native` 走的是「把视频块交给主 provider
+> 亲眼看」，根本不产生可缓存的文本结果 —— 那条路径既不查也不写缓存
+> （实测投递一次后 `hits/misses/stores` 全 0、`cache_len` 仍为 0）。
+
 **先说清楚它不解决什么**：对同一段视频**换个问题再问**，不会因为缓存变快 ——
 用户追问时如果不重发/不引用视频，插件的钩子根本不运行（历史里既没有视频占位符，
 注入的分析也是 `mark_as_temp()` 的、落库时被丢弃）；追问时重新引用视频通常
 **换了提问**，那就**不该**命中缓存（用上一问的答案回答这一问才是 bug）。
 
-它解决的是另一半：**完全相同的重复投递** —— 同一个文件被两个人转发、失败重试、
-`/videotest` 紧跟一条真实消息之后又发一次 —— 现在会各花一次 60-120 秒的上传 +
-推理。key 是六个维度的 sha256：
+它解决的是另一半：**同一视频 + 同一提问 + 同一模型/prompt 的重复投递**
+（同一个文件被两个人转发、失败重试、同一段视频再发一次）。这类投递**以前每次都要
+重付一次上传 + 推理**（实测 60-120 秒、7-9s/MB 上行），**现在只付一次**
+（第 2 次起服务端 `POST` 增量为 0）。
+
+**API 计数证据**（服务端在本机 `http.server` 上自己数的 `POST` 次数，不是插件自报；
+装配与 `tests/test_vision_cache.py` 相同：真 httpx + 真端点 + 真 ffmpeg + 真钩子）：
+
+| 投递 | 变化维度 | 服务端 `POST` 增量 | 缓存条目 | 命中次数 | 注入文本里的服务端序号 |
+|---|---|---|---|---|---|
+| 第 1 次 | 视频 A + 提问 A | **+1** | 1 | 0 | `STUB#1` |
+| 第 2 次 | **完全相同** | **+0** | 1 | 1 | 仍是 `STUB#1` |
+| 第 3 次 | 提问 A → B | **+1** | 2 | 1 | `STUB#2` |
+| 第 4 次 | 回到提问 A | **+0** | 2 | 2 | 仍是 `STUB#1` |
+| `/videotest` 第 1 次 | 同一文件 | **+1** | 2（不变） | 2（不变） | `STUB#3` |
+| `/videotest` 第 2 次 | **完全相同** | **+1** | 2（不变） | 2（不变） | `STUB#4` |
+
+key 是六个维度的 sha256：
 
 ```
 v1 | 实际发送字节的哈希 | 最终 prompt | 协议 | 端点 URL | 模型 | max_tokens
@@ -273,17 +292,43 @@ v1 | 实际发送字节的哈希 | 最终 prompt | 协议 | 端点 URL | 模型 
 - 命中时**不调用**视觉服务，注入文本仍走原来的包装（视频名/模型名用本次的），
   日志单独打一条 `视觉缓存命中（TTL 剩 Xs）` —— 命中时 `elapsed/token` 记 0，
   不会伪装成"接口变快了"。
-- **`/videotest` 绕过缓存**：诊断必须真实调用（那条路径直接调 `analyze_video`）。
+- **`/videotest` 绕过缓存**：诊断必须反映真实链路，那条路径直接调 `analyze_video`。
+  实测同一文件连跑两次诊断 = **两次真实 `POST`**（上表 `+1 / +1`），报告在时间数字
+  归一化后逐字节相同。**`/videotest` 不是受益场景**：它既不会写缓存，也不会因为
+  前一条真实消息刚缓存过而少调一次。
 - `vision_cache_enabled=false` → **完全不建缓存对象**、`content_key` 也不算，
-  行为逐字节回到 0.2.1。
+  注入决策与既有日志行为与 0.2.1 等价（唯一例外见下节）。
 
-### 两条开关 = 逐字节回到 0.2.1
+### 三条开关 = 回到 0.2.1
 
 | 开关 | 关掉之后 |
 |---|---|
 | `ffmpeg_max_concurrency = 0` | 不建令牌队列、不加任何等待、日志零新增 |
 | `ffmpeg_singleflight = false` | 压缩块不经过 flight，两个线程各压一次 |
 | `vision_cache_enabled = false` | 不建缓存对象、不算 `content_key`、钩子不查不写 |
+
+外加 TTL / 条目数 / 排队上限等参数项（`vision_cache_ttl_sec`、
+`vision_cache_max_entries`、`ffmpeg_queue_timeout_sec`）—— 它们只在对应开关打开时
+才被读取，关掉开关后不产生任何行为。
+
+**三条全关之后到底等价到什么程度（按实测写，不写"逐字节"）**：
+**注入决策与既有日志行为等价** —— 9 个素材 × 11 组配置的 198 条 `prepare_video`、
+5 个素材 × 4 组配置的 40 份 `/videotest` 报告、3 次钩子端到端（共 **241 条观测**）
+与 0.2.1（`c00f6a2`）逐字段比较 **0 差异**：`data_uri` 长度与全字节 sha256、
+`action`、`size_mb`、`duration_sec`、`note`、`used_path` 的类别全部相同，
+报告文本在时间数字归一化后相同，日志零新增；同树复跑对照同样 0 差异。
+**唯一的例外**是当旧键 `max_compress_seconds` 与队列超时预算冲突时新增的预算告警：
+
+```
+ffmpeg_queue_timeout_sec(30s)+max_compress_seconds(60s) 已吃掉视觉服务超时预算(openai_timeout_sec=180s) 的一半以上，建议调小其中一项（排队上限或压缩上限）
+```
+
+它是 0.3.0 `VideoConfig.normalized()` 新加的（`core/config.py`），**与这三个开关
+无关**：三开关全关 + `max_compress_seconds=45`（0.2.1 默认）= 0 差异；把它改成 60
+（仍是合法的 0.2.1 旧键值）就多这条告警 —— 启动日志多一条 `WARNING … 配置已自动修正`
+且 `/videotest` 多一行 `配置修正:`。这条告警只在
+`ffmpeg_queue_timeout_sec + max_compress_seconds >= openai_timeout_sec × 0.5`
+且 `provider_mode` 实际为 `openai_compat` 时出现。
 
 `LimiterStats`（等待次数 / 总等待 / 最大等待 / 超时次数 / 峰值并发）与
 `VisionCacheStats`（命中 / 未命中 / 写入 / 淘汰 / 过期）**只从 `debug_log` 的

@@ -329,6 +329,58 @@ def test_changelog_030_explains_the_vision_cache():
         assert needle in section, needle
 
 
+# ------------------------------------- 0.3.0 文档诚实（VERIFY-B P2-1 / P2-2 / P3）
+
+
+def test_readme_cache_benefit_matches_the_measured_posts():
+    """缓存收益只能写成「同一视频 + 同一提问 + 同一模型/prompt 的重复投递」。
+
+    VERIFY-B P2-1：0.3.0 的 README 把收益写反（「现在会各花一次」），并且把
+    ``/videotest`` 当成受益场景 —— 而它**绕过**缓存（§2.6 实测两次都真 POST）。
+    """
+    assert "现在会各花一次" not in README
+    assert "现在只付一次" in README
+    # 受益条件写全（视频字节 + 提问 + 模型/prompt 三个维度）
+    assert "同一视频+同一提问+同一模型/prompt" in squash(README)
+    # /videotest 不是受益场景，必须显式写清
+    assert "不是受益场景" in README
+    # API 计数证据必须在正文里（不能只有「会变快」这类形容词）
+    assert "服务端 `POST` 增量" in README
+    assert "+1" in README and "+0" in README
+
+
+def test_equivalence_claim_is_scoped_and_names_the_budget_warning_exception():
+    """VERIFY-B P2-2：三开关全关 ⇏ 逐字节等价；唯一例外是那条预算告警。
+
+    实测（探针见交付记录）：三开关全关 + 0.2.1 旧键 ``max_compress_seconds=45``
+    → 0 差异；改成 60 时 ``normalized()`` 多一条预算告警（启动 WARNING +
+    ``/videotest`` 的 ``配置修正:`` 行）。告警与三个开关无关。
+    """
+    for text, name in ((README, "README"), (CHANGELOG, "CHANGELOG")):
+        flat = squash(text)
+        assert "逐字节回到 0.2.1" not in flat, name
+        assert "逐字节行为" not in flat, name
+        assert "注入决策与既有日志行为等价" in flat, name
+        assert "唯一的例外" in flat, name
+        assert "预算告警" in flat, name
+        assert "max_compress_seconds" in flat, name
+
+
+def test_readme_says_three_switches_not_two():
+    """README 标题写「两条开关」而表里是三行（VERIFY-B P3-1）。"""
+    assert "两条开关" not in README
+    assert "三条开关" in README
+    assert "三条开关" in CHANGELOG
+
+
+def test_vision_cache_is_documented_as_openai_compat_only():
+    """VERIFY-B P3-2：``gemini_native`` 不产生文本结果，缓存既不查也不写。"""
+    cache_section = README.split("### 视觉理解结果缓存", 1)[1].split("### ", 1)[0]
+    assert "只在`openai_compat`生效" in squash(cache_section)
+    assert "gemini_native" in cache_section
+    assert "只在 `openai_compat` 生效" in CHANGELOG
+
+
 def test_metadata_yaml_has_the_required_fields():
     """``@register`` 删掉之后，``metadata.yaml`` 是**唯一**的身份来源。
 

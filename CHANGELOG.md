@@ -5,9 +5,17 @@
 新增 **6 个配置项**与三处变化（ffmpeg 并发限流 + 同一文件并发只转码一次；
 视觉理解结果的 TTL+LRU 缓存；删掉废弃的 `@register`）。
 
-**三条开关都默认保守、且都能单独退回 0.2.1 的逐字节行为**：
-`ffmpeg_max_concurrency=0`（不限流）、`ffmpeg_singleflight=false`（不共享转码）、
-`vision_cache_enabled=false`（不建视觉缓存对象）。
+**三条开关都默认保守**：`ffmpeg_max_concurrency=0`（不限流）、
+`ffmpeg_singleflight=false`（不共享转码）、`vision_cache_enabled=false`
+（不建视觉缓存对象）。三条都关、其余键也用 0.2.1 的原值时，**注入决策与既有
+日志行为等价**：9 个素材 × 11 组配置的 198 条 `prepare_video` + 40 份
+`/videotest` 报告 + 3 次钩子端到端（共 241 条观测）与 0.2.1（`c00f6a2`）逐字段
+比较 **0 差异**。**唯一的例外**是与这三个开关无关的一条新告警：旧键
+`max_compress_seconds` 与 `ffmpeg_queue_timeout_sec` 的预算冲突时
+（`30 + 60 >= openai_timeout_sec / 2`），`VideoConfig.normalized()` 会多一条
+**预算告警**（启动 WARNING + `/videotest` 的 `配置修正:` 行）；0.2.1 的默认
+`max_compress_seconds=45` 不触发。下面的措辞因此一律写「注入决策与既有日志行为
+等价」，不写「逐字节等价」。
 三条各有专门用例（`tests/test_limits.py` / `tests/test_injector.py` /
 `tests/test_hooks.py` / `tests/test_vision_cache.py`）。
 
@@ -65,7 +73,9 @@
   `SINGLEFLIGHT` 的登记表在 `finally` 里只摘自己那条 flight，不会误删后来者。
 - 新增 `ffmpeg_queue_timeout_sec`（默认 30s）与一条 `normalized()` 告警：本地
   `排队 + 压缩` 吃掉 `openai_timeout_sec` 一半以上时显式提示 —— 因为视觉服务超时
-  只管上传+推理，本地这两段发生在它之前（最坏情况会顶穿它）。
+  只管上传+推理，本地这两段发生在它之前（最坏情况会顶穿它）。**它就是开头那条
+  「唯一的例外」**：不属于三个开关中的任何一个，三开关全关时只要旧配置的
+  `max_compress_seconds` 够大（60）仍然会出现。
 
 ### 2. 视觉理解结果缓存：`vision_cache_enabled` / `vision_cache_ttl_sec` / `vision_cache_max_entries`
 
@@ -73,8 +83,13 @@
   **不成立** —— 追问时如果不重发/不引用视频，插件的钩子**根本不运行**（历史里既没有
   视频占位符，注入的分析也是 `mark_as_temp()`、落库时被丢弃）；而追问时重新引用视频，
   通常**换了提问**，那时**本来就该**重新调用（命中才是 bug：用 A 问的答案回答 B 问）。
-- 成立的是另一半：**完全相同的重复投递**（同一个文件被两个人转发、失败重试、同一段
-  视频再发一次）。以前每次都要重付一次 60-120 秒的上传 + 推理，现在只付一次。
+- 成立的是另一半：**同一视频 + 同一提问 + 同一模型/prompt 的重复投递**（同一个文件
+  被两个人转发、失败重试、同一段视频再发一次）。以前每次都要重付一次 60-120 秒的
+  上传 + 推理，现在只付一次：实测（本机计数端点、真 httpx）第一次 `POST` 增量 +1，
+  完全相同的第二次 **+0**（注入的分析原文与首投相同）。
+- **`/videotest` 绕过缓存，不是受益场景**：诊断必须反映真实链路，同一文件连跑两次
+  = **两次真实 `POST`**（+1 / +1），两次回复来自两次不同的服务端回答；缓存条目在
+  诊断前后原样保留（不读、不写）。
 - key = 六个维度的 sha256：**实际发送字节的哈希**（新增
   `VideoInjection.content_key`：直通 `as-is:<源文件哈希>`、压缩
   `<action>:<产物哈希>`）+ **最终 prompt**（`build_vision_prompt()` 的输出，已折叠
@@ -90,9 +105,12 @@
   不落盘、不跨进程。
 - 命中时**不调用**视觉服务，注入仍走原来的包装（视频名/模型名用本次的），日志单独打
   一条 `视觉缓存命中（TTL 剩 Xs）`；命中结果的 `elapsed/token` 记 0，**不伪装**成
-  一次真实调用。`/videotest` **绕过**缓存（诊断必须真实调用）。
-- `vision_cache_enabled=false` → **完全不建缓存对象**、`content_key` 也不计算，
-  行为逐字节回到 0.2.1。
+  一次真实调用。
+- **只在 `openai_compat` 生效**：`gemini_native` 把视频作为原生模态交给主 provider，
+  不产生可缓存的文本理解结果；该模式下缓存对象会建出来，但一次都不查不写（实测投递
+  后 `hits/misses/stores` 全 0、条目数 0）。
+- `vision_cache_enabled=false` → **完全不建缓存对象**、`content_key` 也不计算、
+  钩子不查不写：注入决策与既有日志行为与 0.2.1 等价（唯一例外见开头）。
 - 新增模块 `core/vision_cache.py`（纯标准库、零 AstrBot 依赖）。
 
 ### 3. 删掉废弃的 `@register`
