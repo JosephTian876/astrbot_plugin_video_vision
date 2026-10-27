@@ -454,14 +454,17 @@ class VideoVisionPlugin(Star):
         try:
             # 计时起点在**取槽之前**：报告里的"准备成功（X s）"必须包含排队时间，
             # 否则高峰期会出现"报告 1.8s、用户实际等了 12s"的静默谎言。
-            async with slots.slot(name=os.path.basename(target)):
-                outcome = await asyncio.to_thread(
-                    prepare_video,
-                    VideoPlaceholder(name=os.path.basename(target), path=target),
-                    config=cfg,
-                    cache_root=self.cache_root,
-                    logger=logger,
-                    debug=cfg.debug_log,
+            # 还槽绑定到 worker **真正**结束（同 hooks：取消不许提前还槽）。
+            async with slots.slot(name=os.path.basename(target)) as slot:
+                outcome = await slot.wait_for_worker(
+                    asyncio.to_thread(
+                        prepare_video,
+                        VideoPlaceholder(name=os.path.basename(target), path=target),
+                        config=cfg,
+                        cache_root=self.cache_root,
+                        logger=logger,
+                        debug=cfg.debug_log,
+                    )
                 )
         except QueueTimeout as exc:
             outcome = PrepareOutcome(

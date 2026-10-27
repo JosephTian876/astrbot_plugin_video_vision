@@ -528,11 +528,15 @@ class _RecordingLimiter:
         class _Slot:
             async def __aenter__(self):
                 recorder.entered += 1
-                return None
+                return self
 
             async def __aexit__(self, *exc):
                 recorder.exited += 1
                 return False
+
+            async def wait_for_worker(self, worker):
+                # 与真 ``_Slot`` 的同名方法同义：等 worker（替身不模拟取消）
+                return await worker
 
         return _Slot()
 

@@ -304,14 +304,18 @@ async def build_video_blocks(
         try:
             # 槽位只包住**这一次** prepare（不许嵌套取槽）；等待全部在事件
             # 循环侧，worker 线程里没有任何 Semaphore。
-            async with slots.slot(name=placeholder.name):
-                outcome = await asyncio.to_thread(
-                    prepare_video,
-                    placeholder,
-                    config=config,
-                    cache_root=cache_root,
-                    logger=logger,
-                    debug=config.debug_log,
+            # 还槽绑定到 worker **真正**结束：外层被取消时 ffmpeg 线程还在跑，
+            # 当场还槽会让真实并发 > limit（VERIFY-A P2-1）。
+            async with slots.slot(name=placeholder.name) as slot:
+                outcome = await slot.wait_for_worker(
+                    asyncio.to_thread(
+                        prepare_video,
+                        placeholder,
+                        config=config,
+                        cache_root=cache_root,
+                        logger=logger,
+                        debug=config.debug_log,
+                    )
                 )
         except QueueTimeout as exc:
             # 排队超时是**独立的失败分类**：不复用 timeout（那句会把用户引向

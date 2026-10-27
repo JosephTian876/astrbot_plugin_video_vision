@@ -35,7 +35,7 @@ import threading
 import time
 from collections.abc import Hashable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 #: leader 的失败里，这些是**确定性**的：重试只会把同一个 `max_compress_seconds`
 #: 超时乘以 N，follower 必须原样承接失败（立即返回，不浪费时间）。
@@ -267,23 +267,63 @@ class SlotLimiter:
 class _Slot:
     """``SlotLimiter.slot()`` 的返回值：保证进出成对。"""
 
-    __slots__ = ("_held", "_limiter", "_name")
+    __slots__ = ("_handed_off", "_held", "_limiter", "_name")
 
     def __init__(self, limiter: SlotLimiter, name: str) -> None:
         self._limiter = limiter
         self._name = name
         self._held = False
+        #: 还槽已移交给 worker 的完成回调（见 :meth:`wait_for_worker`）
+        self._handed_off = False
 
-    async def __aenter__(self) -> None:
+    async def __aenter__(self) -> _Slot:
         await self._limiter._acquire(self._name)
         self._held = True
-        return None
+        return self
 
     async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
-        if self._held:
+        if self._held and not self._handed_off:
             self._held = False
             self._limiter._release()
         return False
+
+    async def wait_for_worker(self, worker: Awaitable[Any]) -> Any:
+        """等 worker 结束；本任务被取消时，槽位**留在 worker 手里**。
+
+        ``asyncio.to_thread`` 的线程不可取消：协程被 cancel 时 ``__aexit__``
+        会当场还令牌，而 ffmpeg 子进程还在跑（最长 ``max_compress_seconds``），
+        真实并发于是可以越过 ``limit``（VERIFY-A P2-1：``limit=1`` 实测峰值 2）。
+
+        所以取消路径把还槽移交给 worker 的 done-callback —— 它在事件循环线程里
+        于 worker 真正结束（成功/失败/异常）之后**恰好**执行一次：既不会提前还，
+        也不会漏还。``__aexit__`` 看到 ``_handed_off`` 就不再还第二次。
+        （一个槽位只对应一个 worker：同一个 ``async with`` 里别调两次。）
+
+        ``limit=0``（关闭限流）时直接 ``await``：不建 task、不 shield，
+        与 0.2.1 逐字节等价。
+        """
+        if not self._limiter.enabled:
+            return await worker
+        task = asyncio.ensure_future(worker)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            self._hand_off(task)
+            raise
+
+    def _hand_off(self, task: asyncio.Future[Any]) -> None:
+        """把还槽移交给 ``task`` 的完成回调（幂等：只移交一次）。"""
+        if self._handed_off or not self._held:
+            return
+        self._handed_off = True
+        task.add_done_callback(self._release_after_worker)
+
+    def _release_after_worker(self, task: asyncio.Future[Any]) -> None:
+        """worker 真正结束时还槽（done-callback 跑在事件循环线程里）。"""
+        if not task.cancelled():
+            task.exception()  # 取走异常：已经没人 await 它，别让 asyncio 报噪音
+        self._held = False
+        self._limiter._release()
 
 
 @dataclass
