@@ -576,6 +576,9 @@ def test_render_report_takes_no_event():
         "outcome",
         "elapsed_sec",
         "vision",
+        # 0.3.0 P3-3：限流排队摘要（纯字符串；空串 = 不渲染）。加参数必须在这里
+        # 显式登记 —— 这个集合的作用是"渲染层只收纯数据"，不是冻结 API。
+        "queue_summary",
         "uri_limit_mb",
         "uri_raw_limit_mb",
     }

@@ -120,7 +120,7 @@ Responses API（`/responses`）同样实测支持：视频用 `input_image` + da
 | `vision_cache_enabled` | `true` | 视觉理解结果缓存。**只在 `openai_compat` 生效**（`gemini_native` 不查不写），**只对完全相同的重复投递命中**（视频字节 + 最终 prompt + 端点 + 模型 + max_tokens），纯内存、重启即失效 |
 | `vision_cache_ttl_sec` | `600.0` | 条目存活时长（60-86400）。命中**不**续期 |
 | `vision_cache_max_entries` | `64` | 条目上限（1-1024），超出按 LRU 淘汰；64 条约 1MB |
-| `debug_log` | `false` | 详细调试日志（限流/缓存的计数也只在这个级别可见） |
+| `debug_log` | `false` | 详细调试日志（缓存计数只在这个级别可见；限流摘要在 `/videotest` 真的排过队时也会多一行） |
 
 ### 两个体积旋钮怎么配合
 
@@ -222,6 +222,11 @@ async with limiter.slot(name=name):
 `to_thread(prepare_video)` 都在槽内"，并专门测了取消/超时**不吞令牌**
 （槽位永久 -1 会让全站慢慢卡死）。
 
+- 排队 INFO 与超时 WARNING 都带 **视频名**（`slot(name=…)` → `视频=a.mp4`），
+  线上能直接定位"是哪条视频排了 28 秒"；不带名字时不留空尾巴。
+- **小于 1 秒一律渲染成毫秒**（`10ms` / `900ms`）：`ffmpeg_queue_timeout_sec=0.01`
+  的文案不会再写成「排队等待转码超过 0s」，`/videotest` 里同一句话也走同一个格式化函数。
+
 ### 同一文件并发只转码一次（`ffmpeg_singleflight`）
 
 两个群同时发**同一段视频**时，0.2.1 会各压一次（实测 2 次 `ffmpeg`、6 次
@@ -265,6 +270,7 @@ async with limiter.slot(name=name):
 | 第 4 次 | 回到提问 A | **+0** | 2 | 2 | 仍是 `STUB#1` |
 | `/videotest` 第 1 次 | 同一文件 | **+1** | 2（不变） | 2（不变） | `STUB#3` |
 | `/videotest` 第 2 次 | **完全相同** | **+1** | 2（不变） | 2（不变） | `STUB#4` |
+| 4 路**并发**完全相同 | 同时发起 | **+1**（其余 3 路等 leader 的结果） | 1 | 0 | 全是 `STUB#1` |
 
 key 是六个维度的 sha256：
 
@@ -290,12 +296,17 @@ v1 | 实际发送字节的哈希 | 最终 prompt | 协议 | 端点 URL | 模型 
 - **TTL 600s，命中不续期**；**LRU 64 条**（约 1MB 常驻）。纯内存、重启即失效、
   不跨进程。
 - 命中时**不调用**视觉服务，注入文本仍走原来的包装（视频名/模型名用本次的），
-  日志单独打一条 `视觉缓存命中（TTL 剩 Xs）` —— 命中时 `elapsed/token` 记 0，
-  不会伪装成"接口变快了"。
+  日志单独打一条 `视觉缓存命中（TTL 剩 Xs）`（剩余 <1s 时是毫秒，如 `400ms`）——
+  命中时 `elapsed/token` 记 0，不会伪装成"接口变快了"。
 - **`/videotest` 绕过缓存**：诊断必须反映真实链路，那条路径直接调 `analyze_video`。
   实测同一文件连跑两次诊断 = **两次真实 `POST`**（上表 `+1 / +1`），报告在时间数字
   归一化后逐字节相同。**`/videotest` 不是受益场景**：它既不会写缓存，也不会因为
   前一条真实消息刚缓存过而少调一次。
+- **同一 key 的并发投递只发一次请求**（P2-3）：4 路同时发同一视频 = **1 次真实
+  `POST`**，其余 3 路等 leader 的结果（上表最后一行）。leader 失败时失败结果同样共享，
+  但**不写缓存** —— 下一次投递会重新请求。它是"并发去重"，与串行命中是两条路径：
+  前者不产生缓存条目、后者靠 TTL；`vision_cache_enabled=false` 时**两者都没有**。
+- 命中日志里的剩余 TTL **小于 1 秒时按毫秒打印**（`TTL 剩 400ms`），不会出现「TTL 剩 0s」。
 - `vision_cache_enabled=false` → **完全不建缓存对象**、`content_key` 也不算，
   注入决策与既有日志行为与 0.2.1 等价（唯一例外见下节）。
 
@@ -330,9 +341,11 @@ ffmpeg_queue_timeout_sec(30s)+max_compress_seconds(60s) 已吃掉视觉服务超
 `ffmpeg_queue_timeout_sec + max_compress_seconds >= openai_timeout_sec × 0.5`
 且 `provider_mode` 实际为 `openai_compat` 时出现。
 
-`LimiterStats`（等待次数 / 总等待 / 最大等待 / 超时次数 / 峰值并发）与
-`VisionCacheStats`（命中 / 未命中 / 写入 / 淘汰 / 过期）**只从 `debug_log` 的
-日志里看得到** —— `/videotest` 的报告格式被测试锁死，本轮刻意不往里加新行。
+`LimiterStats`（等待次数 / 最长等待 / 超时次数）与 `VisionCacheStats`（命中 /
+未命中 / 写入 / 淘汰 / 过期）在 `debug_log=true` 时逐次写进日志。`/videotest` 只在
+**真的排过队或被排队超时拒过**时多一行 `排队   :` 摘要（例如
+`排队 3 次，最长 12.3s，累计 20.0s，超时 1 次`）；正常路径的报告格式**一字不变**
+（`LimiterStats.summary()` 为空串就不渲染）。
 
 ---
 

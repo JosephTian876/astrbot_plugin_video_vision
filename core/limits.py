@@ -52,6 +52,37 @@ QUEUE_LOG_THRESHOLD_SEC = 1.0
 _TOKEN = object()
 
 
+def _name_suffix(name: str) -> str:
+    """日志里的视频名后缀（空名不打印，避免尾巴上挂一个空括号）。"""
+    text = (name or "").strip()
+    return f"，视频={text}" if text else ""
+
+
+def format_seconds(value: float) -> str:
+    """把秒数渲染成人读文本 —— 小于 1 秒时**绝不**写成「0s」。
+
+    ``%.0f`` 会把 ``queue_timeout=0.01`` 渲染成「排队等待转码超过 0s」，把还剩
+    0.9s 的 TTL 渲染成「TTL 剩 0s」（VERIFY-A P3-2 / VERIFY-B P3）。两处都在说
+    "没有等待"和"马上过期"，而实际是"等了 10 毫秒""还剩 900 毫秒"。所以：
+    ``>=60s`` 整数秒、``>=1s`` 一位小数、``>0s`` 毫秒（至少 1ms），只有 0 才是
+    ``0s``。
+
+    Args:
+        value: 秒数（负数按 0 处理）。
+
+    Returns:
+        ``"600s"`` / ``"30.0s"`` / ``"2.5s"`` / ``"900ms"`` / ``"1ms"`` / ``"0s"``。
+    """
+    seconds = max(0.0, float(value))
+    if seconds >= 60.0:
+        return f"{seconds:.0f}s"
+    if seconds >= 1.0:
+        return f"{seconds:.1f}s"
+    if seconds > 0.0:
+        return f"{max(1.0, seconds * 1000.0):.0f}ms"
+    return "0s"
+
+
 class QueueTimeout(Exception):
     """等待 ffmpeg 槽位超时 —— **不是** ffmpeg 自己超时。
 
@@ -64,14 +95,21 @@ class QueueTimeout(Exception):
         self.timeout = timeout
         self.limit = limit
         self.ahead = ahead
+        #: 超时预算的人读文本（``"30s"`` / ``"10ms"``）：文案只有这一份真相，
+        #: 钩子与 ``/videotest`` 都走 :meth:`short_reason`，不各写一遍格式串。
+        self.timeout_text = format_seconds(timeout)
         super().__init__(
-            f"排队等待转码超过 {timeout:.0f}s（limit={limit}，前方 {ahead} 个）"
+            f"排队等待转码超过 {self.timeout_text}（limit={limit}，前方 {ahead} 个）"
         )
+
+    def short_reason(self) -> str:
+        """注入给模型 / ``/videotest`` 的短原因（不含「前方 N 个」这类现场细节）。"""
+        return f"排队等待转码超过 {self.timeout_text}（limit={self.limit}）"
 
 
 @dataclass
 class LimiterStats:
-    """限流器的可观测计数（只用于 DEBUG 日志与单测，不进 ``/videotest``）。"""
+    """限流器的可观测计数（DEBUG 日志 + ``/videotest`` 的一行摘要）。"""
 
     #: 真的排过队的次数（立即拿到槽不计）
     waits: int = 0
@@ -79,6 +117,23 @@ class LimiterStats:
     max_wait_sec: float = 0.0
     timeouts: int = 0
     peak_inflight: int = 0
+
+    def summary(self) -> str:
+        """``/videotest`` 里的那一行摘要；**没有任何排队/超时**时返回空串。
+
+        正常路径不新增任何行（报告格式保持原样），只有运维真的需要看的时候
+        （有人在排队、或有人被排队超时拒掉）才多一行。
+        """
+        if self.waits <= 0 and self.timeouts <= 0:
+            return ""
+        parts = [
+            f"排队 {self.waits} 次",
+            f"最长 {format_seconds(self.max_wait_sec)}",
+            f"累计 {format_seconds(self.waited_sec_total)}",
+        ]
+        if self.timeouts:
+            parts.append(f"超时 {self.timeouts} 次")
+        return "，".join(parts)
 
 
 class SlotLimiter:
@@ -154,7 +209,7 @@ class SlotLimiter:
             ahead = self._waiters
             self._waiters += 1
             try:
-                await self._await_token(queue, ahead)
+                await self._await_token(queue, ahead, name)
             finally:
                 self._waiters -= 1
             self.stats.waits += 1
@@ -165,7 +220,7 @@ class SlotLimiter:
             self.stats.max_wait_sec = waited
         if self._inflight > self.stats.peak_inflight:
             self.stats.peak_inflight = self._inflight
-        self._log_acquisition(waited, ahead)
+        self._log_acquisition(waited, ahead, name)
 
     def _release(self) -> None:
         if self._inflight > 0:
@@ -199,7 +254,9 @@ class SlotLimiter:
             self._waiters = 0
             return queue
 
-    async def _await_token(self, queue: asyncio.Queue[Any], ahead: int) -> None:
+    async def _await_token(
+        self, queue: asyncio.Queue[Any], ahead: int, name: str = ""
+    ) -> None:
         """等一个令牌；超时抛 :class:`QueueTimeout`，取消时令牌不丢。"""
         started = self._clock()
         getter = asyncio.ensure_future(queue.get())
@@ -214,9 +271,10 @@ class SlotLimiter:
             waited = self._clock() - started
             if self._logger is not None:
                 self._logger.warning(
-                    "[VideoVision] ffmpeg 排队超时（%.0fs，limit=%d），本视频跳过",
-                    self.queue_timeout,
+                    "[VideoVision] ffmpeg 排队超时（%s，limit=%d），本视频跳过%s",
+                    format_seconds(self.queue_timeout),
                     self.limit,
+                    _name_suffix(name),
                 )
             raise QueueTimeout(
                 waited=waited,
@@ -244,23 +302,29 @@ class SlotLimiter:
         except Exception:  # noqa: BLE001 - 兜底：任何异常都不能掩盖真正的超时
             pass
 
-    def _log_acquisition(self, waited: float, ahead: int) -> None:
+    def _log_acquisition(self, waited: float, ahead: int, name: str = "") -> None:
+        """排队日志：**带上视频名** —— 否则线上无法判断是哪条视频排了 28 秒。
+
+        ``slot(name=…)`` 一路传到这里，是这条日志唯一的定位信息（VERIFY-A P3-1）。
+        """
         log = self._logger
         if log is None:
             return
         if waited >= QUEUE_LOG_THRESHOLD_SEC:
             log.info(
-                "[VideoVision] ffmpeg 排队 %.1fs（limit=%d，前方 %d 个）",
+                "[VideoVision] ffmpeg 排队 %.1fs（limit=%d，前方 %d 个）%s",
                 waited,
                 self.limit,
                 ahead,
+                _name_suffix(name),
             )
         elif self._debug:
             # 措辞必须诚实：等了 0.3s 不是"立即获取"（只在 <1.0s 时走到这里）
             log.debug(
-                "[VideoVision][debug] ffmpeg 槽位获取（等待 %.2fs，inflight=%d）",
+                "[VideoVision][debug] ffmpeg 槽位获取（等待 %.2fs，inflight=%d）%s",
                 waited,
                 self._inflight,
+                _name_suffix(name),
             )
 
 
@@ -450,6 +514,7 @@ __all__ = [
     "SingleFlight",
     "SlotLimiter",
     "failure_kind",
+    "format_seconds",
 ]
 
 

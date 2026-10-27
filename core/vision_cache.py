@@ -77,18 +77,11 @@ class _Flight:
 class VisionFlights:
     """同 key 的并发视觉请求只跑一次（asyncio 级 singleflight，fail-open）。
 
-    :class:`VisionCache` 只挡得住**先后**发生的重复投递；两个群**同时**发同一段
-    视频时，两边都查不到缓存、各发一次 60-120s 的上传 + 推理（VERIFY-B P2-3：
-    4 并发相同投递 = 4 次 POST）。这里让后到的调用等 leader，共享同一个结果。
-
-    契约：leader 成功 → 等待者拿到同一个分析文本（不再发 HTTP）；leader 抛异常
-    → 同一个异常向所有等待者传播（调用方据此不写缓存）；leader 被取消 → 等待者
-    自己接管（不把别人的取消传染给用户）；空 key → 直接 ``await work()``
-    （fail-open，绝不挡住请求）。
-
-    与 ``core.limits.SingleFlight`` 的区别：那个是**线程**版（给 ffmpeg 用），
-    等的是 ``threading.Event``；这里等的是协程，必须用 ``asyncio.Event`` ——
-    在事件循环线程里阻塞等会卡死整个 AstrBot。
+    :class:`VisionCache` 只挡得住**先后**的重复投递；同一时刻的重复投递会各发一次
+    HTTP（VERIFY-B P2-3：4 并发 = 4 次 POST）。契约：leader 成功 → 等待者共享同一
+    结果；leader 抛异常 → 同一个异常向等待者传播（调用方据此不写缓存）；leader 被
+    取消 → 等待者自己接管；空 key → 直接跑。与 ``core.limits.SingleFlight`` 的区别：
+    那个是线程版（``threading.Event``，给 ffmpeg 用），这里必须用 ``asyncio.Event``。
     """
 
     def __init__(self) -> None:
@@ -97,7 +90,7 @@ class VisionFlights:
 
     @property
     def pending(self) -> int:
-        """在飞的 flight 数（正常情况下任何时刻之后都必须回到 0）。"""
+        """在飞的 flight 数（结束后必须回到 0）。"""
         with self._lock:
             return len(self._flights)
 
@@ -133,22 +126,14 @@ class VisionFlights:
         return value
 
     def _settle(
-        self,
-        key: str,
-        flight: _Flight,
-        *,
-        value: Any = _MISSING,
-        error: BaseException | None = None,
+        self, key: str, flight: _Flight, *, value: Any = _MISSING, error=None
     ) -> None:
         """登记结果并唤醒等待者（只摘自己那条 flight）。"""
         flight.value, flight.error = value, error
-        self._retire(key, flight)
-        flight.event.set()
-
-    def _retire(self, key: str, flight: _Flight) -> None:
         with self._lock:
             if self._flights.get(key) is flight:
                 del self._flights[key]
+        flight.event.set()
 
 
 def cache_key(

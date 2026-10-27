@@ -46,7 +46,7 @@ from .core import diagnostics
 from .core.config import VideoConfig
 from .core.decide import classify
 from .core.injector import PrepareOutcome, prepare_video
-from .core.limits import NULL_LIMITER, QueueTimeout, SlotLimiter
+from .core.limits import NULL_LIMITER, QueueTimeout, SlotLimiter, format_seconds
 from .core.media import (
     file_size_mb,
     probe_duration,
@@ -148,10 +148,10 @@ class VideoVisionPlugin(Star):
         )
         if self.limiter is not None:
             logger.info(
-                "[VideoVision] ffmpeg 并发上限=%d，排队上限=%.0fs"
+                "[VideoVision] ffmpeg 并发上限=%d，排队上限=%s"
                 "（原先的上限只是默认线程池的 min(32, cpu+4)）",
                 self.limiter.limit,
-                self.limiter.queue_timeout,
+                format_seconds(self.limiter.queue_timeout),
             )
 
         #: ``ffmpeg_singleflight=true`` 但没有压缩缓存 = 自相矛盾：没有可共享的
@@ -188,12 +188,23 @@ class VideoVisionPlugin(Star):
                 ttl_sec=self.config.vision_cache_ttl_sec,
                 max_entries=self.config.vision_cache_max_entries,
             )
-            logger.info(
-                "[VideoVision] 视觉结果缓存已启用：TTL=%.0fs，最多 %d 条"
-                "（纯内存、重启即失效；只对完全相同的重复投递命中）",
-                self.vision_cache.ttl_sec,
-                self.vision_cache.max_entries,
-            )
+            # 文案必须诚实：gemini_native 走「视频块交给主 provider 亲眼看」，
+            # 根本不产生可缓存的文本结果 —— 不能在这种模式下宣称"缓存已启用"
+            # （VERIFY-B P3：实测该模式投递一次后 hits/misses/stores 全 0）。
+            if self.config.effective_provider_mode == "openai_compat":
+                logger.info(
+                    "[VideoVision] 视觉结果缓存已启用：TTL=%s，最多 %d 条"
+                    "（纯内存、重启即失效；只对完全相同的重复投递命中，"
+                    "同一 key 的并发投递只发一次请求）",
+                    format_seconds(self.vision_cache.ttl_sec),
+                    self.vision_cache.max_entries,
+                )
+            else:
+                logger.info(
+                    "[VideoVision] 视觉结果缓存已配置，但当前模式=%s 不使用它"
+                    "（仅 openai_compat 生效：gemini_native 没有文本结果可缓存）",
+                    self.config.effective_provider_mode,
+                )
 
         # 启动日志的**文本**在 diagnostics（纯函数，可单测），按级别打出去与
         # 下面的状态变更留在这里。
@@ -469,7 +480,8 @@ class VideoVisionPlugin(Star):
         except QueueTimeout as exc:
             outcome = PrepareOutcome(
                 False,
-                reason=f"排队等待转码超过 {exc.timeout:.0f}s（limit={exc.limit}）",
+                # 同 hooks：文案走 ``QueueTimeout.short_reason``，不各写一份格式串
+                reason=exc.short_reason(),
                 kind="busy",
             )
         elapsed = time.monotonic() - started
@@ -488,6 +500,11 @@ class VideoVisionPlugin(Star):
                 )
             )
 
+        limiter_stats = getattr(self.limiter, "stats", None)
+        queue_summary = (
+            limiter_stats.summary() if limiter_stats is not None else ""
+        )
+
         return diagnostics.render_report(
             cfg=cfg,
             mode=mode,
@@ -499,6 +516,10 @@ class VideoVisionPlugin(Star):
             outcome=outcome,
             elapsed_sec=elapsed,
             vision=vision,
+            # 有排队/超时才多一行（``LimiterStats.summary()`` 为空串 = 不渲染）。
+            # 用 getattr：限流器可能是鸭子类型的替身（测试/外部注入），没有 stats
+            # 时"没有可观测数据"= 不渲染，绝不能让诊断因此失败。
+            queue_summary=queue_summary,
         )
 
     async def _provider_facts(

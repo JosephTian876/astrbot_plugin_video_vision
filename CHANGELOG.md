@@ -61,6 +61,14 @@
   `ffmpeg_queue_timeout_sec`。`/videotest` 的「分类:」行因此多一种取值。
 - **`/videotest` 也排队**，且报告里的"准备成功（X s）"计时起点移到**取槽之前**，
   让耗时包含排队时间（高峰期不会再出现"报告 1.8s、实际等了 12s"）。
+- **排队日志带视频名**（VERIFY-A P3-1）：`slot(name=…)` 一路传进排队 INFO 与超时
+  WARNING（`视频=a.mp4`），线上能直接定位是哪条视频排了 28 秒；不带名字时不留空尾巴。
+- **小于 1 秒不再渲染成「0s」**（VERIFY-A P3-2 / VERIFY-B P3）：新增
+  `limits.format_seconds()`，`0.01s` → `10ms`、`0.9s` → `900ms`；`QueueTimeout`
+  的文案、排队超时 WARNING、缓存命中的「TTL 剩 Xs」、启动日志的排队上限全走它。
+- **`/videotest` 多一行排队摘要**（VERIFY-A P3-3）：`LimiterStats.summary()` 只在
+  **真的排过队或超时过**时非空（`排队 3 次，最长 12.3s，累计 20.0s，超时 1 次`），
+  正常路径报告格式一字不变。
 - **`ffmpeg_singleflight`（默认 true）**：同一份内容 + 同一组压缩参数的并发转码
   只做一次，键就是压缩缓存已有的那个 key（内容哈希 | compress_max_mb | crf |
   preset | truncate_to）—— 不额外读文件、不复制 `decide` 的知识。临界区同时包住
@@ -98,6 +106,12 @@
   为什么不用 `"v1|…"` 拼接：prompt 是用户文本，朴素拼接会让
   `video="a|b", prompt="c"` 与 `video="a", prompt="b|c"` 拼出同一个 key，
   所以走规范化 JSON（`tests/test_vision_cache.py::test_key_separates_field_boundaries`）。
+- **同一 key 的并发投递只发一次请求**（VERIFY-B P2-3 修复）：4 路同时发同一视频 =
+  **1 次真实 `POST`**，其余 3 路等 leader 的结果（`core/vision_cache.VisionFlights`，
+  asyncio 级 singleflight）。leader 失败时失败结果同样共享给等待者，但**不写缓存**，
+  下一次投递会重新请求；leader 被取消时等待者自己接管。实测修复前 4 并发 = 4 次
+  `POST`、修复后 = 1 次（`tests/test_vision_cache_concurrency.py`）。
+  `vision_cache_enabled=false` 时没有缓存对象，也就没有这层去重（与 0.2.1 等价）。
 - **只缓存成功且非空的分析**：失败/超时一律不写（否则一次网络抖动会被固定成 TTL 内的
   持续故障，而失败信息对模型也没有价值）。
 - TTL 默认 **600s**（60-86400），**命中不续期**（否则热门条目永不过期）；容量默认

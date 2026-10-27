@@ -5,13 +5,21 @@
 里的 ffmpeg 还在跑（最长 ``max_compress_seconds``）—— 真实并发于是可以
 > ``limit``（VERIFY-A 实测 ``limit=1`` 时峰值 2）。
 
-本文件锁住四件事：
+本文件锁住两类回归：
+
+**A. 取消语义**（P2-1）
 
 1. 取消**持有者**：取消瞬间 ``inflight`` 仍是 ``limit``，直到 worker 真的结束
    才归还；期间另一个任务的**真实并发**（在线程里独立计数）不超限；
 2. worker 以异常收场时同样恰好归还一次（不多还、不漏还）；
 3. 取消**排队等待**中的任务：令牌数不变、没有任何 worker 被启动；
 4. 连续 50 次取消后 ``inflight`` / ``available`` 回到一致状态。
+
+**B. 排队可观测性**（VERIFY-A P3-1 / P3-2 / P3-3）
+
+5. ``slot(name=…)`` 真的进排队 INFO / 超时 WARNING；
+6. ``queue_timeout`` / 缓存 TTL 小于 1 秒时渲染成毫秒，绝不出现「0s」；
+7. ``/videotest`` 只在**真的排过队或超时过**时多一行 ``排队   :`` 摘要。
 
 判定口径：``inflight + available == limit`` 是令牌守恒式；:class:`_ThreadMeter`
 在 worker 线程里计数（与限流器自己的账本**互相独立**），用来测真实并发。
@@ -29,7 +37,7 @@ import pytest
 
 from vv_plugin.core.config import VideoConfig
 from vv_plugin.core.injector import PrepareOutcome
-from vv_plugin.core.limits import SlotLimiter
+from vv_plugin.core.limits import LimiterStats, SlotLimiter, format_seconds
 from vv_plugin.hooks import llm_request as hooks
 
 REPO = Path(__file__).resolve().parents[1]
@@ -440,3 +448,224 @@ def test_every_slot_wrapped_worker_is_awaited_through_wait_for_worker():
                 )
     assert checked == 2, f"预期 2 个生产调用点（hooks + /videotest），找到 {checked} 个"
     assert offenders == [], offenders
+
+
+# =========================================== P3：排队可观测性
+#
+# 这三条不是"锦上添花"：线上排查"谁排了 28 秒""为什么文案说 0s""到底有没有
+# 人在排队"全靠它们，而三处都曾经缺失（VERIFY-A §7 P3-1/P3-2/P3-3）。
+
+
+class _Recorder:
+    """记录 (level, 渲染后文本) 的最小 logger 替身。"""
+
+    def __init__(self) -> None:
+        self.records: list[tuple[str, str]] = []
+
+    def _add(self, level: str, message: object, *args: object) -> None:
+        self.records.append((level, message % args if args else str(message)))
+
+    def debug(self, message: object, *args: object, **kwargs: object) -> None:
+        self._add("debug", message, *args)
+
+    def info(self, message: object, *args: object, **kwargs: object) -> None:
+        self._add("info", message, *args)
+
+    def warning(self, message: object, *args: object, **kwargs: object) -> None:
+        self._add("warning", message, *args)
+
+    def messages(self, level: str) -> list[str]:
+        return [text for lvl, text in self.records if lvl == level]
+
+
+class _Clock:
+    def __init__(self, now: float = 0.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def test_queue_info_carries_the_video_name():
+    """``slot(name="a.mp4")`` 必须出现在排队 INFO 里（P3-1）。"""
+
+    async def scenario() -> _Recorder:
+        recorder = _Recorder()
+        clock = _Clock()
+        limiter = SlotLimiter(1, logger=recorder, clock=clock)
+        release = asyncio.Event()
+
+        async def holder() -> None:
+            async with limiter.slot(name="holder"):
+                await release.wait()
+
+        holding = asyncio.create_task(holder())
+        await _wait_until(lambda: limiter.inflight == 1, what="持有者没有进槽")
+
+        async def waiter() -> None:
+            async with limiter.slot(name="slow-video.mp4"):
+                pass
+
+        queued = asyncio.create_task(waiter())
+        await _wait_until(lambda: limiter.waiters == 1, what="等待者没有进队列")
+        clock.now = 2.5
+        release.set()
+        await asyncio.wait_for(asyncio.gather(holding, queued), timeout=5)
+        return recorder
+
+    recorder = asyncio.run(scenario())
+    queued = [item for item in recorder.messages("info") if "ffmpeg 排队" in item]
+    assert len(queued) == 1, recorder.records
+    assert "视频=slow-video.mp4" in queued[0], queued[0]
+    # 既有字段一个都不能丢
+    assert "2.5s" in queued[0] and "limit=1" in queued[0] and "前方 0 个" in queued[0]
+
+
+def test_queue_timeout_warning_carries_the_name_and_never_says_zero_seconds():
+    """``queue_timeout=0.01``：文案是 10ms 而不是「超过 0s」，且带视频名（P3-1/2）。"""
+
+    async def scenario() -> tuple[_Recorder, str]:
+        recorder = _Recorder()
+        limiter = SlotLimiter(1, queue_timeout=0.01, logger=recorder)
+        release = asyncio.Event()
+
+        async def holder() -> None:
+            async with limiter.slot():
+                await release.wait()
+
+        holding = asyncio.create_task(holder())
+        await _wait_until(lambda: limiter.inflight == 1, what="持有者没有进槽")
+        try:
+            async with limiter.slot(name="a.mp4"):
+                raise AssertionError("不该拿到槽位")
+        except Exception as exc:  # noqa: BLE001 - 断言类型在下面
+            assert type(exc).__name__ == "QueueTimeout", exc
+            reason = exc.short_reason()
+            assert "10ms" in reason, reason
+            assert "0s" not in reason, reason
+        finally:
+            release.set()
+            await asyncio.wait_for(holding, timeout=5)
+        return recorder, reason
+
+    recorder, _ = asyncio.run(scenario())
+    warnings = [
+        item for item in recorder.messages("warning") if "ffmpeg 排队超时" in item
+    ]
+    assert len(warnings) == 1, recorder.records
+    assert "10ms" in warnings[0] and "limit=1" in warnings[0]
+    assert "视频=a.mp4" in warnings[0]
+    assert "0s" not in warnings[0]
+
+
+def test_sub_second_durations_render_as_milliseconds_never_zero_seconds():
+    """``format_seconds``：<1s 走毫秒，1s 以上保持既有读法（P3-2）。"""
+    assert format_seconds(0.01) == "10ms"
+    assert format_seconds(0.9) == "900ms"
+    assert format_seconds(0.0001) == "1ms"  # 再小也不许是 0
+    assert format_seconds(1.0) == "1.0s"
+    assert format_seconds(2.5) == "2.5s"
+    assert format_seconds(12.34) == "12.3s"
+    assert format_seconds(30.0) == "30.0s"
+    assert format_seconds(60.0) == "60s"
+    assert format_seconds(600.0) == "600s"
+    assert format_seconds(0.0) == "0s"
+
+
+def test_cache_hit_log_never_prints_a_zero_second_ttl(stub_logger):
+    """命中日志「TTL 剩 0s」在剩 0.4s 时是假话（VERIFY-B P3）—— 必须是毫秒。"""
+    from vv_plugin.core.vision_cache import VisionCache
+
+    clock = _Clock()
+    cache = VisionCache(ttl_sec=600.0, max_entries=4, clock=clock)
+    prepared = [
+        hooks.PreparedVideo(0, "a.mp4", _fake_injection_for_ttl())
+    ]
+    config = VideoConfig(
+        provider_mode="openai_compat",
+        openai_base_url="http://127.0.0.1:9/v1",
+        openai_api_key="sk-x",
+        openai_model="vision-model",
+    )
+    prompt = hooks.build_vision_prompt(config, "问题")
+    key = hooks.vision_cache_key(prepared[0].injection, prompt, config)
+    cache.put(key, "旧分析")
+    clock.now = 599.6  # 只剩 0.4s
+
+    asyncio.run(
+        hooks._analyze_prepared_videos(
+            prepared, "问题", config=config, logger=stub_logger, cache=cache
+        )
+    )
+
+    hits = [m for m in stub_logger.messages("info") if "视觉缓存命中" in m]
+    assert len(hits) == 1, stub_logger.records
+    assert "400ms" in hits[0], hits[0]
+    assert "0s" not in hits[0], hits[0]
+
+
+def _fake_injection_for_ttl():
+    from vv_plugin.core.injector import VideoInjection
+
+    return VideoInjection(
+        block={"type": "audio_url", "audio_url": {"url": "data:video/mp4;base64,AAAA"}},
+        source_path="a.mp4",
+        used_path="a.mp4",
+        size_mb=1.0,
+        duration_sec=2.0,
+        action="as-is",
+        content_key="as-is:ttl",
+    )
+
+
+class _Ctx:
+    """``/videotest`` 只用到 ``get_using_provider_async``。"""
+
+    async def get_using_provider_async(self, umo=None):
+        return None
+
+
+def _make_plugin(raw_config: dict):
+    from vv_plugin.main import VideoVisionPlugin
+
+    return VideoVisionPlugin(_Ctx(), raw_config)
+
+
+def test_videotest_adds_the_queue_summary_only_when_someone_waited(
+    media_tools, tiny_video, tmp_path, stub_logger
+):
+    """有排队/超时 -> 一行 ``排队   :``；没有 -> 报告一字不多（P3-3）。"""
+    plugin = _make_plugin({"provider_mode": "gemini_native"})
+    plugin.ffmpeg, plugin.ffprobe = media_tools
+    plugin.cache_root = str(tmp_path / "cache")
+
+    clean = asyncio.run(plugin._diagnose(tiny_video, event=None))
+    assert "排队   :" not in clean, clean
+
+    plugin.limiter = SlotLimiter(2, queue_timeout=30.0)
+    plugin.limiter.stats = LimiterStats(
+        waits=3, waited_sec_total=20.0, max_wait_sec=12.34, timeouts=1
+    )
+    report = asyncio.run(plugin._diagnose(tiny_video, event=None))
+
+    line = [item for item in report.splitlines() if item.startswith("排队   :")]
+    assert len(line) == 1, report
+    assert "排队 3 次" in line[0]
+    assert "最长 12.3s" in line[0]
+    assert "超时 1 次" in line[0]
+
+
+def test_limiter_stats_summary_is_empty_when_nothing_queued():
+    """没有任何排队/超时 -> 空串（``/videotest`` 不加行）。"""
+    assert LimiterStats().summary() == ""
+    assert LimiterStats(peak_inflight=2).summary() == ""
+    assert "排队 1 次" in LimiterStats(waits=1, max_wait_sec=0.4).summary()
+
+
+def test_gemini_native_does_not_claim_the_vision_cache_is_active(stub_logger):
+    """``gemini_native`` 没有可缓存的文本结果 —— 启动日志不许说"已启用"（VERIFY-B P3）。"""
+    _make_plugin({"provider_mode": "gemini_native", "vision_cache_enabled": True})
+    lines = [m for m in stub_logger.messages("info") if "视觉结果缓存" in m]
+    assert len(lines) == 1, stub_logger.records
+    assert "不使用" in lines[0], lines[0]
+    assert "已启用" not in lines[0], lines[0]

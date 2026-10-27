@@ -50,7 +50,7 @@ from astrbot.api import logger
 from ..core import decide, openai_vision, vision_cache
 from ..core.config import VideoConfig
 from ..core.injector import PrepareOutcome, VideoInjection, prepare_video
-from ..core.limits import NULL_LIMITER, QueueTimeout
+from ..core.limits import NULL_LIMITER, QueueTimeout, format_seconds
 from ..core.openai_vision import VisionResult, analyze_videos, build_vision_prompt
 from ..core.placeholder import (
     is_attachment_line,
@@ -322,9 +322,9 @@ async def build_video_blocks(
             # max_compress_seconds，归因错误）。
             outcome = PrepareOutcome(
                 False,
-                reason=(
-                    f"排队等待转码超过 {exc.timeout:.0f}s（limit={exc.limit}）"
-                ),
+                # 文案只有一份真相（``QueueTimeout.short_reason``）：
+                # ``queue_timeout<0.5s`` 时不能渲染成"超过 0s"（VERIFY-A P3-2）。
+                reason=exc.short_reason(),
                 kind="busy",
             )
         if outcome.ok and outcome.injection is not None:
@@ -606,7 +606,10 @@ async def _analyze_prepared_videos(
             True, item.name, analysis=hit.analysis, elapsed_sec=0.0
         )
         logger.info(
-            "[VideoVision] 视觉缓存命中（TTL 剩 %.0fs）：%s", hit.ttl_left, item.name
+            # 剩 0.9s 不许打印成"TTL 剩 0s"（VERIFY-B P3）：<1s 走毫秒
+            "[VideoVision] 视觉缓存命中（TTL 剩 %s）：%s",
+            format_seconds(hit.ttl_left),
+            item.name,
         )
 
     if pending:

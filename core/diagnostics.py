@@ -310,6 +310,7 @@ def render_report(
     outcome: PrepareOutcome | None = None,
     elapsed_sec: float = 0.0,
     vision: VisionReport | None = None,
+    queue_summary: str = "",
     uri_limit_mb: float = URI_LIMIT_MB,
     uri_raw_limit_mb: float = URI_LIMIT_RAW_MB,
 ) -> str:
@@ -326,6 +327,9 @@ def render_report(
         outcome: ``prepare_video`` 的真实结果；``None`` = 只渲染诊断前半段。
         elapsed_sec: ``prepare_video`` 的墙钟耗时。
         vision: 视觉服务调用结果（仅 openai_compat）。
+        queue_summary: 限流器计数摘要（``LimiterStats.summary()``）；**空串 =
+            不渲染** —— 只有真的排过队或被排队超时拒过时才多这一行，正常路径的
+            报告格式保持不变（VERIFY-A P3-3）。
         uri_limit_mb: data URI 编码后的硬上限（MB）。
         uri_raw_limit_mb: 同一上限换算成原始体积（MB）。
 
@@ -392,6 +396,12 @@ def render_report(
 
     # ---- 体积 / 时长判定：只渲染 decide 的判决，绝不在这里重算 ----
     lines.append(f"{VERDICT_LABEL} {describe(plan)}")
+
+    # ---- 限流排队摘要（VERIFY-A P3-3）----
+    # 只在**真的排过队 / 超时过**时出现（``LimiterStats.summary()`` 为空串时
+    # 一行都不加），正常路径的报告格式保持原样。
+    if queue_summary:
+        lines.append(f"排队   : {queue_summary}")
 
     # ---- 将要发给视觉服务的 prompt 预览（截断）----
     lines.append(f"prompt : {prompt_preview(cfg, mode)}")
