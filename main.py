@@ -206,6 +206,27 @@ class VideoVisionPlugin(Star):
                     self.config.effective_provider_mode,
                 )
 
+        #: ``vision_cache_enabled=true`` + ``cache_enabled=false``：缓存**仍然生效**
+        #: （key 取"源内容哈希 + 压缩参数"，不依赖压缩缓存，ARCH-VV-C2 P1-1），
+        #: 但需要压缩的视频**每次投递都要重新压一遍** —— 缓存省掉的是上传 + 推理，
+        #: 省不掉本地 ffmpeg。启动时告警一次（逐视频刷 WARNING 会淹没日志，静默又
+        #: 会让用户以为"开了但没用"，与上面 singleflight 那条同一个模板）。
+        if (
+            self.config.vision_cache_enabled
+            and not self.config.cache_enabled
+            and self.config.effective_provider_mode == "openai_compat"
+        ):
+            logger.warning(
+                "[VideoVision] vision_cache_enabled=true，但压缩缓存已关闭"
+                "（cache_enabled=%s，cache_root=%s）：视觉结果缓存**仍然生效**"
+                "（key 取「源内容哈希 + 压缩参数」，不依赖压缩缓存），但需要压缩的"
+                "视频**每次投递都要重新压一遍**（缓存省掉的是上传 + 推理，省不掉"
+                "本地压缩）。想连本地压缩一起省掉请开启 cache_enabled；想消除这条"
+                "提示就把 vision_cache_enabled 设为 false。",
+                self.config.cache_enabled,
+                "已配置" if self.cache_root else "空",
+            )
+
         # 启动日志的**文本**在 diagnostics（纯函数，可单测），按级别打出去与
         # 下面的状态变更留在这里。
         for level, message in diagnostics.startup_lines(

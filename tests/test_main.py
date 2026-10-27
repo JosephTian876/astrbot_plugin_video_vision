@@ -615,6 +615,67 @@ def test_singleflight_with_the_cache_off_warns_once_at_startup(stub_logger):
 # ------------------------------------------------ 0.3.0：视觉缓存装配 / 绕过
 
 
+def test_vision_cache_with_the_compress_cache_off_warns_once_at_startup(stub_logger):
+    """``vision_cache_enabled=true`` + ``cache_enabled=false``：启动说清代价。
+
+    P1-1 修好之后这条**不再**是"缓存不生效"（key 取"源 + 压缩参数"，压缩视频
+    照样命中），但"需要压缩的视频每次投递都要重压一遍"是用户看不见的本地开销 ——
+    启动时告警一次，逐视频刷 WARNING 会淹没日志（与 singleflight 那条同一个模板）。
+    """
+    plugin = make_plugin(
+        _Context(),
+        provider_mode="openai_compat",
+        openai_base_url="http://127.0.0.1:9/v1",
+        openai_api_key="sk-x",
+        openai_model="vision-model",
+        vision_cache_enabled=True,
+        cache_enabled=False,
+    )
+    warnings = [m for m in stub_logger.messages("warning") if "vision_cache" in m]
+    assert len(warnings) == 1, stub_logger.records
+    text = warnings[0]
+    assert "cache_enabled" in text
+    # 语义必须是**修复后的事实**：缓存仍然命中，代价只是每次都要重压
+    assert "仍然生效" in text
+    assert "重新压一遍" in text
+    # 缓存对象照常装配（只是效率打折），不是错误配置
+    assert plugin.vision_cache is not None
+
+    # 默认（压缩缓存开着）不许刷这条
+    stub_logger.clear()
+    make_plugin(
+        _Context(),
+        provider_mode="openai_compat",
+        openai_base_url="http://127.0.0.1:9/v1",
+        openai_api_key="sk-x",
+        openai_model="vision-model",
+    )
+    assert not [m for m in stub_logger.messages("warning") if "vision_cache" in m]
+
+    # 视觉缓存本来就关着：用户已经明确选择，不许刷
+    stub_logger.clear()
+    make_plugin(
+        _Context(),
+        provider_mode="openai_compat",
+        openai_base_url="http://127.0.0.1:9/v1",
+        openai_api_key="sk-x",
+        openai_model="vision-model",
+        vision_cache_enabled=False,
+        cache_enabled=False,
+    )
+    assert not [m for m in stub_logger.messages("warning") if "vision_cache" in m]
+
+    # gemini_native：缓存本来就不使用（已有 INFO 说明），不该再刷一条 WARNING
+    stub_logger.clear()
+    make_plugin(
+        _Context(),
+        provider_mode="gemini_native",
+        vision_cache_enabled=True,
+        cache_enabled=False,
+    )
+    assert not [m for m in stub_logger.messages("warning") if "vision_cache" in m]
+
+
 def test_plugin_builds_the_vision_cache_from_config(stub_logger):
     on = make_plugin(
         _Context(),

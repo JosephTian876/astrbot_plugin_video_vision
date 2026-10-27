@@ -303,6 +303,18 @@ def test_schema_hints_explain_the_vision_cache_knobs():
     assert "内存" in entries
 
 
+def test_vision_cache_hint_names_the_compress_cache_coupling():
+    """P1-2：面板上必须能查到"关掉压缩缓存会怎样"。
+
+    修 P1-1 之前，这个组合是"视觉缓存永不命中"；修好之后是"仍然命中，但需要压缩
+    的视频每次都要重压一遍"。hint 必须写**修好之后的事实**，不能留过时警告。
+    """
+    hint = SCHEMA["vision_cache_enabled"]["hint"]
+    assert "cache_enabled" in hint
+    assert "不影响" in hint and "命中" in hint
+    assert "重" in hint and "压" in hint
+
+
 def test_readme_documents_the_vision_cache_section():
     assert "vision_cache_enabled" in README
     assert "vision_cache_ttl_sec" in README
