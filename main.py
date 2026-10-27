@@ -487,9 +487,11 @@ class VideoVisionPlugin(Star):
             # 计时起点在**取槽之前**：报告里的"准备成功（X s）"必须包含排队时间，
             # 否则高峰期会出现"报告 1.8s、用户实际等了 12s"的静默谎言。
             # 还槽绑定到 worker **真正**结束（同 hooks：取消不许提前还槽）。
+            # 提交走 ``slots.submit``（ffmpeg 专属执行器）：默认池被占满时
+            # ``asyncio.to_thread`` 会无限挂起（VERIFY-VV-R9 P1-1）。
             async with slots.slot(name=os.path.basename(target)) as slot:
                 outcome = await slot.wait_for_worker(
-                    asyncio.to_thread(
+                    slots.submit(
                         prepare_video,
                         VideoPlaceholder(name=os.path.basename(target), path=target),
                         config=cfg,
@@ -565,5 +567,18 @@ class VideoVisionPlugin(Star):
         )
 
     async def terminate(self) -> None:
-        """插件被停用/卸载时的清理。"""
+        """插件被停用/卸载时的清理。
+
+        收掉 ffmpeg 的**专属**执行器（``max_workers == ffmpeg_max_concurrency``，
+        见 ``core/limits.SlotLimiter.submit``）：``shutdown(wait=False)`` 不打断
+        在飞的 worker（它们会把自己的 ffmpeg 子进程跑完），只是不再接新任务 ——
+        否则每次重载都会留下 ``limit`` 个永不回收的线程。
+
+        对鸭子类型的替身保持宽松：没有 ``shutdown`` 就不调用（测试/外部注入的
+        限流器不该因为缺一个可选方法而让停用流程抛异常）。
+        """
+        limiter = getattr(self, "limiter", None)
+        shutdown = getattr(limiter, "shutdown", None)
+        if callable(shutdown):
+            shutdown()
         logger.info("[VideoVision] 插件已终止")

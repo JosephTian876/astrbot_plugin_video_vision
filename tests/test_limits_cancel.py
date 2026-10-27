@@ -418,10 +418,13 @@ def _calls(node: ast.AST, attr: str) -> list[ast.Call]:
 
 
 def test_every_slot_wrapped_worker_is_awaited_through_wait_for_worker():
-    """结构守卫：``to_thread(prepare_video, ...)`` 必须交给 ``slot.wait_for_worker``。
+    """结构守卫：``submit(prepare_video, ...)`` 必须交给 ``slot.wait_for_worker``。
 
-    只把 ``to_thread`` 放进 ``async with slot()`` 是不够的（P2-1 就是这么漏的）：
+    只把阻塞工作体放进 ``async with slot()`` 是不够的（P2-1 就是这么漏的）：
     还槽必须绑定到 **worker 真正结束**，否则取消时槽位提前归还。
+
+    提交方式在 VERIFY-VV-R9 P1-1 之后是 ``slots.submit``（ffmpeg 专属执行器）；
+    默认池的 ``to_thread`` 已被 ``tests/test_limits.py`` 的同名守卫禁止。
     """
     offenders: list[str] = []
     checked = 0
@@ -432,7 +435,7 @@ def test_every_slot_wrapped_worker_is_awaited_through_wait_for_worker():
                 continue
             spawns = [
                 call
-                for call in _calls(node, "to_thread")
+                for call in _calls(node, "submit")
                 if call.args
                 and isinstance(call.args[0], ast.Name)
                 and call.args[0].id == "prepare_video"
@@ -443,7 +446,7 @@ def test_every_slot_wrapped_worker_is_awaited_through_wait_for_worker():
             guarded = len(_calls(node, "wait_for_worker"))
             if guarded != len(spawns):
                 offenders.append(
-                    f"{name}: {len(spawns)} 处 to_thread(prepare_video)，"
+                    f"{name}: {len(spawns)} 处 submit(prepare_video)，"
                     f"{guarded} 处交给 wait_for_worker"
                 )
     assert checked == 2, f"预期 2 个生产调用点（hooks + /videotest），找到 {checked} 个"

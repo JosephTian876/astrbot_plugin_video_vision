@@ -618,54 +618,71 @@ def test_a_finished_leader_does_not_remove_a_newer_flight():
 # ======================================= 结构守卫：限流只在 async 层
 
 
+def _slot_context_nodes(tree: ast.AST) -> set[int]:
+    """``async with <limiter>.slot(...):`` 体内的全部节点 id。"""
+    inside: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.AsyncWith) or not node.items:
+            continue
+        contexts = [item.context_expr for item in node.items]
+        if not all(
+            isinstance(ctx, ast.Call)
+            and isinstance(ctx.func, ast.Attribute)
+            and ctx.func.attr == "slot"
+            for ctx in contexts
+        ):
+            continue
+        for child in ast.walk(node):
+            inside.add(id(child))
+    return inside
+
+
 def test_every_prepare_video_call_runs_inside_a_limiter_slot():
-    """RISK #3：``to_thread(prepare_video, ...)`` 必须在 ``limiter.slot()`` 里。
+    """RISK #3 + P1-1：``prepare_video`` 必须在槽内、且提交到**专属**执行器。
+
+    两条一起钉：
+
+    1. 每次提交都在 ``async with limiter.slot()`` 里 —— 否则取消时没有槽可以还，
+       真实并发会越过 ``limit``（VERIFY-A P2-1）；
+    2. 提交必须走 ``slots.submit``（``core.limits.SlotLimiter`` 的专属执行器）。
+       **不许**再出现 ``asyncio.to_thread(prepare_video, …)``：它排的是进程级
+       默认执行器，池满时任务在池队列里无限期排队，而槽位已被取走 ——
+       实测 20 线程池占满时视频请求 **>=6.0s 未完成**（VERIFY-VV-R9 P1-1）。
 
     绝不能把 ``threading.Semaphore`` 塞进 ``prepare_video``：默认执行器是全进程
     共享的（2 核只有 6 个线程），在那里阻塞会饿死核心的 media / TTS / ASR。
     """
-    offenders: list[str] = []
+    off_slot: list[str] = []
+    not_dedicated: list[str] = []
     checked = 0
     for name in ("hooks/llm_request.py", "main.py"):
         tree = ast.parse((REPO / name).read_text(encoding="utf-8"))
+        inside = _slot_context_nodes(tree)
         total = 0
-        guarded = 0
         for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
+            if not isinstance(node, ast.Call) or not node.args:
                 continue
+            first = node.args[0]
+            if not (isinstance(first, ast.Name) and first.id == "prepare_video"):
+                continue
+            total += 1
             func = node.func
-            if not isinstance(func, ast.Attribute) or func.attr != "to_thread":
-                continue
-            if node.args and isinstance(node.args[0], ast.Name):
-                if node.args[0].id == "prepare_video":
-                    total += 1
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.AsyncWith) or not node.items:
-                continue
-            contexts = [item.context_expr for item in node.items]
-            if not all(
-                isinstance(ctx, ast.Call)
-                and isinstance(ctx.func, ast.Attribute)
-                and ctx.func.attr == "slot"
-                for ctx in contexts
-            ):
-                continue
-            for child in ast.walk(node):
-                if not isinstance(child, ast.Call):
-                    continue
-                func = child.func
-                if not isinstance(func, ast.Attribute) or func.attr != "to_thread":
-                    continue
-                if child.args and isinstance(child.args[0], ast.Name):
-                    if child.args[0].id == "prepare_video":
-                        guarded += 1
-        checked += total
-        if total != guarded:
-            offenders.append(
-                f"{name}: {total} 处 to_thread(prepare_video)，{guarded} 处在槽内"
+            attr = (
+                func.attr
+                if isinstance(func, ast.Attribute)
+                else getattr(func, "id", "")
             )
+            if id(node) not in inside:
+                off_slot.append(f"{name}:{node.lineno} {attr}(prepare_video, …)")
+            if attr != "submit":
+                not_dedicated.append(
+                    f"{name}:{node.lineno} {attr}(prepare_video, …)"
+                    " —— 必须走 slots.submit（ffmpeg 专属执行器）"
+                )
+        checked += total
     assert checked >= 2, f"没找到预期的调用点（只找到 {checked} 处）"
-    assert offenders == [], offenders
+    assert off_slot == [], off_slot
+    assert not_dedicated == [], not_dedicated
 
 
 def _code_string_literals(path: Path) -> list[str]:
@@ -693,7 +710,12 @@ def _code_string_literals(path: Path) -> list[str]:
 
 
 def test_limits_module_stays_free_of_threading_blocking_for_the_caller():
-    """结构：``limits.py`` 只用标准库，且**不 import astrbot**（``core/`` 契约）。"""
+    """结构：``limits.py`` 只用标准库，且**不 import astrbot**（``core/`` 契约）。
+
+    ``concurrent`` / ``contextvars`` / ``functools`` 是 P1-1 的专属执行器要用的
+    （``SlotLimiter.submit``：与 ``asyncio.to_thread`` 逐字等价地转交阻塞函数，
+    只是换成 ffmpeg 自己的池），不是"顺手多用几个库"。
+    """
     path = REPO / "core" / "limits.py"
     tree = ast.parse(path.read_text(encoding="utf-8"))
     imported: set[str] = set()
@@ -707,7 +729,10 @@ def test_limits_module_stays_free_of_threading_blocking_for_the_caller():
         "__future__",
         "asyncio",
         "collections",
+        "concurrent",
+        "contextvars",
         "dataclasses",
+        "functools",
         "threading",
         "time",
         "typing",
@@ -715,7 +740,7 @@ def test_limits_module_stays_free_of_threading_blocking_for_the_caller():
 
     # 不许出现任何"在 worker 里阻塞"的原语；也不许用 time.sleep 排队
     literals = "\n".join(_code_string_literals(path))
-    for forbidden in ("threading.Semaphore", "run_in_executor", "time.sleep"):
+    for forbidden in ("threading.Semaphore", "time.sleep"):
         assert forbidden not in literals, forbidden
     # 不许真的调用 Semaphore
     semaphore_calls = [
@@ -728,6 +753,25 @@ def test_limits_module_stays_free_of_threading_blocking_for_the_caller():
         )
     ]
     assert semaphore_calls == [], "限流只能用 asyncio.Queue 令牌，不许用 Semaphore"
+    # 交给执行器的**只许**是专属池：``run_in_executor(None, …)`` 会退回进程级
+    # 默认池，那正是 P1-1（池满时任务排在池队列里、槽位被未启动的 worker 占住）
+    executor_calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "run_in_executor"
+    ]
+    assert len(executor_calls) == 1, [node.lineno for node in executor_calls]
+    only = executor_calls[0]
+    assert only.args, "run_in_executor 必须显式给出执行器（不许 None）"
+    target = only.args[0]
+    assert (
+        isinstance(target, ast.Call)
+        and isinstance(target.func, ast.Attribute)
+        and target.func.attr == "_pool"
+    ), f"只许跑在专属执行器上，实际第一个参数是 {ast.dump(target)}"
+
 
 
 def test_queue_info_is_at_most_one_line_per_video():

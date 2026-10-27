@@ -219,11 +219,14 @@ async def build_video_blocks(
     ``max_compress_seconds``（默认 45 秒）的压缩会把整个 AstrBot 卡住 ——
     期间所有会话的消息都不被处理。
 
-    ``limiter``（``core.limits.SlotLimiter``）的排队发生在**事件循环侧**：
-    ``asyncio.to_thread`` 用的是**全进程共享**的默认执行器（2 核只有
-    ``min(32, cpu+4) = 6`` 个线程，核心的 media / TTS / ASR 都在里面），
-    把等待塞进 worker 等于让 4 个线程睡觉、把核心功能一起饿死。
-    传 ``None`` 等价于不限流（用 ``NULL_LIMITER``，不建队列、不等待）。
+    ``limiter``（``core.limits.SlotLimiter``）的排队发生在**事件循环侧**，
+    阻塞工作体由 ``limiter.submit`` 交给 ffmpeg 的**专属**执行器
+    （``max_workers == limit``，``main.terminate`` 里收掉）。**不要**再写
+    ``asyncio.to_thread(prepare_video, ...)``：那排的是**全进程共享**的默认
+    执行器（2 核只有 ``min(32, cpu+4) = 6`` 个线程，核心的 media / TTS / ASR
+    都在里面），池满时任务会在池队列里无限期排队，而槽位已经被取走
+    （VERIFY-VV-R9 P1-1：20 线程池占满时视频请求 >=6.0s 未完成）。
+    传 ``None`` 等价于不限流（用 ``NULL_LIMITER``，不建队列、不等待，仍用默认池）。
 
     返回形状固定为 **3 元组**，所有提前返回分支也必须凑满三个元素
     （0.1.3 修过一次漏了第三项的 bug：调用方解包会抛
@@ -309,12 +312,14 @@ async def build_video_blocks(
             # 循环侧，worker 线程里没有任何 Semaphore。
             # 还槽绑定到 worker **真正**结束：外层被取消时 ffmpeg 线程还在跑，
             # 当场还槽会让真实并发 > limit（VERIFY-A P2-1）。
+            # 提交用 ``slots.submit``（专属执行器），不是 ``asyncio.to_thread``
+            # —— 后者的池被核心占满时本请求会无限挂起（VERIFY-VV-R9 P1-1）。
             async with slots.slot(name=placeholder.name) as slot:
                 # 只计**取到槽之后**的本地处理：排队等待有自己的日志（>=1s 一条），
                 # 两个数字混在一起会让"为什么慢"反而查不清（ARCH-VV-C2 P2-4）。
                 prepare_started = time.monotonic()
                 outcome = await slot.wait_for_worker(
-                    asyncio.to_thread(
+                    slots.submit(
                         prepare_video,
                         placeholder,
                         config=config,

@@ -12,6 +12,24 @@
 ``threading.Semaphore`` 塞进 ``prepare_video`` —— 那等于把默认线程池当成自己的
 私有池用（实测 2 核 = 6 个线程，核心的 media/TTS/ASR 全在里面）。
 
+为什么 ffmpeg 用**专属**执行器（VERIFY-VV-R9 P1-1）
+--------------------------------------------------
+上面那条禁令说的是"**不许一边占用默认池的线程、一边等槽**"，不是"必须用默认池"。
+恰恰相反：把 ``prepare_video`` 交给默认池有一个致命的排队状态 —— 池满时任务只是
+躺在**池队列**里，而调用方已经先取走了槽位，于是
+
+* 当前请求无限挂起（:meth:`_Slot.wait_for_worker` 对 worker 的等待没有超时）；
+* 取消也还不回槽位：还槽挂在 worker 的 done-callback 上，而"还没启动的 worker"
+  永远不会有 done —— 一个并不存在的并发把槽位占住。
+
+实测（AUDIT-VV-R9 §1.5）：20 线程池占满时视频请求 **>=6.0s 未完成**；
+6 线程池（2 核等价）**58.36s**（靠外部 blocker 到期）才结束。
+
+:meth:`SlotLimiter.submit` 因此把阻塞工作交给**专属** ``ThreadPoolExecutor``，
+尺寸就是 ``limit``：限流器保证同一时刻最多 ``limit`` 个 worker 在跑（取槽 ->
+提交 -> worker 结束才还槽），于是"拿到槽就一定有线程"，池队列在结构上为空。
+默认池被核心的 media / TTS / ASR 占满与我们无关，我们也不去抢它。
+
 为什么不用 ``asyncio.Semaphore``
 --------------------------------
 1. ``Queue.get()`` 被取消/超时打断时不会**吞掉**令牌：令牌只在 ``get_nowait()``
@@ -31,9 +49,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import functools
 import threading
 import time
 from collections.abc import Hashable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
@@ -47,6 +68,9 @@ DETERMINISTIC_FAILURE_KINDS: frozenset[str] = frozenset(
 
 #: 排队达到这个秒数才打 INFO（每个视频最多一条 —— 不许在成功路径上刷屏）
 QUEUE_LOG_THRESHOLD_SEC = 1.0
+
+#: ffmpeg 专属执行器的线程名前缀（测试据此断言"没跑在默认池里"）
+EXECUTOR_THREAD_PREFIX = "vv-ffmpeg"
 
 #: 队列里的令牌（内容无意义，只表示"一个空闲槽位"）
 _TOKEN = object()
@@ -142,14 +166,17 @@ class LimiterStats:
 
 
 class SlotLimiter:
-    """进程内**全局**（跨会话）的 ffmpeg 槽位限流器。
+    """进程内**全局**（跨会话）的 ffmpeg 槽位限流器 + **专属**执行器。
 
-    ``limit <= 0`` 表示**关闭限流**：不建队列、不加任何 await、不打任何日志 ——
-    逐字节等价 0.2.1（默认线程池仍是唯一的上限来源）。
+    ``limit <= 0`` 表示**关闭限流**：不建队列、不加任何 await、不打任何日志，
+    也不建专属执行器 —— 逐字节等价 0.2.1（默认线程池仍是唯一的上限来源）。
 
     队列按事件循环惰性重建：``asyncio.Queue`` 是 loop 绑定的，而测试（以及
     插件的重载）会反复 ``asyncio.run``。换 loop 时重建一份填满 ``limit`` 个令牌
     的队列，``inflight`` 归零。
+
+    专属执行器同理**惰性**创建（在 :meth:`submit` 里），尺寸 == ``limit``，
+    :meth:`shutdown` 收掉 —— 见模块说明里"为什么 ffmpeg 用专属执行器"。
     """
 
     def __init__(
@@ -172,6 +199,11 @@ class SlotLimiter:
         self._queue: asyncio.Queue[Any] | None = None
         self._waiters = 0
         self._inflight = 0
+        #: 专属执行器（惰性创建；``limit<=0`` 时永远是 ``None``）
+        self._executor: ThreadPoolExecutor | None = None
+        self._pool_lock = threading.Lock()
+        #: :meth:`shutdown` 之后不再接受新任务（退回默认池，见 :meth:`submit`）
+        self._closed = False
 
     # ------------------------------------------------------------ 只读状态
 
@@ -237,6 +269,72 @@ class SlotLimiter:
             queue.put_nowait(_TOKEN)
         except asyncio.QueueFull:  # 不该发生：只有归还会放令牌
             pass
+
+    # -------------------------------------------------------- 专属执行器
+
+    def submit(self, fn: Callable[..., Any], /, *args: Any, **kwargs: Any) -> Any:
+        """把**阻塞**函数排到 ffmpeg 专属执行器，返回可直接 ``await`` 的对象。
+
+        为什么不 ``asyncio.to_thread``（AUDIT-VV-R9 §1.5 实测）：它排的是
+        **进程级**默认执行器，池满时任务只是躺在**池队列**里，而槽位已经被取走
+        —— 当前请求无限挂起，取消也还不回槽位（还槽挂在 worker 的 done-callback
+        上，而还没启动的 worker 永远没有 done）。
+
+        这里排到专属池（``max_workers == limit``）。因为限流器保证同一时刻最多
+        ``limit`` 个 worker 在跑（取槽 -> 提交 -> worker 结束才还槽），
+        "拿到槽就一定有线程"，池队列在结构上为空。
+
+        ``limit <= 0``（关闭限流）或已经 :meth:`shutdown` 时退回
+        ``asyncio.to_thread``：前者就是 0.2.1 的行为，后者是为了重载途中的
+        在飞钩子不至于挂死。
+
+        Args:
+            fn: 要在线程里跑的**同步**函数。
+            *args: 位置参数。
+            **kwargs: 关键字参数。
+
+        Returns:
+            ``asyncio.Future``（专属池）或 coroutine（退回默认池），都可 ``await``。
+        """
+        if not self.enabled or self._closed:
+            return asyncio.to_thread(fn, *args, **kwargs)
+        loop = asyncio.get_running_loop()
+        # 与 ``asyncio.to_thread`` 逐字等价（含 contextvars 传递），只换执行器
+        call = functools.partial(contextvars.copy_context().run, fn, *args, **kwargs)
+        try:
+            return loop.run_in_executor(self._pool(), call)
+        except RuntimeError:
+            # shutdown 正在发生（重载途中的在飞钩子）：退回默认池，绝不挂起
+            return asyncio.to_thread(fn, *args, **kwargs)
+
+    def _pool(self) -> ThreadPoolExecutor:
+        """取专属执行器（惰性创建：没处理过视频就不建线程）。"""
+        pool = self._executor
+        if pool is not None:
+            return pool
+        with self._pool_lock:
+            if self._executor is None:
+                self._executor = ThreadPoolExecutor(
+                    max_workers=self.limit,
+                    thread_name_prefix=EXECUTOR_THREAD_PREFIX,
+                )
+            return self._executor
+
+    def shutdown(self, *, wait: bool = False) -> None:
+        """收掉专属执行器（``main.terminate`` 调用）：不打断在飞的 worker。
+
+        线程只在第一次 :meth:`submit` 时创建，所以"没处理过视频"的实例没有线程
+        可收；这里只把已经建出来的那些收掉，插件重载不会留下一个永不回收的池。
+
+        Args:
+            wait: ``True`` 时等 worker 跑完。默认 ``False``：ffmpeg 子进程有自己
+                的超时，卸载流程不该跟着等（在飞的 worker 会跑完自己那一次）。
+        """
+        with self._pool_lock:
+            pool, self._executor = self._executor, None
+            self._closed = True
+        if pool is not None:
+            pool.shutdown(wait=wait)
 
     # ---------------------------------------------------------------- 内部
 
@@ -359,9 +457,10 @@ class _Slot:
     async def wait_for_worker(self, worker: Awaitable[Any]) -> Any:
         """等 worker 结束；本任务被取消时，槽位**留在 worker 手里**。
 
-        ``asyncio.to_thread`` 的线程不可取消：协程被 cancel 时 ``__aexit__``
-        会当场还令牌，而 ffmpeg 子进程还在跑（最长 ``max_compress_seconds``），
-        真实并发于是可以越过 ``limit``（VERIFY-A P2-1：``limit=1`` 实测峰值 2）。
+        worker（``SlotLimiter.submit`` 排到专属执行器 / 默认池的那个线程）不可
+        取消：协程被 cancel 时 ``__aexit__`` 会当场还令牌，而 ffmpeg 子进程还在跑
+        （最长 ``max_compress_seconds``），真实并发于是可以越过 ``limit``
+        （VERIFY-A P2-1：``limit=1`` 实测峰值 2）。
 
         所以取消路径把还槽移交给 worker 的 done-callback —— 它在事件循环线程里
         于 worker 真正结束（成功/失败/异常）之后**恰好**执行一次：既不会提前还，

@@ -540,6 +540,14 @@ class _RecordingLimiter:
 
         return _Slot()
 
+    async def submit(self, fn, *args, **kwargs):
+        """与真 ``SlotLimiter.submit`` 同义：把阻塞函数交给执行器（替身就地跑）。
+
+        真实现排到 ffmpeg 专属执行器；替身只关心"进出槽各一次"，
+        就地调用即可（用例里的视频是几十 KB 的 tiny_video）。
+        """
+        return fn(*args, **kwargs)
+
 
 def test_plugin_builds_the_limiter_from_config(stub_logger):
     """``ffmpeg_max_concurrency`` 决定**有没有**限流器；0 = 完全不建。"""
