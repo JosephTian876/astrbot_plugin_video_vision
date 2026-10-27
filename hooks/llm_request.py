@@ -83,6 +83,65 @@ PROVIDER_ERROR_NONE = "none"
 PROVIDER_ERROR_NO_CONTEXT = "no-context"
 
 
+#: 本地**权限**类失败的关键字（小写比较）。
+#:
+#: 中文 Windows 的 ``PermissionError`` 文案是「[Errno 13] 拒绝访问。」—— 旧代码的
+#: ``"拒绝" in reason`` 分支把它当成「按配置拒绝」（体积/时长闸门），于是模型去劝
+#: 用户"把视频压小一点"，而真实原因是本机写不了文件：用户怎么压都没用
+#: （VERIFY-VV-R9 P2-2）。这里按 errno / 平台原文显式分类，不靠单个汉字猜。
+_PERMISSION_MARKERS: tuple[str, ...] = (
+    "[errno 13]",
+    "errno 13",
+    "eacces",
+    "eperm",
+    "operation not permitted",
+    "permission denied",
+    "permissionerror",
+    "access is denied",
+    "access denied",
+    "[winerror 5]",
+    "拒绝访问",
+    "权限不足",
+    "没有权限",
+)
+
+#: 本地**磁盘满**的关键字。``[Errno 28]`` / ``WinError 112`` 是同一件事的两套原文。
+_DISK_FULL_MARKERS: tuple[str, ...] = (
+    "[errno 28]",
+    "errno 28",
+    "enospc",
+    "no space left",
+    "[winerror 112]",
+    "设备上没有空间",
+    "磁盘空间不足",
+    "空间不足",
+)
+
+#: 本地 I/O 故障的短原因（**绝不**说成"太大/太长"）
+LOCAL_IO_DENIED = "local file access was denied"
+LOCAL_DISK_FULL = "the local disk is full"
+
+
+def _local_io_failure(reason: str) -> str | None:
+    """本地权限 / 磁盘满 -> 准确的短原因；不是这两类时返回 ``None``。
+
+    只认**明确的**证据（errno 号、平台原文），不猜：分类不了返回 ``None``，
+    由调用方给一句中性文案。宁可说"压缩失败"，也不能把写盘失败说成"视频太大"。
+
+    Args:
+        reason: 原始失败原因（任意 locale）。
+
+    Returns:
+        :data:`LOCAL_IO_DENIED` / :data:`LOCAL_DISK_FULL` / ``None``。
+    """
+    low = reason.lower()
+    if any(marker in low for marker in _PERMISSION_MARKERS):
+        return LOCAL_IO_DENIED
+    if any(marker in low for marker in _DISK_FULL_MARKERS):
+        return LOCAL_DISK_FULL
+    return None
+
+
 def _short_reason(reason: str, kind: str = "") -> str:
     """把失败原因压缩成不含本机路径的短语，供注入给模型。
 
@@ -95,7 +154,9 @@ def _short_reason(reason: str, kind: str = "") -> str:
     * 视觉服务（``openai_compat``）的原因由 ``core/openai_vision._classify_error``
       产出，属**另一个错误域**（HTTP / SSL / 连通性），没有机器可读分类 ——
       给它现编一套码是另一件事，不在本次结构重构里；
-    * ``kind`` 不在码表里（``internal`` / ``other``）时保持 0.2.1 的回退行为。
+    * ``kind`` 不在码表里（``internal`` / ``other``）时走下面的文本回退，
+      但**先**按 errno / 关键字认「本地权限」「磁盘满」（:func:`_local_io_failure`）。
+      这两类以前会掉进中文「拒绝」启发式，被说成"体积超限"（VERIFY-VV-R9 P2-2）。
 
     匹配顺序：视觉服务 -> 码表 -> 文本回退，且更具体的原因排在更宽泛的之前
     （例如「无法读取时长，拒绝盲压缩（体积超闸门）」必须归为时长问题，否则模型
@@ -143,10 +204,18 @@ def _short_reason(reason: str, kind: str = "") -> str:
         return decide.explain("missing")
     if "时长" in reason:
         return decide.explain("unknown_duration")
-    if "压缩" in reason and "拒绝" not in reason:
-        return "compression failed"
-    if "拒绝" in reason or "闸门" in reason or "too large" in low:
+    # ---- 本地 I/O 故障：权限 / 磁盘（**先于**任何"超限"猜测）----
+    # 这里是 P2-2 的根因位置：旧代码用 ``"拒绝" in reason`` 判"按配置拒绝"，
+    # 中文 locale 的「拒绝访问」于是被说成 "it exceeds the size limit"。
+    local_failure = _local_io_failure(reason)
+    if local_failure is not None:
+        return local_failure
+    # 「闸门」/「too large」才是体积的**证据**；「压缩」只说明这段走在压缩路径上，
+    # 所以体积判定必须排在它前面（否则"超过闸门…需要压缩"会被说成压缩失败）。
+    if "闸门" in reason or "too large" in low:
         return decide.explain("too_large")
+    if "压缩" in reason:
+        return "compression failed"
     return "it could not be processed"
 
 
