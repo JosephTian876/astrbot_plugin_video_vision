@@ -400,16 +400,25 @@ def test_injector_content_key_only_when_openai_mode_with_the_cache(
     assert off.injection.content_key == ""
 
 
-def test_content_key_identifies_the_bytes_actually_sent(
+def test_content_key_is_reproducible_for_compressed_videos(
     media_tools, ffmpeg_dir, noisy_video, tmp_path, make_placeholder, stub_logger
 ):
-    """压缩路径的 content_key 必须跟着**产物字节**变（画面变了就不许共用缓存）。
+    """压缩路径的 content_key = **源内容哈希 + 压缩参数**（不是产物哈希）。
 
-    用**真 ffmpeg**：CRF 28 与 40 产出的 mp4 字节不同 -> key 必须不同。这里刻意
-    不用 "把源文件拷成产物" 的桩 —— 桩会忽略压缩参数，恰好证明不了这件事
-    （桩下产物的字节相同，key 相同反而是**正确**行为）。
+    回归（ARCH-VV-C2 P1-1）：产物字节**不可复现** —— 同一源 + 同一组参数每次压
+    出来的 mp4 都不一样（熵编码 + 封装时间戳 + ``-fs`` 在 GOP 边界截断），于是
+    ``compressed:<产物哈希>`` 每次都变：``vision_cache_enabled=true`` +
+    ``cache_enabled=false`` 时视觉缓存**永不命中**（实测 3 次同源同参 = 3 个 key）。
+
+    现在 key 与压缩缓存 key **同源**（``core/injector.py`` 里同一个 signature：
+    源内容哈希 | compress_max_mb | crf | preset | truncate_to），于是：
+
+    * 同源同参 -> 同一个 key（重复投递才可能命中）；
+    * 换压缩参数 -> 换 key（模型看到的画面变了，不许共用缓存）。
+
+    用**真 ffmpeg**：这里证明的是"参数进 key、字节不进 key"。
     """
-    from vv_plugin.core.injector import prepare_video
+    from vv_plugin.core.injector import content_hash_from_text, prepare_video
     from vv_plugin.core.media import content_hash
 
     def compress(**kwargs):
@@ -430,21 +439,127 @@ def test_content_key_identifies_the_bytes_actually_sent(
             logger=stub_logger,
         )
 
+    def expected(crf: int) -> str:
+        """独立算一遍签名（不调生产代码里的帮助函数，避免自证）。"""
+        return "compressed:" + content_hash_from_text(
+            f"{content_hash(noisy_video)}|0.2|{crf}|veryfast|0.0"
+        )
+
     outcome = compress()
     assert outcome.ok, outcome.reason
     injection = outcome.injection
     assert injection.action == "compressed"
-    assert injection.content_key == f"compressed:{content_hash(injection.used_path)}"
-    # 压缩过 -> 发出去的字节不是源文件，key 当然也不该是源文件哈希
+    assert injection.content_key == expected(30)
+    # 产物确实不是源文件（这也正是"产物哈希"当初看起来正确的来源）
     assert content_hash(injection.used_path) != content_hash(noisy_video)
 
-    # 换一组压缩参数 -> 产物字节不同 -> content_key 必须不同（否则画面串味）
+    # 同源同参再压一次：content_key 必须**完全相同**（否则重复投递永不命中）
+    again = compress()
+    assert again.ok, again.reason
+    assert again.injection.content_key == injection.content_key
+
+    # 换一组压缩参数 -> 画面变了 -> content_key 必须不同（否则串味）
     other = compress(compress_crf=40)
     assert other.ok, other.reason
-    assert content_hash(other.injection.used_path) != content_hash(
-        injection.used_path
-    )
+    assert other.injection.content_key == expected(40)
     assert other.injection.content_key != injection.content_key
+
+
+def test_content_key_ignores_the_non_reproducible_artifact_bytes(
+    media_tools, ffmpeg_dir, noisy_video, tmp_path, make_placeholder, stub_logger,
+    monkeypatch,
+):
+    """产物字节**每次都不一样**时，content_key 仍必须稳定（P1-1 的根因锁）。
+
+    真 ffmpeg 的产物是"通常不同"，本用例把它变成**确定性**事实：桩每次写出不同
+    的字节（带调用序号）。若 key 取产物哈希，这里就会得到两个 key；取
+    「源内容哈希 + 压缩参数」则只有一个 —— 而这正是视觉缓存能否命中的全部区别。
+    """
+    from vv_plugin.core import media
+    from vv_plugin.core.injector import prepare_video
+
+    calls: list[list[str]] = []
+
+    def fake_run(args, timeout):
+        calls.append(list(args))
+        with open(args[-1], "wb") as handle:
+            # 非空 + 每次不同：模拟"同一源同参压出来的字节不可复现"
+            handle.write(b"\x00\x00\x00\x18ftypmp42" + f"run{len(calls)}".encode())
+
+    monkeypatch.setattr(media, "_run_ffmpeg", fake_run)
+
+    def compress():
+        config = VideoConfig(
+            provider_mode="openai_compat",
+            openai_base_url="http://127.0.0.1:9/v1",
+            openai_api_key="sk-x",
+            openai_model="m",
+            ffmpeg_path=ffmpeg_dir,
+            max_size_mb=0.25,
+            compress_max_mb=0.2,
+            cache_enabled=False,
+        )
+        return prepare_video(
+            make_placeholder(noisy_video),
+            config=config,
+            cache_root="",
+            logger=stub_logger,
+        )
+
+    first = compress()
+    second = compress()
+    assert first.ok and second.ok, (first.reason, second.reason)
+    assert len(calls) == 2, "前提：确实压了两次（关掉压缩缓存）"
+    assert first.injection.content_key, "视觉缓存开启时必须算得出 key"
+    assert first.injection.content_key == second.injection.content_key
+
+
+def test_compress_cache_key_is_unchanged_and_is_the_vision_key(
+    media_tools, ffmpeg_dir, noisy_video, tmp_path, make_placeholder, stub_logger
+):
+    """压缩缓存 key 必须与 0.3.0 第一版**逐字节相同**，且就是视觉 key 的正文。
+
+    两件事一起锁：
+
+    1. **升级不许让已有缓存失效**：用旧实现的公式手工预热一个产物，新实现必须
+       命中它（P1-1 只改"视觉缓存取什么"，不许顺带改压缩缓存的 key）；
+    2. **同源承诺**：视觉 key = ``<action>:<压缩缓存 key>`` —— 两处由同一个
+       signature 产生，``cache_enabled`` 的开关因此不会改变视觉缓存的 key。
+    """
+    import shutil
+
+    from vv_plugin.core.injector import content_hash_from_text, prepare_video
+    from vv_plugin.core.media import OUTPUT_SUFFIX, content_hash
+
+    cache_root = tmp_path / "cache"
+    cache_root.mkdir()
+    # 旧实现的公式（0.3.0 第一版，逐字抄）：源内容哈希 | compress_max_mb | crf |
+    # preset | truncate_to。truncate_to 在"只超体积、不超时长"时是 0.0。
+    legacy_key = content_hash_from_text(
+        f"{content_hash(noisy_video)}|0.2|30|veryfast|0.0"
+    )
+    shutil.copyfile(noisy_video, cache_root / f"{legacy_key}{OUTPUT_SUFFIX}")
+
+    config = VideoConfig(
+        provider_mode="openai_compat",
+        openai_base_url="http://127.0.0.1:9/v1",
+        openai_api_key="sk-x",
+        openai_model="m",
+        ffmpeg_path=ffmpeg_dir,
+        max_size_mb=0.25,
+        compress_max_mb=0.2,
+        vision_cache_enabled=True,
+    )
+    outcome = prepare_video(
+        make_placeholder(noisy_video),
+        config=config,
+        cache_root=str(cache_root),
+        logger=stub_logger,
+    )
+
+    assert outcome.ok, outcome.reason
+    assert "缓存命中" in outcome.injection.note, outcome.injection.note
+    assert outcome.injection.content_key == f"compressed:{legacy_key}"
 
 
 # ============================== 端到端：命中真的省了一次 HTTP（真 httpx）
@@ -472,6 +587,42 @@ def test_cache_hit_skips_the_service_call(
     hits = [m for m in stub_logger.messages("info") if "视觉缓存命中" in m]
     assert len(hits) == 1, stub_logger.records
     assert "TTL 剩" in hits[0]
+
+
+def test_compressed_video_hits_even_with_the_compress_cache_off(
+    media_tools, ffmpeg_dir, noisy_video, endpoint, stub_logger
+):
+    """``cache_enabled=false`` + ``vision_cache_enabled=true``：同源同参必须命中。
+
+    回归（ARCH-VV-C2 P1-1 的**端到端**面）：压缩分支的 key 曾经取产物哈希，而
+    同一源 + 同一组参数每次压出来的字节都不同 -> 第 2 次投递换一个 key ->
+    **再发一次 HTTP**（实测 3 次投递 = 3 次 POST、hits=0 misses=3 stores=3）。
+
+    修好之后：关掉压缩缓存只是"每次都要重压一遍本地视频"（省不掉的本地开销），
+    视觉缓存照常命中 —— 第 2 次投递的服务端 POST 增量必须是 **0**。
+    """
+    cache = VisionCache(ttl_sec=600.0, max_entries=8, clock=_Clock())
+    plugin = make_plugin(
+        endpoint.url,
+        vision_cache=cache,
+        cache_enabled=False,
+        ffmpeg_path=ffmpeg_dir,
+        max_size_mb=0.25,
+        compress_max_mb=0.2,
+    )
+
+    first = run_hook(plugin, noisy_video)
+    second = run_hook(plugin, noisy_video)
+
+    assert len(endpoint.requests) == 1, "同源同参的重复投递不许再发一次 HTTP"
+    assert cache.stats.hits == 1
+    assert cache.stats.stores == 1
+    assert len(cache) == 1, "只该有一个 key（3 个 key 正是修复前的症状）"
+    assert "第 1 次分析" in first[-1].text
+    assert "第 1 次分析" in second[-1].text, "命中时必须复用第一次的分析原文"
+    assert "第 2 次分析" not in second[-1].text
+    # 命中日志照样要出现（与 as-is 路径同一条文案）
+    assert len([m for m in stub_logger.messages("info") if "视觉缓存命中" in m]) == 1
 
 
 def test_a_different_question_misses_and_calls_again(endpoint, tiny_video, stub_logger):

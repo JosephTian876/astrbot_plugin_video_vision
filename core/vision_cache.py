@@ -23,6 +23,19 @@ key 为什么是"规范化 JSON 的 sha256"而不是 ``"|".join(...)``
 明确**不**进 key 的东西：``openai_api_key``（换密钥不改变语义）、
 ``openai_timeout_sec``、``vision_verify_ssl``、视频文件名（QQ 每次落地名都不同，
 放进去等于永不命中）、会话 ID（跨会话共享正是收益来源）。
+
+``video`` 这一维：**"源 + 参数"，不是产物字节**
+------------------------------------------------
+压缩/截断过的视频，这一维是 ``<action>:<压缩签名>``，签名 = 源内容哈希 +
+压缩参数（``compress_max_mb`` / ``crf`` / ``preset`` / ``truncate_to``），与
+**压缩缓存 key 完全同源**（``core/injector.py`` 的 ``compress_signature``）。
+
+为什么不用"真正发出去的字节"的哈希：产物**不可复现** —— 同一源 + 同一组参数
+每次压出来的 mp4 都不一样（熵编码 + 封装时间戳 + ``-fs`` 在 GOP 边界截断），
+实测 3 次同源同参 = 3 个不同的产物哈希。取产物哈希会让
+``vision_cache_enabled=true`` + ``cache_enabled=false`` 时**永不命中**
+（ARCH-VV-C2 P1-1）。"源 + 参数"决定模型看到的画面，既稳定、又能在压缩之前
+算出来；直通（as-is）视频的签名就是源文件内容哈希。
 """
 
 from __future__ import annotations
@@ -149,7 +162,9 @@ def cache_key(
     """六个维度 + ``KEY_VERSION`` 的 sha256（十六进制）。
 
     Args:
-        video: "真正发出去的字节"的标识（``VideoInjection.content_key``）。
+        video: 模型实际看到的画面的标识（``VideoInjection.content_key``）：
+            直通是 ``as-is:<源内容哈希>``，压缩/截断是
+            ``<action>:<源内容哈希 + 压缩参数>``（**不是**产物哈希，见模块说明）。
         prompt: ``build_vision_prompt()`` 的**最终输出**（已折叠用户问题与模板）。
         proto: ``"chat"`` 或 ``"responses"``（``_resolve_endpoint`` 的结果）。
         url: 最终请求 URL（换端点回答会变）。

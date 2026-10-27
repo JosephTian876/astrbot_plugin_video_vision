@@ -540,9 +540,11 @@ def vision_cache_key(
 ) -> str:
     """构造视觉结果缓存的 key；这条视频不可缓存时返回空串（fail-open）。
 
-    六个维度与 ``core.vision_cache.cache_key`` 一一对应：**实际发送字节**
-    （``injection.content_key``） / **最终 prompt** / 端点协议 / 端点 URL /
-    模型 / ``max_tokens``。
+    六个维度与 ``core.vision_cache.cache_key`` 一一对应：**模型实际看到的画面**
+    （``injection.content_key``：直通是 ``as-is:<源内容哈希>``，压缩/截断是
+    ``<action>:<源内容哈希 + 压缩参数>`` —— 与压缩缓存 key 同源，**不是**产物
+    哈希：产物字节每次都不一样，取它等于永不命中，ARCH-VV-C2 P1-1）/
+    **最终 prompt** / 端点协议 / 端点 URL / 模型 / ``max_tokens``。
 
     端点解析复用 ``openai_vision._resolve_endpoint`` —— 那是"base_url ->
     (协议, 最终 URL)"的唯一真相源；在这里复制一份规则，迟早会与真实请求分叉

@@ -98,10 +98,13 @@
 - **`/videotest` 绕过缓存，不是受益场景**：诊断必须反映真实链路，同一文件连跑两次
   = **两次真实 `POST`**（+1 / +1），两次回复来自两次不同的服务端回答；缓存条目在
   诊断前后原样保留（不读、不写）。
-- key = 六个维度的 sha256：**实际发送字节的哈希**（新增
-  `VideoInjection.content_key`：直通 `as-is:<源文件哈希>`、压缩
-  `<action>:<产物哈希>`）+ **最终 prompt**（`build_vision_prompt()` 的输出，已折叠
-  用户问题与模板）+ **端点协议** + **端点 URL** + **模型** + **max_tokens**。
+- key = 六个维度的 sha256：**视频标识**（新增 `VideoInjection.content_key`：直通
+  `as-is:<源文件哈希>`、压缩 `<action>:<压缩签名>`，签名 = 源内容哈希 +
+  `compress_max_mb` + `crf` + `preset` + `truncate_to`，**与压缩缓存 key 同源**；
+  **不是**产物哈希 —— 同一源同参每次压出来的字节都不一样，取产物哈希会让
+  `cache_enabled=false` 时永不命中，已修）+ **最终 prompt**（`build_vision_prompt()`
+  的输出，已折叠用户问题与模板）+ **端点协议** + **端点 URL** + **模型** +
+  **max_tokens**。
   另带 `KEY_VERSION`：载荷结构一变，旧条目自动失效。
   为什么不用 `"v1|…"` 拼接：prompt 是用户文本，朴素拼接会让
   `video="a|b", prompt="c"` 与 `video="a", prompt="b|c"` 拼出同一个 key，

@@ -71,13 +71,18 @@ class VideoInjection:
     duration_sec: float
     action: str  # as-is | compressed | truncated | rejected
     note: str = ""
-    #: "**真正发出去的那份字节**"的标识（视觉结果缓存 key 的第一个维度）。
+    #: 模型**实际看到的画面**的标识（视觉结果缓存 key 的第一个维度）。
     #:
     #: 直通时是 ``as-is:<源文件内容哈希>``；压缩/截断时是
-    #: ``<action>:<产物内容哈希>``。只在 ``openai_compat`` +
-    #: ``vision_cache_enabled`` 时计算（gemini_native 没有可缓存的文本结果，
-    #: 也不该为此白读一遍文件）。算不出来（文件已被删等）时是空串 ——
-    #: 钩子看到空串就**跳过缓存**，绝不因此阻断主流程。
+    #: ``<action>:<压缩签名>``，签名 = 源内容哈希 + 压缩参数
+    #: （``compress_max_mb`` / ``crf`` / ``preset`` / ``truncate_to``），
+    #: 与压缩缓存 key **完全同源**。**刻意不用产物字节的哈希**：同一源 + 同一组
+    #: 参数压出来的 mp4 每次都不一样（熵编码 + 封装时间戳 + ``-fs`` 在 GOP 边界
+    #: 截断），取产物哈希会让重复投递永不命中（ARCH-VV-C2 P1-1）。
+    #:
+    #: 只在 ``openai_compat`` + ``vision_cache_enabled`` 时计算（gemini_native 没有
+    #: 可缓存的文本结果，也不该为此白读一遍文件）。算不出来（文件已被删等）时是
+    #: 空串 —— 钩子看到空串就**跳过缓存**，绝不因此阻断主流程。
     content_key: str = ""
 
     @property
@@ -189,23 +194,58 @@ def _prepare_video(
 
     source = placeholder.path
 
-    def content_key_for(path: str, action: str) -> str:
-        """算"真正发出去的那份字节"的标识；不适用/算不出来时返回空串。
+    #: 视觉缓存的 key 第 1 维要不要算。``gemini_native`` 不调用视觉服务、没有可
+    #: 缓存的文本结果，那条路径连一次哈希都不做（与 0.2.1 的零开销一致）。
+    vision_key_enabled = bool(
+        config.vision_cache_enabled
+        and config.effective_provider_mode == "openai_compat"
+    )
 
-        **必须在临时目录被 ``finally`` 清掉之前调用**：压缩产物在非缓存路径下
-        返回时，返回之后临时目录就删了（``content_hash`` 会 ``FileNotFoundError``）。
-        成本：13MB ≈ 8ms，只在 ``openai_compat`` + 缓存开启时发生。
+    #: 源文件内容哈希的惰性缓存（只算一次）：压缩缓存 key 与视觉缓存 key 共用。
+    #: 算不出来时留空串 —— 空标识必须让上层**跳过缓存**，绝不能拿同一个空串
+    #: 去撞别人的条目。
+    digest: list[str] = []
+
+    def source_digest() -> str:
+        if not digest:
+            try:
+                digest.append(content_hash(source))
+            except Exception as exc:  # noqa: BLE001 - 算不出来就不缓存，绝不阻断
+                log.debug("[VideoVision] 源文件哈希算不出来: %s", exc)
+                digest.append("")
+        return digest[0]
+
+    def content_key_for(identity: str, action: str) -> str:
+        """把「可复现标识」包装成 ``VideoInjection.content_key``；不适用时空串。
+
+        直通（as-is）时 ``identity`` 就是源文件内容哈希；压缩/截断时是
+        :func:`compress_signature` 的返回值（源内容哈希 + 压缩参数）。
+
+        **为什么不再取"真正发出去的那份字节"的哈希**（0.3.0 的第一版做法）：
+        压缩产物**不可复现** —— 同一源 + 同一组参数每次压出来的 mp4 都不一样
+        （熵编码 + 封装时间戳 + ``-fs`` 在 GOP 边界截断），实测 3 次同源同参 =
+        3 个不同的产物哈希。取产物哈希等于让视觉缓存在 ``cache_enabled=false``
+        时**永不命中**（ARCH-VV-C2 P1-1）。而"源 + 参数"完全决定模型看到的画面，
+        既稳定又可在压缩**之前**算出来。
         """
-        if not (
-            config.vision_cache_enabled
-            and config.effective_provider_mode == "openai_compat"
-        ):
+        if not vision_key_enabled or not identity:
             return ""
-        try:
-            return f"{action}:{content_hash(path)}"
-        except Exception as exc:  # noqa: BLE001 - 算不出来就不缓存，绝不阻断
-            log.debug("[VideoVision] 视觉结果缓存的 content_key 算不出来: %s", exc)
+        return f"{action}:{identity}"
+
+    def compress_signature(truncate_to: float) -> str:
+        """压缩产物的可复现标识 —— 与**压缩缓存 key 完全同源**。
+
+        同一份签名既当压缩缓存 key（``cache_enabled`` 那段）、又当视觉缓存 key
+        的第 1 维，于是"有没有开压缩缓存"不会改变视觉缓存的 key。字段全是数字
+        + 白名单字符串（``core/config.py`` 的 ``VALID_PRESETS`` 兜住 preset）。
+        """
+        source_hash = source_digest()
+        if not source_hash:
             return ""
+        return content_hash_from_text(
+            f"{source_hash}|{config.compress_max_mb}"
+            f"|{config.compress_crf}|{config.compress_preset}|{truncate_to}"
+        )
 
     if not source or not os.path.exists(source):
         return PrepareOutcome(False, reason=f"文件不存在: {source}", kind="missing")
@@ -276,7 +316,11 @@ def _prepare_video(
                 size_mb=size_mb,
                 duration_sec=duration,
                 action=plan.outcome_action,
-                content_key=content_key_for(source, plan.outcome_action),
+                # 直通：发出去的就是源文件，标识 = 源内容哈希
+                content_key=content_key_for(
+                    source_digest() if vision_key_enabled else "",
+                    plan.outcome_action,
+                ),
             ),
         )
 
@@ -291,16 +335,23 @@ def _prepare_video(
             size_mb,
         )
 
+    # ---- 压缩产物的可复现标识（= 压缩缓存 key = 视觉缓存 key 的第 1 维）----
+    # 一处算、两处用：``cache_enabled`` 的开关于是**不会**改变视觉缓存的 key。
+    # 只在真要用时才付这次哈希（15MB 源 ≈ 10.7ms）；两个缓存都关时连哈希都不做。
+    cache_ready = bool(config.cache_enabled and cache_root)
+    signature = ""
+    if vision_key_enabled or cache_ready:
+        try:
+            signature = compress_signature(truncate_to)
+        except Exception as exc:  # noqa: BLE001 - 算不出来就不缓存，绝不阻断
+            log.debug("[VideoVision] 压缩签名算不出来（本次不缓存）: %s", exc)
+
     # ---- 缓存查找 ----
     cache: CompressCache | None = None
     cache_key = ""
-    if config.cache_enabled and cache_root:
+    if cache_ready and signature:
         try:
-            signature = (
-                f"{content_hash(source)}|{config.compress_max_mb}"
-                f"|{config.compress_crf}|{config.compress_preset}|{truncate_to}"
-            )
-            cache_key = content_hash_from_text(signature)
+            cache_key = signature
             cache = CompressCache(cache_root, config.cache_max_mb)
             hit = cache.get(cache_key)
             if hit:
@@ -327,8 +378,9 @@ def _prepare_video(
                         duration_sec=plan.expected_duration_sec,
                         action=plan.outcome_action,
                         note=f"缓存命中；{plan.note}",
-                        # 命中压缩缓存时，发出去的是**缓存产物**：哈希它而不是源文件
-                        content_key=content_key_for(hit, plan.outcome_action),
+                        # 与实时压缩同一条标识：产物字节不可复现，能复现的只有
+                        # "源 + 参数"（也就是这个 cache_key 本身）
+                        content_key=content_key_for(signature, plan.outcome_action),
                     ),
                 )
         except Exception as exc:  # noqa: BLE001
@@ -468,8 +520,9 @@ def _prepare_video(
                 duration_sec=new_duration,
                 action=plan.outcome_action,
                 note=note,
-                # 临时目录还没被 finally 清掉：必须在这里算完（之后再算就看不到产物了）
-                content_key=content_key_for(final_path, plan.outcome_action),
+                # 标识取"源 + 参数"（= cache_key），**不**取产物字节：后者每次
+                # 都不一样，取它就等于让视觉缓存永不命中（ARCH-VV-C2 P1-1）
+                content_key=content_key_for(signature, plan.outcome_action),
             ),
         )
     finally:

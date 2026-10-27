@@ -117,7 +117,7 @@ Responses API（`/responses`）同样实测支持：视频用 `input_image` + da
 | `ffmpeg_max_concurrency` | `2` | 进程内**全局**（跨会话）同时进行的 ffmpeg 转码数（0-8）。**`0` = 关闭限流**，行为回到 0.2.1 |
 | `ffmpeg_queue_timeout_sec` | `30.0` | 单个视频**等待槽位**的上限（1-600，不含转码本身）。超时 -> 失败分类 `busy` |
 | `ffmpeg_singleflight` | `true` | 同一内容 + 同一组压缩参数的并发转码只做一次（**依赖 `cache_enabled`**） |
-| `vision_cache_enabled` | `true` | 视觉理解结果缓存。**只在 `openai_compat` 生效**（`gemini_native` 不查不写），**只对完全相同的重复投递命中**（视频字节 + 最终 prompt + 端点 + 模型 + max_tokens），纯内存、重启即失效 |
+| `vision_cache_enabled` | `true` | 视觉理解结果缓存。**只在 `openai_compat` 生效**（`gemini_native` 不查不写），**只对完全相同的重复投递命中**（视频标识 = 源 + 压缩参数 + 最终 prompt + 端点 + 模型 + max_tokens），纯内存、重启即失效 |
 | `vision_cache_ttl_sec` | `600.0` | 条目存活时长（60-86400）。命中**不**续期 |
 | `vision_cache_max_entries` | `64` | 条目上限（1-1024），超出按 LRU 淘汰；64 条约 1MB |
 | `debug_log` | `false` | 详细调试日志（缓存计数只在这个级别可见；限流摘要在 `/videotest` 真的排过队时也会多一行） |
@@ -275,13 +275,20 @@ async with limiter.slot(name=name):
 key 是六个维度的 sha256：
 
 ```
-v1 | 实际发送字节的哈希 | 最终 prompt | 协议 | 端点 URL | 模型 | max_tokens
+v1 | 视频标识 | 最终 prompt | 协议 | 端点 URL | 模型 | max_tokens
 ```
 
-- **实际发送字节**（`VideoInjection.content_key`）：直通是 `as-is:<源文件哈希>`，
-  压缩是 `compressed:<产物哈希>`。压缩参数变了 = 模型看到的画面变了 = 必须换 key。
-  它在 `prepare_video` 内部、临时目录被清掉**之前**算好（产物在非缓存路径下返回后
-  就没了）。
+- **视频标识**（`VideoInjection.content_key`）＝ 模型实际看到的画面，取
+  **「源 + 参数」而不是产物字节**：
+  - 直通：`as-is:<源文件内容哈希>`；
+  - 压缩/截断：`<action>:<压缩签名>`，签名 = 源内容哈希 + `compress_max_mb` +
+    `crf` + `preset` + `truncate_to` —— 与**压缩缓存 key 完全同源**。
+
+  为什么不用"真正发出去的字节"的哈希：同一源 + 同一组参数压出来的 mp4
+  **每次都不一样**（熵编码 + 封装时间戳 + `-fs` 在 GOP 边界截断），实测 3 次
+  同源同参 = 3 个不同的产物哈希。取产物哈希会让 `cache_enabled=false` 时
+  视觉缓存**永不命中**（这正是 0.3.0 第一版的缺陷，已修）。压缩参数变了 =
+  模型看到的画面变了 = 仍然必须换 key。
 - **最终 prompt**：`build_vision_prompt()` 的输出（已折叠用户问题 + 两个模板）。
   只哈希原始 question 会漏掉模板改动。
 - **端点**：`(协议, 最终 URL)` —— 换端点/换协议回答会变。
