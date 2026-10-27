@@ -602,6 +602,64 @@ def test_unlimited_matches_the_limited_pipeline_byte_for_byte(tiny_video, stub_l
     assert limited_limiter.available == 2
 
 
+# ------------------------------------------- 0.3.0：每视频 INFO 的可观测性
+
+
+def test_per_video_info_line_reports_the_local_prepare_time(
+    tiny_video, stub_logger, monkeypatch
+):
+    """每视频那条 INFO 必须**同时**给出「视频时长」与「本地处理耗时」（P2-4）。
+
+    旧行只有一个 ``%.1fs``，而那是 ``inj.duration_sec`` —— **视频时长**，不是本地
+    处理耗时。于是"为什么慢"在没有排队（<1s）时完全查不到：既没有排队日志，也没有
+    耗时数字，只有 debug 级别才看得到的 ``压缩完成 | 耗时=…``。
+    """
+    import re
+    import time as time_module
+
+    from vv_plugin.core.injector import PrepareOutcome, VideoInjection
+
+    def slow_prepare(*args, **kwargs):
+        time_module.sleep(0.2)  # 确定的本地耗时：format_seconds 会渲染成 2xx ms
+        return PrepareOutcome(
+            True,
+            VideoInjection(
+                block={
+                    "type": "audio_url",
+                    "audio_url": {"url": "data:video/mp4;base64,AAAA"},
+                },
+                source_path=tiny_video,
+                used_path=tiny_video,
+                size_mb=1.0,
+                duration_sec=8.0,  # 视频本身 8 秒：绝不许拿它冒充本地耗时
+                action="as-is",
+            ),
+        )
+
+    monkeypatch.setattr(hooks, "prepare_video", slow_prepare)
+    parts = [_TextPart(f"[Video Attachment: name a.mp4, path {tiny_video}]")]
+    asyncio.run(
+        hooks.build_video_blocks(
+            parts,
+            config=VideoConfig(provider_mode="gemini_native"),
+            cache_root="",
+            limiter=None,
+        )
+    )
+
+    lines = [m for m in stub_logger.messages("info") if "视频已备好" in m]
+    assert len(lines) == 1, stub_logger.records
+    line = lines[0]
+    # 视频时长必须标注成"时长"，不许再是一个裸的 "8.0s"
+    assert "时长 8.0s" in line, line
+    match = re.search(r"本地处理 (\d+(?:\.\d+)?)(ms|s)", line)
+    assert match, line
+    value, unit = float(match.group(1)), match.group(2)
+    seconds = value / 1000 if unit == "ms" else value
+    assert 0.15 <= seconds <= 2.0, f"本地耗时量级不对: {line}"
+    assert "本地处理 8.0s" not in line, "视频时长不许冒充本地耗时"
+
+
 # ------------------------------------- 0.3.0：视觉结果缓存（hook 内部单元层）
 #
 # 端到端（真 httpx + 真端点 + 真 ffmpeg）在 ``tests/test_vision_cache.py``；

@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -301,12 +302,17 @@ async def build_video_blocks(
             continue
         seen_paths.add(key)
 
+        #: 本地处理耗时（取到槽之后才算；排队超时时保持 0，且那条走 WARNING 分支）
+        prepare_elapsed = 0.0
         try:
             # 槽位只包住**这一次** prepare（不许嵌套取槽）；等待全部在事件
             # 循环侧，worker 线程里没有任何 Semaphore。
             # 还槽绑定到 worker **真正**结束：外层被取消时 ffmpeg 线程还在跑，
             # 当场还槽会让真实并发 > limit（VERIFY-A P2-1）。
             async with slots.slot(name=placeholder.name) as slot:
+                # 只计**取到槽之后**的本地处理：排队等待有自己的日志（>=1s 一条），
+                # 两个数字混在一起会让"为什么慢"反而查不清（ARCH-VV-C2 P2-4）。
+                prepare_started = time.monotonic()
                 outcome = await slot.wait_for_worker(
                     asyncio.to_thread(
                         prepare_video,
@@ -317,6 +323,7 @@ async def build_video_blocks(
                         debug=config.debug_log,
                     )
                 )
+                prepare_elapsed = time.monotonic() - prepare_started
         except QueueTimeout as exc:
             # 排队超时是**独立的失败分类**：不复用 timeout（那句会把用户引向
             # max_compress_seconds，归因错误）。
@@ -332,12 +339,18 @@ async def build_video_blocks(
             prepared.append(PreparedVideo(index, placeholder.name, inj))
             consumed.add(index)
             logger.info(
-                "[VideoVision] 视频已备好: %s | %s | %.2fMB -> %.2fMB | %.1fs | %s%s",
+                # 两个数字必须各自标清含义：``时长`` 是**视频本身**多长，
+                # ``本地处理`` 是这条消息为了它花的本地时间（压缩/编码，不含排队）。
+                # 0.3.0 之前只有一个 ``%.1fs`` —— 那是视频时长，于是"为什么慢"在
+                # 没有排队时完全查不到（ARCH-VV-C2 P2-4）。
+                "[VideoVision] 视频已备好: %s | %s | %.2fMB -> %.2fMB"
+                " | 时长 %.1fs | 本地处理 %s | %s%s",
                 placeholder.name,
                 inj.action,
                 _safe_size(inj.source_path),
                 inj.size_mb,
                 inj.duration_sec,
+                format_seconds(prepare_elapsed),
                 inj.note or "正常",
                 "（File 组件按视频处理）" if placeholder.is_file_kind else "",
             )
