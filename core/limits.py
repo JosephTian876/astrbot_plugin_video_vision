@@ -126,6 +126,11 @@ class LimiterStats:
         """
         if self.waits <= 0 and self.timeouts <= 0:
             return ""
+        if self.timeouts and self.waits <= 0:
+            # 只有"排队超时"、没有一次排队成功时，别渲染成
+            # 「排队 0 次，最长 0ms，累计 0ms，超时 1 次」——那三个 0 与后面的
+            # 「超时 1 次」自相矛盾（VERIFY-VV-R7 P2-3 实测复现）。
+            return f"超时 {self.timeouts} 次（没有一次排队成功）"
         parts = [
             f"排队 {self.waits} 次",
             f"最长 {format_seconds(self.max_wait_sec)}",

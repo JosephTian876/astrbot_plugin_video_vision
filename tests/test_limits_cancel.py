@@ -640,7 +640,7 @@ def test_videotest_adds_the_queue_summary_only_when_someone_waited(
     plugin.cache_root = str(tmp_path / "cache")
 
     clean = asyncio.run(plugin._diagnose(tiny_video, event=None))
-    assert "排队   :" not in clean, clean
+    assert "队列   :" not in clean, clean
 
     plugin.limiter = SlotLimiter(2, queue_timeout=30.0)
     plugin.limiter.stats = LimiterStats(
@@ -648,7 +648,7 @@ def test_videotest_adds_the_queue_summary_only_when_someone_waited(
     )
     report = asyncio.run(plugin._diagnose(tiny_video, event=None))
 
-    line = [item for item in report.splitlines() if item.startswith("排队   :")]
+    line = [item for item in report.splitlines() if item.startswith("队列   :")]
     assert len(line) == 1, report
     assert "排队 3 次" in line[0]
     assert "最长 12.3s" in line[0]
@@ -660,6 +660,17 @@ def test_limiter_stats_summary_is_empty_when_nothing_queued():
     assert LimiterStats().summary() == ""
     assert LimiterStats(peak_inflight=2).summary() == ""
     assert "排队 1 次" in LimiterStats(waits=1, max_wait_sec=0.4).summary()
+
+
+def test_limiter_stats_summary_never_says_zero_queue_while_timing_out():
+    """只有超时、没有一次排队成功时，不许渲染「排队 0 次，最长 0ms，累计 0ms」。
+
+    VERIFY-VV-R7 P2-3 实测复现过这行自相矛盾的摘要。
+    """
+    text = LimiterStats(waits=0, timeouts=2).summary()
+    assert "排队 0 次" not in text, text
+    assert "0ms" not in text, text
+    assert "超时 2 次" in text, text
 
 
 def test_gemini_native_does_not_claim_the_vision_cache_is_active(stub_logger):

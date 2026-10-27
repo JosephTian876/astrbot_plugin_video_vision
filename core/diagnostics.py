@@ -402,7 +402,9 @@ def render_report(
     # 只在**真的排过队 / 超时过**时出现（``LimiterStats.summary()`` 为空串时
     # 一行都不加），正常路径的报告格式保持原样。
     if queue_summary:
-        lines.append(f"排队   : {queue_summary}")
+        # 标签用「队列」而不是「排队」：summary() 自己已经以「排队 N 次」开头，
+        # 用「排队   : 」会渲染成「排队   : 排队 3 次…」（VERIFY-VV-R7 P2-3）。
+        lines.append(f"队列   : {queue_summary}")
 
     # ---- 将要发给视觉服务的 prompt 预览（截断）----
     lines.append(f"prompt : {prompt_preview(cfg, mode)}")
