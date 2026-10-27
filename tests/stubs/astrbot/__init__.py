@@ -2,7 +2,7 @@
 
 插件在模块级就 ``import astrbot``；为了在仓库外（没有 AstrBot 安装的环境）跑
 pytest，这里提供**只覆盖插件实际用到的那几个符号**的桩实现。桩的签名与语义
-对齐 AstrBot 4.29.3（见 ``work/astrbot-upstream``），不引入任何真实框架行为。
+对齐 AstrBot 4.29.1（见 ``work/astrbot-upstream``），不引入任何真实框架行为。
 
 注意：桩**不是**被测对象。凡是框架契约相关的地方（``GreedyStr`` 的贪婪语义、
 ``CommandFilter`` 的参数提取），测试里都直接复刻框架那几行源码做断言，避免

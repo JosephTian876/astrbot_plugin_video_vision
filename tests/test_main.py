@@ -70,7 +70,7 @@ def test_videotest_path_is_registered_as_greedy():
     "raw_path",
     [
         r"C:\Program Files\Some App\视频 1.mp4",
-        r"C:\Users\UwU\Videos\中文 空格 都有.mp4",
+        r"C:\videos\中文 空格 都有.mp4",
         r"D:\a b\c d\e.mp4",
     ],
 )

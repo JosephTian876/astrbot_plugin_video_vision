@@ -11,7 +11,7 @@
 
 手动跑法::
 
-    D:\\AstrBot\\backend\\python\\python.exe tests/contract_probe.py
+    <AstrBot python> tests/contract_probe.py
 
 退出码：0 = 全部通过；2 = 没有真框架（调用方据此 skip）；1 = 断言失败。
 """

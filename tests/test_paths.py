@@ -49,7 +49,7 @@ REPO = Path(__file__).resolve().parents[1]
         ("clip.MP4", ".mp4"),
         ("clip.MoV", ".mov"),
         ("/tmp/a.b/clip.webm", ".webm"),
-        (r"D:\UwU\videos\a b c.mkv", ".mkv"),
+        (r"D:\media\videos\a b c.mkv", ".mkv"),
         ("archive.tar.gz", ".gz"),
         ("no-extension", ""),
         ("", ""),

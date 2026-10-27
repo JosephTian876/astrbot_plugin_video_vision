@@ -7,7 +7,7 @@
 默认 **skip**：venv 里没装 AstrBot 时，探针以退出码 2 结束，本用例 skip（CI 因此
 不会因为缺框架变红）。本地装了框架就跑得到::
 
-    D:\\AstrBot\\backend\\python\\python.exe -m pytest tests/test_contract.py -q
+    <AstrBot python> -m pytest tests/test_contract.py -q
 
 它锁三件事（AUDIT-030 §B.3）：
 

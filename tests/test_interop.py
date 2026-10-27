@@ -20,7 +20,7 @@
   外发前把整条回复换成 ``Plain(cleaned)``，并打一条
   ``logger.error("发送前拦截到回复复核内部判断: ...")``。
 
-真机证据（``C:\\Users\\UwU\\.astrbot\\data\\logs\\astrbot.log``，两次）::
+真机证据（``<AstrBot data>/logs/astrbot.log``，两次）::
 
     21:00:39 ERRO 发送前拦截到回复复核内部判断: reason=复核模型输出判定字段
     11:34:53 ERRO 发送前拦截到回复复核内部判断: reason=复核模型输出判定字段
