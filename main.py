@@ -55,6 +55,7 @@ from .core.media import (
 )
 from .core.openai_vision import analyze_video, build_vision_prompt
 from .core.placeholder import VIDEO_SUFFIXES, VideoPlaceholder
+from .core.vision_cache import VisionCache
 from .hooks.llm_request import (
     handle_llm_request,
     mark_degradation_warned,
@@ -172,6 +173,24 @@ class VideoVisionPlugin(Star):
         ffmpeg, ffprobe = resolve_ffmpeg_tools(self.config.ffmpeg_path)
         self.ffmpeg = ffmpeg
         self.ffprobe = ffprobe
+
+        #: 视觉理解结果缓存（**纯内存**、TTL + LRU）。
+        #: ``vision_cache_enabled=false`` -> 不建对象，钩子拿不到缓存 ->
+        #: 不查不写、``content_key`` 也不算 —— 逐字节回到 0.2.1。
+        #: 只对"完全相同"的重复投递生效：同一份视频字节 + 同一最终 prompt +
+        #: 同一端点 + 同一模型 + 同一 max_tokens（追问换了提问不会命中，这是设计）。
+        self.vision_cache: VisionCache | None = None
+        if self.config.vision_cache_enabled:
+            self.vision_cache = VisionCache(
+                ttl_sec=self.config.vision_cache_ttl_sec,
+                max_entries=self.config.vision_cache_max_entries,
+            )
+            logger.info(
+                "[VideoVision] 视觉结果缓存已启用：TTL=%.0fs，最多 %d 条"
+                "（纯内存、重启即失效；只对完全相同的重复投递命中）",
+                self.vision_cache.ttl_sec,
+                self.vision_cache.max_entries,
+            )
 
         # 启动日志的**文本**在 diagnostics（纯函数，可单测），按级别打出去与
         # 下面的状态变更留在这里。

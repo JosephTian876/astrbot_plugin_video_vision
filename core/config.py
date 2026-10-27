@@ -43,6 +43,15 @@ FFMPEG_CONCURRENCY_CEILING = 8
 #: 若也给 60s，最坏情况会顶穿 ``openai_timeout_sec=180``。
 QUEUE_TIMEOUT_CEILING = 600.0
 
+#: 0.3.0：视觉理解结果缓存。TTL 上界取 24h —— 再长就等于"重启前永远命中"，
+#: 而端点侧模型/prompt 的真实变化用户是感知不到的（缓存只在**完全相同**的
+#: 重复投递上命中，长 TTL 不会扩大命中面，只会推迟"重新验证"的时刻）。
+VISION_CACHE_TTL_CEILING = 86400.0
+
+#: 条目数上界：按 ``openai_vision.MAX_ANALYSIS_CHARS``（16KB）算，1024 条
+#: 最坏约 16MB 常驻 —— 已经超出"顺手加个缓存"的合理成本，所以上界就到这里。
+VISION_CACHE_ENTRIES_CEILING = 1024
+
 VALID_OVERSIZE_ACTIONS = ("compress", "reject", "truncate")
 VALID_PRESETS = ("ultrafast", "veryfast", "faster", "fast", "medium", "slow")
 
@@ -234,6 +243,8 @@ _NUMERIC_BOUNDS: dict[str, tuple[float, float]] = {
     #: 0 = 关闭限流（逐字节回到 0.2.1）
     "ffmpeg_max_concurrency": (0, FFMPEG_CONCURRENCY_CEILING),
     "ffmpeg_queue_timeout_sec": (1.0, QUEUE_TIMEOUT_CEILING),
+    "vision_cache_ttl_sec": (60.0, VISION_CACHE_TTL_CEILING),
+    "vision_cache_max_entries": (1, VISION_CACHE_ENTRIES_CEILING),
 }
 
 
@@ -354,6 +365,17 @@ class VideoConfig:
     #: 同一内容哈希的并发转码只做一次。依赖 ``cache_enabled``：
     #: 缓存关掉就没有可共享的产物，followers 只能自己压（会打一条 DEBUG）。
     ffmpeg_singleflight: bool = True
+
+    # -------- 0.3.0：视觉理解结果缓存（进程内、纯内存、TTL+LRU）--------
+    #: **只对"完全相同"的重复投递生效**：同一份视频字节 + 同一个最终 prompt +
+    #: 同一端点 + 同一模型 + 同一 max_tokens。追问时提问变了 -> 本来就不该命中
+    #: （AUDIT-030 §B.2 证伪了"连续追问每次重调"这个动机的前半段）。
+    #: 关闭时**完全不建缓存对象**，行为逐字节回到 0.2.1。
+    vision_cache_enabled: bool = True
+    #: 条目存活时长（60-86400）。命中**不**续期：否则热门条目永不过期。
+    vision_cache_ttl_sec: float = 600.0
+    #: LRU 容量（1-1024）。按 ``MAX_ANALYSIS_CHARS``=16KB 算，64 条约 1MB。
+    vision_cache_max_entries: int = 64
 
     # -------- 视觉服务商（provider_mode=openai_compat 时生效）--------
     provider_mode: str = "openai_compat"
@@ -486,6 +508,19 @@ class VideoConfig:
                 maximum=QUEUE_TIMEOUT_CEILING,
             ),
             ffmpeg_singleflight=_as_bool(data.get("ffmpeg_singleflight"), True),
+            vision_cache_enabled=_as_bool(data.get("vision_cache_enabled"), True),
+            vision_cache_ttl_sec=_as_float(
+                data.get("vision_cache_ttl_sec"),
+                600.0,
+                minimum=60.0,
+                maximum=VISION_CACHE_TTL_CEILING,
+            ),
+            vision_cache_max_entries=_as_int(
+                data.get("vision_cache_max_entries"),
+                64,
+                minimum=1,
+                maximum=VISION_CACHE_ENTRIES_CEILING,
+            ),
             provider_mode=_as_choice(
                 data.get("provider_mode"), "openai_compat", VALID_PROVIDER_MODES
             ),

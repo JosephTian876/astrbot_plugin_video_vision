@@ -112,6 +112,9 @@ Responses API（`/responses`）同样实测支持：视频用 `input_image` + da
 | `ffmpeg_max_concurrency` | `2` | 进程内**全局**（跨会话）同时进行的 ffmpeg 转码数（0-8）。**`0` = 关闭限流**，行为回到 0.2.1 |
 | `ffmpeg_queue_timeout_sec` | `30.0` | 单个视频**等待槽位**的上限（1-600，不含转码本身）。超时 -> 失败分类 `busy` |
 | `ffmpeg_singleflight` | `true` | 同一内容 + 同一组压缩参数的并发转码只做一次（**依赖 `cache_enabled`**） |
+| `vision_cache_enabled` | `true` | 视觉理解结果缓存。**只对完全相同的重复投递命中**（视频字节 + 最终 prompt + 端点 + 模型 + max_tokens），纯内存、重启即失效 |
+| `vision_cache_ttl_sec` | `600.0` | 条目存活时长（60-86400）。命中**不**续期 |
+| `vision_cache_max_entries` | `64` | 条目上限（1-1024），超出按 LRU 淘汰；64 条约 1MB |
 | `debug_log` | `false` | 详细调试日志（限流/缓存的计数也只在这个级别可见） |
 
 ### 两个体积旋钮怎么配合
@@ -230,16 +233,56 @@ async with limiter.slot(name=name):
   **自己接管一次**；
 - 两个线程拿到的是**同一个缓存产物**（`used_path` 相同），不是各压一份。
 
+### 视觉理解结果缓存（`vision_cache_enabled` / `vision_cache_ttl_sec` / `vision_cache_max_entries`）
+
+**先说清楚它不解决什么**：对同一段视频**换个问题再问**，不会因为缓存变快 ——
+用户追问时如果不重发/不引用视频，插件的钩子根本不运行（历史里既没有视频占位符，
+注入的分析也是 `mark_as_temp()` 的、落库时被丢弃）；追问时重新引用视频通常
+**换了提问**，那就**不该**命中缓存（用上一问的答案回答这一问才是 bug）。
+
+它解决的是另一半：**完全相同的重复投递** —— 同一个文件被两个人转发、失败重试、
+`/videotest` 紧跟一条真实消息之后又发一次 —— 现在会各花一次 60-120 秒的上传 +
+推理。key 是六个维度的 sha256：
+
+```
+v1 | 实际发送字节的哈希 | 最终 prompt | 协议 | 端点 URL | 模型 | max_tokens
+```
+
+- **实际发送字节**（`VideoInjection.content_key`）：直通是 `as-is:<源文件哈希>`，
+  压缩是 `compressed:<产物哈希>`。压缩参数变了 = 模型看到的画面变了 = 必须换 key。
+  它在 `prepare_video` 内部、临时目录被清掉**之前**算好（产物在非缓存路径下返回后
+  就没了）。
+- **最终 prompt**：`build_vision_prompt()` 的输出（已折叠用户问题 + 两个模板）。
+  只哈希原始 question 会漏掉模板改动。
+- **端点**：`(协议, 最终 URL)` —— 换端点/换协议回答会变。
+- **模型 / max_tokens**：换模型=换回答；上限不同输出可能被截断。
+- **不进 key**：API key（换密钥不改变语义）、超时、SSL 开关、视频文件名（QQ 每次
+  落地名不同，放进去等于永不命中）、会话 ID（跨会话共享正是收益来源）。
+
+行为细节：
+
+- **只缓存成功且非空的分析**：失败/超时绝不写缓存（否则一次网络抖动会被固定成
+  TTL 内的持续故障）。
+- **TTL 600s，命中不续期**；**LRU 64 条**（约 1MB 常驻）。纯内存、重启即失效、
+  不跨进程。
+- 命中时**不调用**视觉服务，注入文本仍走原来的包装（视频名/模型名用本次的），
+  日志单独打一条 `视觉缓存命中（TTL 剩 Xs）` —— 命中时 `elapsed/token` 记 0，
+  不会伪装成"接口变快了"。
+- **`/videotest` 绕过缓存**：诊断必须真实调用（那条路径直接调 `analyze_video`）。
+- `vision_cache_enabled=false` → **完全不建缓存对象**、`content_key` 也不算，
+  行为逐字节回到 0.2.1。
+
 ### 两条开关 = 逐字节回到 0.2.1
 
 | 开关 | 关掉之后 |
 |---|---|
 | `ffmpeg_max_concurrency = 0` | 不建令牌队列、不加任何等待、日志零新增 |
 | `ffmpeg_singleflight = false` | 压缩块不经过 flight，两个线程各压一次 |
+| `vision_cache_enabled = false` | 不建缓存对象、不算 `content_key`、钩子不查不写 |
 
-`LimiterStats`（等待次数 / 总等待 / 最大等待 / 超时次数 / 峰值并发）**只从
-`debug_log` 的日志里看得到** —— `/videotest` 的报告格式被测试锁死，本轮刻意
-不往里加新行。
+`LimiterStats`（等待次数 / 总等待 / 最大等待 / 超时次数 / 峰值并发）与
+`VisionCacheStats`（命中 / 未命中 / 写入 / 淘汰 / 过期）**只从 `debug_log` 的
+日志里看得到** —— `/videotest` 的报告格式被测试锁死，本轮刻意不往里加新行。
 
 ---
 
@@ -503,6 +546,7 @@ astrbot_plugin_video_vision/
 │   ├── injector.py         执行 decide 的 MediaPlan（压缩编排 + data URI 编码）
 │   ├── limits.py           ffmpeg 并发限流（async 令牌）+ 同文件 singleflight（线程事件）
 │   ├── openai_vision.py    OpenAI 兼容视觉服务客户端（实测格式见模块说明）
+│   ├── vision_cache.py     视觉结果缓存（TTL + LRU，纯内存，零 AstrBot）
 │   └── placeholder.py      占位文本解析
 └── hooks/
     └── llm_request.py      on_llm_request 注入逻辑
@@ -511,7 +555,7 @@ astrbot_plugin_video_vision/
 `core/` 下除 `injector.py` 从 `astrbot.api` 取 `logger` 之外**不依赖** AstrBot 的
 任何符号（插件市场安全检查要求日志记录器必须且只能来自 `astrbot.api`，所以这一处
 是有意保留的）。其余纯逻辑（`config` / `decide` / `diagnostics` / `media` /
-`openai_vision` / `placeholder`）可以直接搬进 AstrBot 核心。
+`limits` / `vision_cache` / `openai_vision` / `placeholder`）可以直接搬进 AstrBot 核心。
 
 ### CI
 
@@ -545,6 +589,9 @@ CI 里设了 **`VV_REQUIRE_FFMPEG=1`**：缺 ffmpeg 时相关用例**失败**而
 - **限流与缓存都只在进程内**：`ffmpeg_max_concurrency` 是**本进程**的闸门，
   不是全局资源锁；多开 AstrBot 实例时机器上仍会有 `实例数 × limit` 个 ffmpeg。
   视觉结果缓存同理 —— 纯内存、重启即失效，不跨进程共享。
+- **视觉结果缓存只在 `openai_compat` 生效**，且**只对完全相同的重复投递**命中
+  （视频字节 + 最终 prompt + 端点 + 模型 + max_tokens）；命中时日志里的
+  `elapsed/token` 记 0，别拿它当"接口变快了"的证据。`/videotest` **绕过**缓存。
 - 压缩缓存按源文件内容哈希做 key，**单个产物大于 `cache_max_mb` 时不会进缓存**，
   这类视频每次都会重新压缩。0.2.1 是**直接跳过它**（缓存里的其它条目不受影响）；
   0.2.0 相反：会先放进去、再被自己挤掉，还会连带清空其它条目。这类产物也**无法**

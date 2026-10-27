@@ -600,3 +600,176 @@ def test_unlimited_matches_the_limited_pipeline_byte_for_byte(tiny_video, stub_l
     assert limited_limiter.stats.waits == 0
     assert limited_limiter.inflight == 0
     assert limited_limiter.available == 2
+
+
+# ------------------------------------- 0.3.0：视觉结果缓存（hook 内部单元层）
+#
+# 端到端（真 httpx + 真端点 + 真 ffmpeg）在 ``tests/test_vision_cache.py``；
+# 这里锁住的是"命中路径不调用服务、构造出的结果零成本"以及多视频的顺序契约。
+
+
+def _fake_injection(content_key: str = "as-is:deadbeef", name: str = "a.mp4"):
+    from vv_plugin.core.injector import VideoInjection
+
+    return VideoInjection(
+        block={
+            "type": "audio_url",
+            "audio_url": {"url": "data:video/mp4;base64,AAAA"},
+        },
+        source_path=name,
+        used_path=name,
+        size_mb=1.0,
+        duration_sec=2.0,
+        action="as-is",
+        content_key=content_key,
+    )
+
+
+def make_openai_config(**kwargs):
+    options = {
+        "provider_mode": "openai_compat",
+        "openai_base_url": "http://127.0.0.1:9/v1",
+        "openai_api_key": "sk-x",
+        "openai_model": "vision-model",
+    }
+    options.update(kwargs)
+    return VideoConfig(**options)
+
+
+def _counting_analyze(monkeypatch, calls: list[list[tuple[str, str]]]):
+    from vv_plugin.core.openai_vision import VisionResult
+
+    async def fake_analyze_videos(videos, question, *, config, logger=None):
+        calls.append(list(videos))
+        return [
+            VisionResult(
+                True,
+                name,
+                analysis=f"分析{len(calls)}",
+                elapsed_sec=1.7,
+                prompt_tokens=120,
+                completion_tokens=9,
+            )
+            for name, _ in videos
+        ]
+
+    monkeypatch.setattr(hooks, "analyze_videos", fake_analyze_videos)
+    return fake_analyze_videos
+
+
+def test_vision_cache_hit_returns_a_zero_cost_result(monkeypatch, stub_logger):
+    """命中不调用 ``analyze_videos``，且结果显式标记为零成本（elapsed/token = 0）。"""
+    from vv_plugin.core.vision_cache import VisionCache
+
+    calls: list = []
+    _counting_analyze(monkeypatch, calls)
+    cache = VisionCache(ttl_sec=600.0, max_entries=4)
+    prepared = [hooks.PreparedVideo(0, "a.mp4", _fake_injection())]
+    config = make_openai_config()
+
+    first = asyncio.run(
+        hooks._analyze_prepared_videos(
+            prepared, "这视频讲了什么", config=config, logger=stub_logger, cache=cache
+        )
+    )
+    second = asyncio.run(
+        hooks._analyze_prepared_videos(
+            prepared, "这视频讲了什么", config=config, logger=stub_logger, cache=cache
+        )
+    )
+
+    assert len(calls) == 1, "第二次相同投递不该再调用视觉服务"
+    assert first[0].analysis == second[0].analysis == "分析1"
+    assert second[0].ok is True
+    assert second[0].elapsed_sec == 0.0
+    assert second[0].prompt_tokens == 0
+    assert second[0].completion_tokens == 0
+    assert cache.stats.hits == 1
+    assert len([m for m in stub_logger.messages("info") if "视觉缓存命中" in m]) == 1
+
+
+def test_vision_cache_miss_then_hit_only_sends_the_missing_video(
+    monkeypatch, stub_logger
+):
+    """多视频：命中的不进请求，未命中的才发；返回顺序必须与输入一致。"""
+    from vv_plugin.core.vision_cache import VisionCache, cache_key
+
+    calls: list = []
+    _counting_analyze(monkeypatch, calls)
+    cache = VisionCache(ttl_sec=600.0, max_entries=4)
+    config = make_openai_config()
+    prepared = [
+        hooks.PreparedVideo(0, "a.mp4", _fake_injection("as-is:aaa", "a.mp4")),
+        hooks.PreparedVideo(1, "b.mp4", _fake_injection("as-is:bbb", "b.mp4")),
+    ]
+
+    # 先只把 a 的结果放进缓存（b 不在里面）
+    from vv_plugin.core.openai_vision import build_vision_prompt, _resolve_endpoint
+
+    prompt = build_vision_prompt(config, "问题")
+    proto, url = _resolve_endpoint(config.openai_base_url)
+    cache.put(
+        cache_key(
+            video="as-is:aaa",
+            prompt=prompt,
+            proto=proto,
+            url=url,
+            model=config.openai_model,
+            max_tokens=config.openai_max_tokens,
+        ),
+        "a 的旧分析",
+    )
+
+    results = asyncio.run(
+        hooks._analyze_prepared_videos(
+            prepared, "问题", config=config, logger=stub_logger, cache=cache
+        )
+    )
+
+    assert len(calls) == 1
+    assert calls[0] == [("b.mp4", "data:video/mp4;base64,AAAA")], "只该发 b"
+    assert results[0].analysis == "a 的旧分析"
+    assert results[1].analysis == "分析1"
+    assert results[0].name == "a.mp4" and results[1].name == "b.mp4"
+
+
+def test_vision_cache_is_skipped_when_the_content_key_is_empty(
+    monkeypatch, stub_logger
+):
+    """算不出"发出去的字节"时（content_key="")必须直接跳过缓存（fail-open）。"""
+    from vv_plugin.core.vision_cache import VisionCache
+
+    calls: list = []
+    _counting_analyze(monkeypatch, calls)
+    cache = VisionCache(ttl_sec=600.0, max_entries=4)
+    prepared = [hooks.PreparedVideo(0, "a.mp4", _fake_injection(""))]
+
+    for _ in range(2):
+        asyncio.run(
+            hooks._analyze_prepared_videos(
+                prepared, "问题", config=make_openai_config(), logger=stub_logger,
+                cache=cache,
+            )
+        )
+
+    assert len(calls) == 2
+    assert cache.stats.stores == 0
+    assert len(cache) == 0
+
+
+def test_disabled_vision_cache_calls_the_service_every_time(monkeypatch, stub_logger):
+    """``cache=None``（``vision_cache_enabled=false``）：不查不写，逐字节等于 0.2.1。"""
+    calls: list = []
+    _counting_analyze(monkeypatch, calls)
+    prepared = [hooks.PreparedVideo(0, "a.mp4", _fake_injection())]
+
+    for _ in range(2):
+        asyncio.run(
+            hooks._analyze_prepared_videos(
+                prepared, "问题", config=make_openai_config(), logger=stub_logger,
+                cache=None,
+            )
+        )
+
+    assert len(calls) == 2
+    assert not [m for m in stub_logger.messages("info") if "视觉缓存" in m]

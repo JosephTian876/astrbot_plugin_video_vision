@@ -33,6 +33,9 @@ OPENAI_TIMEOUT_SEC_CEILING = getattr(
 #: 0.3.0 新增：ffmpeg 并发限流（AUDIT-030 §C.1）
 FFMPEG_CONCURRENCY_CEILING = getattr(config_mod, "FFMPEG_CONCURRENCY_CEILING", 8)
 QUEUE_TIMEOUT_CEILING = getattr(config_mod, "QUEUE_TIMEOUT_CEILING", 600.0)
+#: 0.3.0 新增：视觉结果缓存（AUDIT-030 §C.2）
+VISION_CACHE_TTL_CEILING = getattr(config_mod, "VISION_CACHE_TTL_CEILING", 86400.0)
+VISION_CACHE_ENTRIES_CEILING = getattr(config_mod, "VISION_CACHE_ENTRIES_CEILING", 1024)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -618,3 +621,55 @@ def test_enum_values_still_fall_back_to_default():
     assert cfg.oversize_action == "compress"
     assert cfg.compress_preset == "veryfast"
     assert cfg.provider_mode == "openai_compat"
+
+
+# ---------------------------------------- 0.3.0：视觉缓存三个键（边界/垃圾值）
+
+
+#: 视觉缓存的三个键与 (默认值, 下界, 上界)；``vision_cache_enabled`` 是布尔，另测
+VISION_CACHE_KEYS = {
+    "vision_cache_ttl_sec": (600.0, 60.0, VISION_CACHE_TTL_CEILING),
+    "vision_cache_max_entries": (64, 1, VISION_CACHE_ENTRIES_CEILING),
+}
+
+
+def test_vision_cache_numeric_keys_bounds_and_garbage():
+    for key, (default, low, high) in VISION_CACHE_KEYS.items():
+        # 明确"取不到数字"的垃圾值 -> 回落默认
+        for value in NON_NUMERIC_GARBAGE:
+            assert getattr(VideoConfig.from_mapping({key: value}), key) == default, (
+                key,
+                value,
+            )
+        # 任何数值 -> 收敛进边界，绝不抛
+        for value in GARBAGE_VALUES:
+            resolved = getattr(VideoConfig.from_mapping({key: value}), key)
+            assert low <= resolved <= high, (key, value, resolved)
+        # 类型必须严格（int/float），schema 里 `test_schema_type_matches_annotation`
+        # 还会再对一遍注解
+        assert type(VideoConfig.from_mapping({key: default}).__dict__[key]) is type(
+            default
+        ), key
+        bounds = config_mod._NUMERIC_BOUNDS
+        assert bounds[key] == (low, high), key
+
+
+def test_vision_cache_numeric_keys_clamp_with_one_notice():
+    cfg, notices = VideoConfig.from_mapping_detailed({"vision_cache_ttl_sec": 5})
+    assert cfg.vision_cache_ttl_sec == 60.0
+    assert notices == [
+        f"vision_cache_ttl_sec={5:g} 低于下限 {60.0:g}，已收敛为 {60.0:g}"
+    ], notices
+
+    cfg, notices = VideoConfig.from_mapping_detailed({"vision_cache_max_entries": 4096})
+    assert cfg.vision_cache_max_entries == VISION_CACHE_ENTRIES_CEILING
+    assert any("vision_cache_max_entries" in item for item in notices)
+
+
+def test_vision_cache_enabled_defaults_to_true_and_false_disables_it():
+    assert VideoConfig().vision_cache_enabled is True
+    assert VideoConfig.from_mapping({}).vision_cache_enabled is True
+    for value in (False, 0, "false", "off", "no", "否"):
+        assert VideoConfig.from_mapping({"vision_cache_enabled": value}).vision_cache_enabled is False
+    for value in (None, [], {}, object()):
+        assert VideoConfig.from_mapping({"vision_cache_enabled": value}).vision_cache_enabled is True

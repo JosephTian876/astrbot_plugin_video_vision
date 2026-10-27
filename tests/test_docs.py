@@ -282,3 +282,45 @@ def test_readme_documents_the_concurrency_section():
         assert needle in README, needle
     assert "无限并发" not in README
     assert "不会压出超预算的文件" not in README
+
+
+# ---------------------------------------------- 0.3.0：视觉结果缓存（文档）
+
+
+def test_schema_hints_explain_the_vision_cache_knobs():
+    """面板 hint 必须写清"只对完全相同的重复投递命中"、TTL 与容量语义。"""
+    enabled = SCHEMA["vision_cache_enabled"]["hint"]
+    assert "完全相同" in enabled
+    assert "重启" in enabled or "内存" in enabled
+    ttl = SCHEMA["vision_cache_ttl_sec"]["hint"]
+    assert "TTL" in ttl or "存活" in ttl
+    assert "续期" in ttl
+    entries = SCHEMA["vision_cache_max_entries"]["hint"]
+    assert "LRU" in entries or "最久未使用" in entries
+    assert "内存" in entries
+
+
+def test_readme_documents_the_vision_cache_section():
+    assert "vision_cache_enabled" in README
+    assert "vision_cache_ttl_sec" in README
+    assert "vision_cache_max_entries" in README
+    assert "视觉缓存" in README
+    # 审计证伪过的那句话不许出现在 README 里（追问不重发视频时插件根本不运行）
+    assert "连续追问" not in README
+    assert "追问更快" not in README
+    # 缓存只对"完全相同的重复投递"生效，这一点必须写清楚
+    assert "完全相同的" in README or "完全相同" in README
+    # /videotest 绕过缓存必须写清楚（诊断要真实调用）
+    assert "绕过" in README or "不经过缓存" in README
+
+
+def test_changelog_030_explains_the_vision_cache():
+    section = CHANGELOG.split("## 0.3.0", 1)[1].split("## 0.2.1", 1)[0]
+    for needle in (
+        "vision_cache_enabled",
+        "vision_cache_ttl_sec",
+        "vision_cache_max_entries",
+        # 被证伪的说法必须写明，否则用户会以为"追问更快"
+        "连续追问",
+    ):
+        assert needle in section, needle

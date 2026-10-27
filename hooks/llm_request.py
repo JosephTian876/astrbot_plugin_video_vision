@@ -47,11 +47,11 @@ from typing import Any
 
 from astrbot.api import logger
 
-from ..core import decide
+from ..core import decide, openai_vision, vision_cache
 from ..core.config import VideoConfig
 from ..core.injector import PrepareOutcome, VideoInjection, prepare_video
 from ..core.limits import NULL_LIMITER, QueueTimeout
-from ..core.openai_vision import analyze_videos
+from ..core.openai_vision import VisionResult, analyze_videos, build_vision_prompt
 from ..core.placeholder import (
     is_attachment_line,
     iter_placeholders,
@@ -531,6 +531,118 @@ def _wrap_vision_analysis(name: str, analysis: str, model: str) -> str:
     )
 
 
+def vision_cache_key(
+    injection: VideoInjection, prompt: str, config: VideoConfig
+) -> str:
+    """构造视觉结果缓存的 key；这条视频不可缓存时返回空串（fail-open）。
+
+    六个维度与 ``core.vision_cache.cache_key`` 一一对应：**实际发送字节**
+    （``injection.content_key``） / **最终 prompt** / 端点协议 / 端点 URL /
+    模型 / ``max_tokens``。
+
+    端点解析复用 ``openai_vision._resolve_endpoint`` —— 那是"base_url ->
+    (协议, 最终 URL)"的唯一真相源；在这里复制一份规则，迟早会与真实请求分叉
+    （换了端点却命中旧答案）。``openai_vision`` 的公开签名不受影响。
+    """
+    content_key = getattr(injection, "content_key", "")
+    if not content_key:
+        return ""
+    proto, url = openai_vision._resolve_endpoint(config.openai_base_url)
+    return vision_cache.cache_key(
+        video=content_key,
+        prompt=prompt,
+        proto=proto,
+        url=url,
+        model=config.openai_model,
+        max_tokens=config.openai_max_tokens,
+    )
+
+
+async def _analyze_prepared_videos(
+    prepared: list[PreparedVideo],
+    question: str,
+    *,
+    config: VideoConfig,
+    logger: Any,
+    cache: Any | None,
+) -> list[VisionResult]:
+    """查缓存 -> 未命中的并发调用视觉服务 -> 成功的写回缓存。
+
+    ``cache is None``（``vision_cache_enabled=false``）时**逐字节等于 0.2.1**：
+    一次 ``analyze_videos`` 调用，不预先算 prompt、不打任何新日志。
+
+    未命中路径刻意**不**改 ``analyze_videos`` 的签名（``tests/test_hooks.py``
+    的假函数依赖它）：代价是 prompt 会被 ``build_vision_prompt()`` 算两遍。
+    那是纯函数（一次字符串替换），比"改公开签名"便宜得多。
+
+    失败/空结果**绝不写缓存**：否则一次网络抖动会被固定成 TTL 内的持续故障，
+    而失败信息对模型也没有价值。
+    """
+    if cache is None:
+        return await analyze_videos(
+            [(item.name, item.injection.data_uri) for item in prepared],
+            question,
+            config=config,
+            logger=logger,
+        )
+
+    prompt = build_vision_prompt(config, question, logger=logger)
+    results: dict[int, VisionResult] = {}
+    keys: list[str] = []
+    pending: list[int] = []
+    for position, item in enumerate(prepared):
+        key = vision_cache_key(item.injection, prompt, config)
+        keys.append(key)
+        hit = cache.lookup(key) if key else None
+        if hit is None:
+            pending.append(position)
+            continue
+        # 命中路径：elapsed/token 显式记 0（不伪装成一次真实调用）
+        results[position] = VisionResult(
+            True, item.name, analysis=hit.analysis, elapsed_sec=0.0
+        )
+        logger.info(
+            "[VideoVision] 视觉缓存命中（TTL 剩 %.0fs）：%s", hit.ttl_left, item.name
+        )
+
+    if pending:
+        fresh = await analyze_videos(
+            [(prepared[i].name, prepared[i].injection.data_uri) for i in pending],
+            question,
+            config=config,
+            logger=logger,
+        )
+        for position, result in zip(pending, fresh):
+            results[position] = result
+            key = keys[position]
+            if not key:
+                continue
+            if result.ok and result.analysis.strip():
+                cache.put(key, result.analysis)
+            elif config.debug_log:
+                logger.info(
+                    "[VideoVision][debug] 视觉结果未写入缓存（ok=%s，空=%s）：%s",
+                    result.ok,
+                    not result.analysis.strip(),
+                    prepared[position].name,
+                )
+
+    if config.debug_log:
+        stats = cache.stats
+        logger.info(
+            "[VideoVision][debug] 视觉缓存 | 命中=%d 未命中=%d 写入=%d 淘汰=%d "
+            "过期=%d 条目=%d",
+            stats.hits,
+            stats.misses,
+            stats.stores,
+            stats.evictions,
+            stats.expirations,
+            len(cache),
+        )
+
+    return [results[index] for index in range(len(prepared))]
+
+
 async def handle_llm_request(plugin: Any, event: Any, req: Any) -> None:
     """钩子入口。任何异常都在内部消化，绝不打断对话。"""
     try:
@@ -692,11 +804,13 @@ async def _handle(plugin: Any, event: Any, req: Any) -> None:
                 len(prepared),
                 (question[:80] + "…") if len(question) > 80 else (question or "(无)"),
             )
-        results = await analyze_videos(
-            [(item.name, item.injection.data_uri) for item in prepared],
+        results = await _analyze_prepared_videos(
+            prepared,
             question,
             config=config,
             logger=logger,
+            # 插件实例上的缓存（``vision_cache_enabled=false`` 时为 None -> 不查不写）
+            cache=getattr(plugin, "vision_cache", None),
         )
         for item, result in zip(prepared, results):
             if result.ok:

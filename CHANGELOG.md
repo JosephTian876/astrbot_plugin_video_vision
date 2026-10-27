@@ -2,11 +2,14 @@
 
 ## 0.3.0
 
-新增 **3 个配置项**与两处新行为（ffmpeg 并发限流 + 同一文件并发只转码一次）。
+新增 **6 个配置项**与两处新行为（ffmpeg 并发限流 + 同一文件并发只转码一次；
+视觉理解结果的 TTL+LRU 缓存）。
 
-**两条开关都默认保守、且都能单独退回 0.2.1 的逐字节行为**：
-`ffmpeg_max_concurrency=0`（不限流）、`ffmpeg_singleflight=false`（不共享转码）。
-两条各有专门用例（`tests/test_limits.py` / `tests/test_injector.py` / `tests/test_hooks.py`）。
+**三条开关都默认保守、且都能单独退回 0.2.1 的逐字节行为**：
+`ffmpeg_max_concurrency=0`（不限流）、`ffmpeg_singleflight=false`（不共享转码）、
+`vision_cache_enabled=false`（不建视觉缓存对象）。
+三条各有专门用例（`tests/test_limits.py` / `tests/test_injector.py` /
+`tests/test_hooks.py` / `tests/test_vision_cache.py`）。
 
 ### 1. ffmpeg 并发限流：`ffmpeg_max_concurrency` / `ffmpeg_queue_timeout_sec` / `ffmpeg_singleflight`
 
@@ -64,11 +67,40 @@
   `排队 + 压缩` 吃掉 `openai_timeout_sec` 一半以上时显式提示 —— 因为视觉服务超时
   只管上传+推理，本地这两段发生在它之前（最坏情况会顶穿它）。
 
-### 2. 其他
+### 2. 视觉理解结果缓存：`vision_cache_enabled` / `vision_cache_ttl_sec` / `vision_cache_max_entries`
 
-- 既有 **441** 条用例全部保留并绿，新增用例覆盖上述限流与 singleflight。
-- 改这几个新键需要**重载插件**（limiter 在 `__init__` 里建）。
-- 新增模块 `core/limits.py`（限流 + singleflight），在 `core/` 下、不 import astrbot。
+- **先写清被证伪的那个说法**：群友提的"对同一视频连续追问时每次都要重新调视觉接口"
+  **不成立** —— 追问时如果不重发/不引用视频，插件的钩子**根本不运行**（历史里既没有
+  视频占位符，注入的分析也是 `mark_as_temp()`、落库时被丢弃）；而追问时重新引用视频，
+  通常**换了提问**，那时**本来就该**重新调用（命中才是 bug：用 A 问的答案回答 B 问）。
+- 成立的是另一半：**完全相同的重复投递**（同一个文件被两个人转发、失败重试、同一段
+  视频再发一次）。以前每次都要重付一次 60-120 秒的上传 + 推理，现在只付一次。
+- key = 六个维度的 sha256：**实际发送字节的哈希**（新增
+  `VideoInjection.content_key`：直通 `as-is:<源文件哈希>`、压缩
+  `<action>:<产物哈希>`）+ **最终 prompt**（`build_vision_prompt()` 的输出，已折叠
+  用户问题与模板）+ **端点协议** + **端点 URL** + **模型** + **max_tokens**。
+  另带 `KEY_VERSION`：载荷结构一变，旧条目自动失效。
+  为什么不用 `"v1|…"` 拼接：prompt 是用户文本，朴素拼接会让
+  `video="a|b", prompt="c"` 与 `video="a", prompt="b|c"` 拼出同一个 key，
+  所以走规范化 JSON（`tests/test_vision_cache.py::test_key_separates_field_boundaries`）。
+- **只缓存成功且非空的分析**：失败/超时一律不写（否则一次网络抖动会被固定成 TTL 内的
+  持续故障，而失败信息对模型也没有价值）。
+- TTL 默认 **600s**（60-86400），**命中不续期**（否则热门条目永不过期）；容量默认
+  **64 条**（1-1024，按单条 16KB 估算约 1MB），超出按 LRU 淘汰。**纯内存、重启即失效**、
+  不落盘、不跨进程。
+- 命中时**不调用**视觉服务，注入仍走原来的包装（视频名/模型名用本次的），日志单独打
+  一条 `视觉缓存命中（TTL 剩 Xs）`；命中结果的 `elapsed/token` 记 0，**不伪装**成
+  一次真实调用。`/videotest` **绕过**缓存（诊断必须真实调用）。
+- `vision_cache_enabled=false` → **完全不建缓存对象**、`content_key` 也不计算，
+  行为逐字节回到 0.2.1。
+- 新增模块 `core/vision_cache.py`（纯标准库、零 AstrBot 依赖）。
+
+### 3. 其他
+
+- 既有 **441** 条用例全部保留并绿，新增用例覆盖上述限流、singleflight 与视觉缓存。
+- 改这几个新键都需要**重载插件**（limiter / 缓存在 `__init__` 里建）。
+- 新增模块 `core/limits.py`（限流 + singleflight）与 `core/vision_cache.py`
+  （视觉结果缓存），都在 `core/` 下、不 import astrbot。
 
 ## 0.2.1
 

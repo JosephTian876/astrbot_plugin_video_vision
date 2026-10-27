@@ -71,6 +71,14 @@ class VideoInjection:
     duration_sec: float
     action: str  # as-is | compressed | truncated | rejected
     note: str = ""
+    #: "**真正发出去的那份字节**"的标识（视觉结果缓存 key 的第一个维度）。
+    #:
+    #: 直通时是 ``as-is:<源文件内容哈希>``；压缩/截断时是
+    #: ``<action>:<产物内容哈希>``。只在 ``openai_compat`` +
+    #: ``vision_cache_enabled`` 时计算（gemini_native 没有可缓存的文本结果，
+    #: 也不该为此白读一遍文件）。算不出来（文件已被删等）时是空串 ——
+    #: 钩子看到空串就**跳过缓存**，绝不因此阻断主流程。
+    content_key: str = ""
 
     @property
     def data_uri(self) -> str:
@@ -181,6 +189,24 @@ def _prepare_video(
 
     source = placeholder.path
 
+    def content_key_for(path: str, action: str) -> str:
+        """算"真正发出去的那份字节"的标识；不适用/算不出来时返回空串。
+
+        **必须在临时目录被 ``finally`` 清掉之前调用**：压缩产物在非缓存路径下
+        返回时，返回之后临时目录就删了（``content_hash`` 会 ``FileNotFoundError``）。
+        成本：13MB ≈ 8ms，只在 ``openai_compat`` + 缓存开启时发生。
+        """
+        if not (
+            config.vision_cache_enabled
+            and config.effective_provider_mode == "openai_compat"
+        ):
+            return ""
+        try:
+            return f"{action}:{content_hash(path)}"
+        except Exception as exc:  # noqa: BLE001 - 算不出来就不缓存，绝不阻断
+            log.debug("[VideoVision] 视觉结果缓存的 content_key 算不出来: %s", exc)
+            return ""
+
     if not source or not os.path.exists(source):
         return PrepareOutcome(False, reason=f"文件不存在: {source}", kind="missing")
     if not os.path.isfile(source):
@@ -250,6 +276,7 @@ def _prepare_video(
                 size_mb=size_mb,
                 duration_sec=duration,
                 action=plan.outcome_action,
+                content_key=content_key_for(source, plan.outcome_action),
             ),
         )
 
@@ -300,6 +327,8 @@ def _prepare_video(
                         duration_sec=plan.expected_duration_sec,
                         action=plan.outcome_action,
                         note=f"缓存命中；{plan.note}",
+                        # 命中压缩缓存时，发出去的是**缓存产物**：哈希它而不是源文件
+                        content_key=content_key_for(hit, plan.outcome_action),
                     ),
                 )
         except Exception as exc:  # noqa: BLE001
@@ -439,6 +468,8 @@ def _prepare_video(
                 duration_sec=new_duration,
                 action=plan.outcome_action,
                 note=note,
+                # 临时目录还没被 finally 清掉：必须在这里算完（之后再算就看不到产物了）
+                content_key=content_key_for(final_path, plan.outcome_action),
             ),
         )
     finally:

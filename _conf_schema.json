@@ -222,6 +222,24 @@
     "default": true,
     "hint": "开启后，同一份内容 + 同一组压缩参数（内容哈希 | compress_max_mb | crf | preset | truncate_to）的并发转码只做一次（即 singleflight：排队的请求复用 leader 的产物），其余请求等它把产物放进 cache_enabled 的压缩缓存后直接复用。**依赖 cache_enabled**：缓存关掉就没有可共享的产物 —— 启动时打一条 WARNING（配置自相矛盾），每个视频再打一条 debug 说明本次已跳过。leader 失败时按分类处理：确定性失败（文件损坏 / 缺 ffmpeg / 体积越界）原样返回，瞬时失败（超时 / 退出码）让等待者自己重试一次。"
   },
+  "vision_cache_enabled": {
+    "description": "视觉理解结果缓存",
+    "type": "bool",
+    "default": true,
+    "hint": "只对**完全相同**的重复投递生效：同一份视频字节 + 同一个最终 prompt（含用户问题与模板）+ 同一端点（协议 + URL）+ 同一模型 + 同一 max_tokens，在 TTL 内再次出现时直接复用上次的分析原文，省掉一次上传 + 推理（60-120 秒）。追问时提问变了**不会**命中 —— 这是设计，不是缺陷（用 A 问题的答案回答 B 问题才是 bug）。只缓存成功且非空的结果，失败/超时一律不缓存。**纯内存、重启即失效**、不落盘、不跨进程。关闭后插件完全不建缓存对象，行为逐字节回到 0.2.1。/videotest 的诊断**绕过**缓存（必须真实调用）。"
+  },
+  "vision_cache_ttl_sec": {
+    "description": "视觉缓存条目存活时长（秒）",
+    "type": "float",
+    "default": 600.0,
+    "hint": "60-86400。TTL 从**写入**时刻开始计时，命中**不**续期 —— 否则热门条目永不过期，会一直拿旧答案回答（换了模型/prompt 之后尤其难发现）。"
+  },
+  "vision_cache_max_entries": {
+    "description": "视觉缓存条目上限（LRU）",
+    "type": "int",
+    "default": 64,
+    "hint": "1-1024。超出后按最久未使用（LRU）淘汰；按单条分析最多 16KB 估算，64 条约 1MB 常驻内存。只在进程内、不落盘。"
+  },
   "debug_log": {
     "description": "详细调试日志",
     "type": "bool",

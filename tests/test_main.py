@@ -606,3 +606,58 @@ def test_singleflight_with_the_cache_off_warns_once_at_startup(stub_logger):
     off = make_plugin(_Context(), ffmpeg_singleflight=False, cache_enabled=False)
     assert not [m for m in stub_logger.messages("warning") if "singleflight" in m]
     assert off.singleflight_effective is False
+
+
+# ------------------------------------------------ 0.3.0：视觉缓存装配 / 绕过
+
+
+def test_plugin_builds_the_vision_cache_from_config(stub_logger):
+    on = make_plugin(
+        _Context(),
+        vision_cache_enabled=True,
+        vision_cache_ttl_sec=120.0,
+        vision_cache_max_entries=8,
+    )
+    assert on.vision_cache is not None
+    assert on.vision_cache.ttl_sec == 120.0
+    assert on.vision_cache.max_entries == 8
+
+    off = make_plugin(_Context(), vision_cache_enabled=False)
+    assert off.vision_cache is None, "关闭时完全不建缓存对象（逐字节等价 0.2.1）"
+
+
+def test_diagnose_bypasses_the_vision_cache(monkeypatch, media_tools, tiny_video, stub_logger):
+    """``/videotest`` 是诊断：必须真实调用视觉服务，不许命中缓存。"""
+    plugin = make_plugin(
+        _Context(),
+        provider_mode="openai_compat",
+        openai_base_url="http://127.0.0.1:9/v1",
+        openai_api_key="sk-x",
+        openai_model="vision-model",
+        vision_cache_enabled=True,
+    )
+    point_to_ffmpeg(plugin, media_tools)
+    plugin.cache_root = str(Path(tiny_video).parent / "cache")
+
+    calls: list[int] = []
+
+    async def fake_analyze_video(*args, **kwargs):
+        calls.append(1)
+        return VisionResult(True, "tiny.mp4", analysis="ok", elapsed_sec=0.1)
+
+    monkeypatch.setattr(main_module, "analyze_video", fake_analyze_video)
+
+    class _Tripwire:
+        def lookup(self, key):  # pragma: no cover - 被调用即失败
+            raise AssertionError("/videotest 不许查视觉缓存")
+
+        def put(self, key, analysis):  # pragma: no cover
+            raise AssertionError("/videotest 不许写视觉缓存")
+
+    plugin.vision_cache = _Tripwire()
+
+    first = run(plugin._diagnose(tiny_video, event=_Event()))
+    second = run(plugin._diagnose(tiny_video, event=_Event()))
+
+    assert len(calls) == 2, "两次诊断 = 两次真实调用"
+    assert "✅ 准备成功" in first and "✅ 准备成功" in second
