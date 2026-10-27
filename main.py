@@ -17,7 +17,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import os
 import time
 from typing import Any
@@ -459,7 +458,11 @@ class VideoVisionPlugin(Star):
             return f"{diagnostics.TITLE}\n❌ 不是文件: {target}"
 
         size_mb = file_size_mb(target)
-        duration = await asyncio.to_thread(probe_duration, target, self.ffprobe)
+        # 诊断也走 ffmpeg 专属池：默认池被别的插件/TTS 打满时，这里同样会躺在池队列里
+        # 无限等（AUDIT-VV-R9 P1-1 的同一根因），而 ``/videotest`` 是用户排障的第一步。
+        # ``limit=0`` 时 ``submit`` 直接退回 ``asyncio.to_thread``，与 0.2.1 等价。
+        slots = self.limiter if self.limiter is not None else NULL_LIMITER
+        duration = await slots.submit(probe_duration, target, self.ffprobe)
         mode = cfg.effective_provider_mode
         # provider 解析留在 hooks（要 plugin.context），结果作为纯数据交给渲染层
         provider = await self._provider_facts(event, mode)

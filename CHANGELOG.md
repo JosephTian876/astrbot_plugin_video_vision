@@ -84,8 +84,10 @@
   （配置自相矛盾），每个视频再打一条 debug 说明"本次已跳过"，两个线程各压一次。
   leader 失败时分流：确定性失败（`not_found` / `duration` / `corrupt` / `empty` /
   `too_large`）让 follower 原样承接（重试只会把 45s 超时乘以 N）；瞬时失败
-  （`timeout` / `exit_code` / `other`）或 follower 等待超时，允许它自己接管**一次**。
-  `SINGLEFLIGHT` 的登记表在 `finally` 里只摘自己那条 flight，不会误删后来者。
+  （`timeout` / `exit_code` / `other`）允许它自己接管**一次**。**等待超时不再接管**：
+  follower 只放弃这一轮等待、下一轮仍等同一个 leader（同 key 并发恒为 1），并打一条
+  `on_overdue` WARNING 让"leader 慢过 follower 预算"在日志里可见。
+  `SINGLEFLIGHT` 的登记表只有 leader 自己的 `finally` 能摘，follower 绝不删别人的登记。
 - 新增 `ffmpeg_queue_timeout_sec`（默认 30s）与一条 `normalized()` 告警：本地
   `排队 + 压缩` 吃掉 `openai_timeout_sec` 一半以上时显式提示 —— 因为视觉服务超时
   只管上传+推理，本地这两段发生在它之前（最坏情况会顶穿它）。**它就是开头那条

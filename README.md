@@ -267,8 +267,11 @@ async with limiter.slot(name=name) as slot:
   debug 说明"本次已跳过"；两个线程各压一次（与 0.2.1 相同）；
 - leader 失败时分流：确定性失败（`not_found` / `duration` / `corrupt` /
   `empty` / `too_large`）**原样返回**（重试只会把 45s 超时乘以 N）；
-  瞬时失败（`timeout` / `exit_code` / `other`）或等待超时 → follower
-  **自己接管一次**；
+  瞬时失败（`timeout` / `exit_code` / `other`）→ follower **自己接管一次**；
+- **等待超时不等于接管**（0.3.0 定稿语义）：follower 等满自己的等待预算后只是
+  **放弃这一轮等待**，下一轮仍等同一个 leader —— 同一个 key 的并发恒为 1。
+  同时打一条 `on_overdue` **WARNING**，让"leader 慢到超过 follower 预算"这件事
+  在日志里可见（否则用户只会看到"卡住"）；
 - 两个线程拿到的是**同一个缓存产物**（`used_path` 相同），不是各压一份。
 
 ### 视觉理解结果缓存（`vision_cache_enabled` / `vision_cache_ttl_sec` / `vision_cache_max_entries`）
