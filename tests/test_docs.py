@@ -355,3 +355,6 @@ def test_metadata_yaml_has_the_required_fields():
     # 四个必填字段之外，面板展示用的字段也不许丢
     for key in ("display_name", "short_desc", "astrbot_version"):
         assert fields.get(key), f"metadata.yaml 缺少 {key}"
+    # 特性清单要跟着版本走：0.3.0 的两处新行为都得在 description 里露过面
+    assert "ffmpeg 并发限流" in METADATA
+    assert "视觉理解结果缓存" in METADATA
