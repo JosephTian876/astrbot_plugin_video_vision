@@ -5,10 +5,11 @@
 新增 **6 个配置项**与三处变化（ffmpeg 并发限流 + 同一文件并发只转码一次；
 视觉理解结果的 TTL+LRU 缓存；删掉废弃的 `@register`）。
 
-**三条开关都默认保守**：`ffmpeg_max_concurrency=0`（不限流）、
-`ffmpeg_singleflight=false`（不共享转码）、`vision_cache_enabled=false`
-（不建视觉缓存对象）。三条都关、其余键也用 0.2.1 的原值时，**注入决策与既有
-日志行为等价**：9 个素材 × 11 组配置的 198 条 `prepare_video` + 40 份
+**三条开关的默认值**是 `ffmpeg_max_concurrency=2`（限流 2 路）、
+`ffmpeg_singleflight=true`（同一文件并发只转码一次）、`vision_cache_enabled=true`
+（建视觉缓存，只在 `openai_compat` 生效）。把它们改成 `0` / `false` / `false`
+并让其余键保持 0.2.1 的原值时，**注入决策与既有日志行为等价**：9 个素材 × 11 组
+配置的 198 条 `prepare_video` + 40 份
 `/videotest` 报告 + 3 次钩子端到端（共 241 条观测）与 0.2.1（`c00f6a2`）逐字段
 比较 **0 差异**。**唯一的例外**是与这三个开关无关的一条新告警：旧键
 `max_compress_seconds` 与 `ffmpeg_queue_timeout_sec` 的预算冲突时
