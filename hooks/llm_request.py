@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from astrbot.api import logger
@@ -610,26 +610,17 @@ async def _analyze_prepared_videos(
         )
 
     if pending:
-        fresh = await analyze_videos(
-            [(prepared[i].name, prepared[i].injection.data_uri) for i in pending],
-            question,
-            config=config,
-            logger=logger,
+        results.update(
+            await _analyze_pending(
+                prepared,
+                pending,
+                keys,
+                question,
+                config=config,
+                logger=logger,
+                cache=cache,
+            )
         )
-        for position, result in zip(pending, fresh):
-            results[position] = result
-            key = keys[position]
-            if not key:
-                continue
-            if result.ok and result.analysis.strip():
-                cache.put(key, result.analysis)
-            elif config.debug_log:
-                logger.info(
-                    "[VideoVision][debug] 视觉结果未写入缓存（ok=%s，空=%s）：%s",
-                    result.ok,
-                    not result.analysis.strip(),
-                    prepared[position].name,
-                )
 
     if config.debug_log:
         stats = cache.stats
@@ -645,6 +636,95 @@ async def _analyze_prepared_videos(
         )
 
     return [results[index] for index in range(len(prepared))]
+
+
+def _store_vision_result(
+    cache: Any,
+    key: str,
+    result: VisionResult,
+    name: str,
+    config: VideoConfig,
+    logger: Any,
+) -> None:
+    """成功且非空的才写缓存；失败/空一律不写（一次抖动不许被固定成 TTL 内故障）。"""
+    if not key:
+        return
+    if result.ok and result.analysis.strip():
+        cache.put(key, result.analysis)
+    elif config.debug_log:
+        logger.info(
+            "[VideoVision][debug] 视觉结果未写入缓存（ok=%s，空=%s）：%s",
+            result.ok,
+            not result.analysis.strip(),
+            name,
+        )
+
+
+async def _analyze_pending(
+    prepared: list[PreparedVideo],
+    pending: list[int],
+    keys: list[str],
+    question: str,
+    *,
+    config: VideoConfig,
+    logger: Any,
+    cache: Any,
+) -> dict[int, VisionResult]:
+    """未命中的视频：同 key 的**并发**投递只发一次 HTTP（P2-3）。
+
+    并发去重在 ``cache.flights``（``core.vision_cache.VisionFlights``）：第一个
+    调用是 leader，后来者等它的结果、不再发请求。串行路径不变 —— 一次投递里的
+    多个**不同**视频仍各自发一次请求。
+
+    写缓存放在 leader 的 ``call()`` 里而不是外层循环：等待者拿到的是**已经写好**
+    的结果，不会因为 N 个等待者各写一次而把 ``stores`` 计数放大 N 倍。
+    """
+    flights = getattr(cache, "flights", None)
+
+    async def analyze_one(position: int) -> VisionResult:
+        item = prepared[position]
+        key = keys[position]
+
+        async def call() -> VisionResult:
+            batch = await analyze_videos(
+                [(item.name, item.injection.data_uri)],
+                question,
+                config=config,
+                logger=logger,
+            )
+            result = (
+                batch[0]
+                if batch
+                else VisionResult(False, item.name, reason="视觉服务未返回结果")
+            )
+            _store_vision_result(cache, key, result, item.name, config, logger)
+            return result
+
+        if flights is None or not key:
+            return await call()
+        result = await flights.run(key, call)
+        # 等待者拿到的是 leader 的结果；文件名属于**本次**投递（同一份字节可能
+        # 来自两个不同文件名），所以换成自己的名字，别的字段保持真实调用的值。
+        return result if result.name == item.name else replace(result, name=item.name)
+
+    gathered = await asyncio.gather(
+        *(analyze_one(position) for position in pending), return_exceptions=True
+    )
+    out: dict[int, VisionResult] = {}
+    for position, result in zip(pending, gathered):
+        if isinstance(result, VisionResult):
+            out[position] = result
+            continue
+        # 意外异常不许拖垮同一条消息里的其它视频（``analyze_videos`` 也是这个口径）
+        logger.warning(
+            "[VideoVision] 视觉调用异常: %s | %s", prepared[position].name, result
+        )
+        out[position] = VisionResult(
+            False,
+            prepared[position].name,
+            reason=openai_vision._classify_error(result),
+        )
+    return out
 
 
 async def handle_llm_request(plugin: Any, event: Any, req: Any) -> None:

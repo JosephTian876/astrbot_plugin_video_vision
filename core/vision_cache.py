@@ -27,13 +27,15 @@ key 为什么是"规范化 JSON 的 sha256"而不是 ``"|".join(...)``
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Awaitable
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable
 
 #: key 的载荷版本。任何"让旧条目语义失效"的改动（例如换发送形态）都必须 +1。
 KEY_VERSION = 1
@@ -56,6 +58,97 @@ class VisionCacheStats:
     stores: int = 0
     evictions: int = 0
     expirations: int = 0
+
+
+#: ``work()`` 返回这个哨兵表示"没有结果"（与 ``None`` 区分开）
+_MISSING = object()
+
+
+@dataclass
+class _Flight:
+    """一次在飞的异步视觉请求（同 key 的后来者等它的结果）。"""
+
+    loop: asyncio.AbstractEventLoop
+    event: asyncio.Event
+    value: Any = _MISSING
+    error: BaseException | None = None
+
+
+class VisionFlights:
+    """同 key 的并发视觉请求只跑一次（asyncio 级 singleflight，fail-open）。
+
+    :class:`VisionCache` 只挡得住**先后**发生的重复投递；两个群**同时**发同一段
+    视频时，两边都查不到缓存、各发一次 60-120s 的上传 + 推理（VERIFY-B P2-3：
+    4 并发相同投递 = 4 次 POST）。这里让后到的调用等 leader，共享同一个结果。
+
+    契约：leader 成功 → 等待者拿到同一个分析文本（不再发 HTTP）；leader 抛异常
+    → 同一个异常向所有等待者传播（调用方据此不写缓存）；leader 被取消 → 等待者
+    自己接管（不把别人的取消传染给用户）；空 key → 直接 ``await work()``
+    （fail-open，绝不挡住请求）。
+
+    与 ``core.limits.SingleFlight`` 的区别：那个是**线程**版（给 ffmpeg 用），
+    等的是 ``threading.Event``；这里等的是协程，必须用 ``asyncio.Event`` ——
+    在事件循环线程里阻塞等会卡死整个 AstrBot。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._flights: dict[str, _Flight] = {}
+
+    @property
+    def pending(self) -> int:
+        """在飞的 flight 数（正常情况下任何时刻之后都必须回到 0）。"""
+        with self._lock:
+            return len(self._flights)
+
+    async def run(self, key: str, work: Callable[[], Awaitable[Any]]) -> Any:
+        """执行 ``work``（同 key 只一个真跑）；返回 leader 或 leader 的结果。"""
+        if not key:  # fail-open：算不出可比标识就不去重
+            return await work()
+        loop = asyncio.get_running_loop()
+        with self._lock:
+            flight = self._flights.get(key)
+            if flight is not None and flight.loop is not loop:
+                flight = None  # 换 loop：旧条目作废（它的等待者也在旧 loop 上）
+            leader = flight is None
+            if leader:
+                flight = _Flight(loop, asyncio.Event())
+                self._flights[key] = flight
+        if not leader:
+            await flight.event.wait()
+            if flight.error is not None:
+                raise flight.error  # 失败向等待者传播（调用方据此不写缓存）
+            if flight.value is not _MISSING:
+                return flight.value
+            return await self.run(key, work)  # leader 被取消：自己接管
+        try:
+            value = await work()
+        except asyncio.CancelledError:
+            self._settle(key, flight)  # 无结果：唤醒等待者让它自己接管
+            raise
+        except BaseException as exc:  # noqa: BLE001 - 失败必须原样传给等待者
+            self._settle(key, flight, error=exc)
+            raise
+        self._settle(key, flight, value=value)
+        return value
+
+    def _settle(
+        self,
+        key: str,
+        flight: _Flight,
+        *,
+        value: Any = _MISSING,
+        error: BaseException | None = None,
+    ) -> None:
+        """登记结果并唤醒等待者（只摘自己那条 flight）。"""
+        flight.value, flight.error = value, error
+        self._retire(key, flight)
+        flight.event.set()
+
+    def _retire(self, key: str, flight: _Flight) -> None:
+        with self._lock:
+            if self._flights.get(key) is flight:
+                del self._flights[key]
 
 
 def cache_key(
@@ -102,6 +195,10 @@ class VisionCache:
     * **只缓存非空文本**：空回答进缓存等于把一次空响应固定成 TTL 内的持续空结果；
     * **一把 ``threading.Lock``**：钩子在事件循环里单线程调用，但测试会并发，
       而且锁的代价远低于一次视觉请求。
+
+    ``flights`` 是**并发**去重（P2-3）：缓存挡不住"同时发生"的重复投递，
+    :class:`VisionFlights` 让同 key 的后来者等 leader 的结果。它随缓存对象一起
+    创建 —— ``vision_cache_enabled=false`` 时连对象都没有，行为回到 0.2.1。
     """
 
     def __init__(
@@ -117,6 +214,7 @@ class VisionCache:
         self._lock = threading.Lock()
         self._entries: OrderedDict[str, tuple[str, float]] = OrderedDict()
         self._stats = VisionCacheStats()
+        self.flights = VisionFlights()
 
     # ------------------------------------------------------------ 只读状态
 
@@ -184,5 +282,6 @@ __all__ = [
     "CacheHit",
     "VisionCache",
     "VisionCacheStats",
+    "VisionFlights",
     "cache_key",
 ]
