@@ -52,6 +52,7 @@ from ..core import decide, openai_vision, vision_cache
 from ..core.config import VideoConfig
 from ..core.injector import PrepareOutcome, VideoInjection, prepare_video
 from ..core.limits import NULL_LIMITER, QueueTimeout, format_seconds
+from ..core.media import guess_video_mime
 from ..core.openai_vision import VisionResult, analyze_videos, build_vision_prompt
 from ..core.placeholder import (
     is_attachment_line,
@@ -627,11 +628,19 @@ def vision_cache_key(
 ) -> str:
     """构造视觉结果缓存的 key；这条视频不可缓存时返回空串（fail-open）。
 
-    六个维度与 ``core.vision_cache.cache_key`` 一一对应：**模型实际看到的画面**
-    （``injection.content_key``：直通是 ``as-is:<源内容哈希>``，压缩/截断是
+    六个语义维度与 ``core.vision_cache.cache_key`` 一一对应：**模型实际看到的
+    画面**（``injection.content_key``：直通是 ``as-is:<源内容哈希>``，压缩/截断是
     ``<action>:<源内容哈希 + 压缩参数>`` —— 与压缩缓存 key 同源，**不是**产物
     哈希：产物字节每次都不一样，取它等于永不命中，ARCH-VV-C2 P1-1）/
     **最终 prompt** / 端点协议 / 端点 URL / 模型 / ``max_tokens``。
+
+    另加两条"身份"维度（AUDIT-VV-R9 §2.2/§2.3）：
+
+    * **声明给端点的 MIME**：由**文件后缀**决定（``core.media.guess_video_mime``，
+      与 data URI 前缀同源）。同一份字节改名 ``.mov`` / ``.mp4`` 就是不同的声明，
+      不换 key 会把 ``.mp4`` 那次失败/被拒绝的答案复用到 ``.mov`` 上；
+    * **``openai_api_key`` 的 12 位指纹**：中转站按 key 路由到不同后端/模型时，
+      换 key 就是换回答。只放指纹，明文绝不进载荷。
 
     端点解析复用 ``openai_vision._resolve_endpoint`` —— 那是"base_url ->
     (协议, 最终 URL)"的唯一真相源；在这里复制一份规则，迟早会与真实请求分叉
@@ -643,11 +652,15 @@ def vision_cache_key(
     proto, url = openai_vision._resolve_endpoint(config.openai_base_url)
     return vision_cache.cache_key(
         video=content_key,
+        # 同一份字节换个后缀 = 换一个声明 MIME = 一次新的语义（§2.2）
+        mime=guess_video_mime(injection.used_path),
         prompt=prompt,
         proto=proto,
         url=url,
         model=config.openai_model,
         max_tokens=config.openai_max_tokens,
+        # 只传原文，进载荷的是 key_fingerprint() 的 12 位摘要（§2.3）
+        api_key=config.openai_api_key,
     )
 
 

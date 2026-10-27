@@ -53,6 +53,9 @@ def fields(**overrides):
         "url": "https://example.invalid/v1/chat/completions",
         "model": "vision-model",
         "max_tokens": 512,
+        # v2 的两个身份维度（必填，见 core/vision_cache.cache_key）
+        "mime": "video/mp4",
+        "api_key": "sk-unit-test",
     }
     base.update(overrides)
     return base
@@ -207,11 +210,15 @@ def test_key_isolates_every_dimension(changed, value):
 
 
 def test_key_is_versioned(monkeypatch):
-    """payload 结构变化（换字段形态）必须让旧条目失效（``KEY_VERSION``）。"""
-    assert KEY_VERSION == 1
-    key_v1 = cache_key(**fields())
-    monkeypatch.setattr(vision_cache_module, "KEY_VERSION", 2)
-    assert cache_key(**fields()) != key_v1
+    """payload 结构变化（换字段形态）必须让旧条目失效（``KEY_VERSION``）。
+
+    v2：载荷加了声明 MIME 与 API key 指纹（AUDIT-VV-R9 §2.2/§2.3）——
+    v1 的条目可能已经被"同字节换后缀"或"换 key"串味，必须整批作废。
+    """
+    assert KEY_VERSION == 2
+    key_v2 = cache_key(**fields())
+    monkeypatch.setattr(vision_cache_module, "KEY_VERSION", 3)
+    assert cache_key(**fields()) != key_v2
 
 
 def test_key_separates_field_boundaries():

@@ -20,9 +20,23 @@ key 为什么是"规范化 JSON 的 sha256"而不是 ``"|".join(...)``
 ``json.dumps(..., sort_keys=True, ensure_ascii=False)`` 给每个字段加了转义边界，
 同时 ``KEY_VERSION`` 让将来 payload 结构变化时旧条目自动失效。
 
-明确**不**进 key 的东西：``openai_api_key``（换密钥不改变语义）、
-``openai_timeout_sec``、``vision_verify_ssl``、视频文件名（QQ 每次落地名都不同，
-放进去等于永不命中）、会话 ID（跨会话共享正是收益来源）。
+声明 MIME 与 API key 指纹为什么**必须**进 key（AUDIT-VV-R9 §2.2/§2.3）
+---------------------------------------------------------------------
+* **MIME**：``content_key`` 只含"源哈希 + 压缩参数"，而发给端点的 MIME 是按
+  **文件后缀**猜的（``core/media.guess_video_mime``）。于是同一份字节改名
+  ``.mov`` 与 ``.mp4`` 会共用一条缓存 —— 实测第二次 **0 次 POST** 就拿到了
+  ``.mp4`` 那次的答案。端点若按 MIME 拒绝/差别对待，**失败会被缓存掩盖**。
+* **API key**：本项目自己的文档就承认用户在走"中转站"（按 key 路由到不同
+  后端/模型）。换 key 之后仍命中旧答案，意味着"用户修正了一个错 key，第一次
+  重复投递还是拿到错 key 时的回答"。
+
+key 只放 **sha256 前 12 位**（48 bit）而**不是** key 原文：载荷会进
+``json.dumps``，原文多留一处就是多一处泄漏面（日志/诊断/崩溃转储）；
+48 bit 足以区分"换了一个 key"，又不足以反推一个高熵密钥。
+
+明确**不**进 key 的东西：``openai_timeout_sec``、``vision_verify_ssl``、
+视频文件名（QQ 每次落地名都不同，放进去等于永不命中）、会话 ID（跨会话共享
+正是收益来源）。
 
 ``video`` 这一维：**"源 + 参数"，不是产物字节**
 ------------------------------------------------
@@ -51,7 +65,11 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 #: key 的载荷版本。任何"让旧条目语义失效"的改动（例如换发送形态）都必须 +1。
-KEY_VERSION = 1
+#:
+#: * v1：六个维度（视频标识 / prompt / 协议 / URL / 模型 / max_tokens）。
+#: * **v2**（AUDIT-VV-R9 §2.2/§2.3）：加入声明 MIME 与 API key 指纹。旧条目
+#:   全部失效 —— 这是**故意**的：它们可能已经被"同字节换后缀"或"换 key"串味。
+KEY_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -149,6 +167,22 @@ class VisionFlights:
         flight.event.set()
 
 
+def key_fingerprint(api_key: str) -> str:
+    """API key 的**不可逆**指纹：``sha256`` 前 12 位十六进制（48 bit）。
+
+    为什么不直接把 key 拼进载荷：载荷会进 ``json.dumps``，明文多留一处就多一处
+    泄漏面（日志、诊断、崩溃转储、调试器）。48 bit 足够把"换了一个 key"区分开
+    （两条 key 撞同一个前缀的概率是 2⁻⁴⁸ 量级），又不足以反推高熵密钥。
+
+    空 key 返回空串：未配置时 ``openai_service_ready`` 为假、请求根本发不出去，
+    这里保持"没有 key"与"key 恰好是空串"同义即可。
+    """
+    text = str(api_key or "")
+    if not text:
+        return ""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
 def cache_key(
     *,
     video: str,
@@ -157,9 +191,15 @@ def cache_key(
     url: str,
     model: str,
     max_tokens: int,
+    mime: str,
+    api_key: str,
     version: int | None = None,
 ) -> str:
-    """六个维度 + ``KEY_VERSION`` 的 sha256（十六进制）。
+    """六个语义维度 + 声明 MIME + API key 指纹 + ``KEY_VERSION`` 的 sha256。
+
+    ``mime`` / ``api_key`` **刻意不给默认值**：它们不是"可选优化"，少了任何一个
+    都会回到 v1 的串味 bug（§2.2 / §2.3）。必填能让"新调用方忘了传"在第一次
+    调用时就炸出来，而不是静默地把两种语义算成同一个 key。
 
     Args:
         video: 模型实际看到的画面的标识（``VideoInjection.content_key``）：
@@ -170,6 +210,12 @@ def cache_key(
         url: 最终请求 URL（换端点回答会变）。
         model: ``openai_model``。
         max_tokens: ``openai_max_tokens``（上限不同，输出可能被截断）。
+        mime: 声明给端点的 MIME（``core.media.guess_video_mime(used_path)``，
+            与 data URI 里的那个前缀同源）。**同一份字节换个后缀就是一次新的
+            语义**，必须换 key（AUDIT-VV-R9 §2.2）。
+        api_key: ``openai_api_key``，只以 :func:`key_fingerprint` 的 12 位摘要
+            进载荷。中转站按 key 路由到不同后端/模型时，换 key = 换回答
+            （AUDIT-VV-R9 §2.3）。
         version: 仅供测试注入；默认取模块级 :data:`KEY_VERSION`。
 
     Returns:
@@ -178,11 +224,13 @@ def cache_key(
     payload = {
         "v": KEY_VERSION if version is None else int(version),
         "video": str(video),
+        "mime": str(mime or "").strip().lower(),
         "prompt": str(prompt),
         "proto": str(proto),
         "url": str(url),
         "model": str(model),
         "max_tokens": int(max_tokens),
+        "key": key_fingerprint(api_key),
     }
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
@@ -284,4 +332,5 @@ __all__ = [
     "VisionCacheStats",
     "VisionFlights",
     "cache_key",
+    "key_fingerprint",
 ]

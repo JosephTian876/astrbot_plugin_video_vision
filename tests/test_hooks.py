@@ -774,6 +774,10 @@ def test_vision_cache_miss_then_hit_only_sends_the_missing_video(
             url=url,
             model=config.openai_model,
             max_tokens=config.openai_max_tokens,
+            # v2 载荷还有 MIME 与 api_key 指纹：_fake_injection 的 used_path 是
+            # a.mp4（guess_video_mime 回落到 video/mp4 也一致），key 是 sk-x。
+            mime="video/mp4",
+            api_key=config.openai_api_key,
         ),
         "a 的旧分析",
     )
