@@ -1,5 +1,7 @@
 # 基米看得见视频 · astrbot_plugin_video_vision
 
+> 当前版本 **0.3.0**（版本号的唯一来源是 `metadata.yaml`；`main.py` 不再持有副本）。
+
 让模型真正**看见视频**，而不是抽取关键帧。支持两种模式：
 
 - **openai_compat（默认）**：插件把视频发给你配置的 **OpenAI 兼容视觉服务**做理解，结果以文字注入对话 —— 主对话模型**可以是任意模型**
@@ -22,6 +24,9 @@
 - **体积硬上限**：压缩用 `-fs` 按字节数硬截断，产物不会显著超过 `compress_max_mb`
   （极小预算时会牺牲**时长**，见下方「两个体积旋钮怎么配合」）
 - **压缩缓存**：按源文件内容哈希缓存，重试/重复发送不重复压缩
+- **ffmpeg 并发限流**：进程内**全局**上限（默认 2），排队超时降级为 `busy`；
+  不再是"最多 6 个 ffmpeg 一起抢 2 个核"（原上限只是默认线程池的 `min(32, cpu+4)`）
+- **视觉结果缓存**：完全相同的重复投递不再重付一次上传 + 推理（TTL 600s / LRU 64 条，纯内存）
 - **全链路失败降级**：视频处理出错**绝不影响**正常文字对话
 - **不污染对话历史**：注入的视频块标记为非持久化，不会在后续轮次被重发
 - **`/videotest` 诊断指令**：逐步查看处理耗时、体积、provider 与三道闸门
@@ -570,6 +575,34 @@ CI 里设了 **`VV_REQUIRE_FFMPEG=1`**：缺 ffmpeg 时相关用例**失败**而
 ——否则约 40 例会悄悄消失，CI 照样绿。本机跑测试时可用 `VV_FFMPEG_DIR=<目录>`
 指定 ffmpeg 所在目录（不设则从 `PATH` 找）。
 
+### 契约用例（没有 `@register` 也能被识别）
+
+`tests/test_contract.py` 会起一个**子进程**跑 `tests/contract_probe.py`，在**真
+AstrBot** 里验证：导入期零 `DeprecationWarning`、`star_map` 里登记的类型就是
+`VideoVisionPlugin`、`on_llm_request` 恰好 1 条且 priority 仍是 `-300000`、
+`/videotest` 仍登记为 `cmd_videotest`。
+
+* venv 里没装框架 → 探针退出码 2 → 用例 **skip**（CI 不会因此变红）；
+* 想真跑，用装了框架的解释器，并用 `VV_ASTRBOT_APP` 指向它的 `app` 目录
+  （**仓库里不写任何开发机私有路径**）：
+
+```bash
+VV_ASTRBOT_APP=/path/to/AstrBot/backend/app python -m pytest tests/test_contract.py -q
+```
+
+0.3.0 已用 AstrBot **4.29.1** 实测过（同一套断言）：
+
+```
+import_deprecation_warnings = []
+star_map_key = 'data.plugins.astrbot_plugin_video_vision.main'
+star_cls_type_is_plugin = True
+on_llm_request_handlers = [('on_llm_request', -300000)]
+command_handlers = ['cmd_videotest']
+plugin_id = josephtian876/astrbot_plugin_video_vision | PLUGIN_VERSION = 0.3.0
+checks = {'title': True, 'verdict_line': True, 'prepare_ok': True, 'mime_line': True}
+```
+
+
 ---
 
 ## 已知限制
@@ -592,6 +625,10 @@ CI 里设了 **`VV_REQUIRE_FFMPEG=1`**：缺 ffmpeg 时相关用例**失败**而
 - **视觉结果缓存只在 `openai_compat` 生效**，且**只对完全相同的重复投递**命中
   （视频字节 + 最终 prompt + 端点 + 模型 + max_tokens）；命中时日志里的
   `elapsed/token` 记 0，别拿它当"接口变快了"的证据。`/videotest` **绕过**缓存。
+- **0.3.0 起不再使用 `@register`**（AstrBot 4.29.1 的 `core/star/register/star.py`
+  文件头就标着 `[DEPRECATED]`，且首次使用会发 `DeprecationWarning`）：插件身份
+  **只**来自 `metadata.yaml`。它整个丢失时插件仍能加载，但面板/日志里的身份会
+  退化成 `unknown/unknown` —— 这是删装饰器的唯一回归面，已用测试锁住四个必填字段。
 - 压缩缓存按源文件内容哈希做 key，**单个产物大于 `cache_max_mb` 时不会进缓存**，
   这类视频每次都会重新压缩。0.2.1 是**直接跳过它**（缓存里的其它条目不受影响）；
   0.2.0 相反：会先放进去、再被自己挤掉，还会连带清空其它条目。这类产物也**无法**

@@ -24,7 +24,7 @@ from typing import Any
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star
 
 try:
     from astrbot.api.message_components import File, Video
@@ -63,7 +63,8 @@ from .hooks.llm_request import (
 )
 
 PLUGIN_NAME = "astrbot_plugin_video_vision"
-PLUGIN_REPO = "https://github.com/JosephTian876/astrbot_plugin_video_vision"
+#: 插件的显示名 / 简介 / 版本 / 仓库 / 作者**只在** ``metadata.yaml`` 里维护
+#: （0.3.0 删掉 ``@register`` 之后，代码里不再有第二份副本可以漂移）。
 
 
 def _read_plugin_version() -> str:
@@ -97,13 +98,15 @@ def _resolve_cache_root() -> str:
     return os.path.join(base, "plugin_data", PLUGIN_NAME, "cache")
 
 
-@register(
-    PLUGIN_NAME,
-    "JosephTian876",
-    "让模型真正看见视频：Gemini 原生注入 / 任意 OpenAI 兼容视觉服务理解，双模式。",
-    PLUGIN_VERSION,
-    PLUGIN_REPO,
-)
+#: 插件的身份**只**来自 ``metadata.yaml``（AstrBot 4.29.1 起不需要 ``@register``）：
+#: ``Star.__init_subclass__`` 在类创建时就把本模块登记进 ``star_map``，
+#: ``StarManager.load()`` 再用 ``metadata.yaml`` 的字段逐个覆盖
+#: （``star_manager.py:1182-1196``，源码注释原文"yaml 文件的元数据优先"）。
+#:
+#: 为什么不留那个装饰器：``core/star/register/star.py:6-46`` 文件头就写着
+#: ``[DEPRECATED]``，并会在首次使用时 ``warnings.warn(DeprecationWarning)``。
+#: 唯一回归面：``metadata.yaml`` 整个丢失时身份退化为 ``unknown/unknown``
+#: （插件仍能加载）—— 所以 ``tests/test_docs.py`` 锁住四个必填字段。
 class VideoVisionPlugin(Star):
     """视频原生输入插件。"""
 

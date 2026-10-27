@@ -2,8 +2,8 @@
 
 ## 0.3.0
 
-新增 **6 个配置项**与两处新行为（ffmpeg 并发限流 + 同一文件并发只转码一次；
-视觉理解结果的 TTL+LRU 缓存）。
+新增 **6 个配置项**与三处变化（ffmpeg 并发限流 + 同一文件并发只转码一次；
+视觉理解结果的 TTL+LRU 缓存；删掉废弃的 `@register`）。
 
 **三条开关都默认保守、且都能单独退回 0.2.1 的逐字节行为**：
 `ffmpeg_max_concurrency=0`（不限流）、`ffmpeg_singleflight=false`（不共享转码）、
@@ -95,9 +95,33 @@
   行为逐字节回到 0.2.1。
 - 新增模块 `core/vision_cache.py`（纯标准库、零 AstrBot 依赖）。
 
-### 3. 其他
+### 3. 删掉废弃的 `@register`
 
-- 既有 **441** 条用例全部保留并绿，新增用例覆盖上述限流、singleflight 与视觉缓存。
+- AstrBot 4.29.1 的 `core/star/register/star.py` 文件头就写着 `[DEPRECATED]`，
+  且首次使用时 `warnings.warn(DeprecationWarning)`；而 `Star.__init_subclass__`
+  在类创建时**已经**把模块登记进 `star_map`，`StarManager.load()` 再用
+  `metadata.yaml` 逐字段覆盖（`star_manager.py:1182-1196`，源码注释原文
+  "yaml 文件的元数据优先"）。也就是说：装饰器是**纯冗余**，只会多一条废弃告警。
+- 现在 `main.py` 里既没有 `from astrbot.api.star import … register`，也没有
+  `@register(...)`；插件的 name / author / desc / version / repo **只**来自
+  `metadata.yaml`（代码里不再有第二份副本可以漂移）。
+- **唯一回归面**：`metadata.yaml` 整个丢失时 `name=None` → `plugin_id` 退化为
+  `unknown/unknown`（插件**仍能加载**，只是面板/日志显示 unknown）。因此新增
+  用例锁住 `name/desc/version/author` 四个必填字段 + `repo` + 版本格式
+  （`tests/test_docs.py::test_metadata_yaml_has_the_required_fields`），
+  并用 AST 锁住"源码里不许再出现 `@register(` "
+  （`tests/test_main.py::test_plugin_registers_without_the_register_decorator`）。
+- 已在**真 AstrBot 4.29.1** 运行时端到端验证（`tests/test_contract.py` 是同一套断言
+  的自动版，装了框架才跑）：导入期零 `DeprecationWarning`；`star_map` 里登记的
+  类型就是 `VideoVisionPlugin`；`on_llm_request` 钩子恰好 1 条、priority 仍是
+  `-300000`；`/videotest` 仍登记为 `cmd_videotest`；用 `metadata.yaml` 覆盖后
+  `plugin_id = josephtian876/astrbot_plugin_video_vision`、版本 `0.3.0`；真 ffmpeg
+  跑一次 `/videotest`，报告含标题 / 结论 / MIME / `✅ 准备成功`。
+
+### 4. 其他
+
+- 既有 **441** 条用例全部保留并绿，新增用例覆盖上述限流、singleflight、视觉缓存
+  与"没有装饰器也能被识别"。
 - 改这几个新键都需要**重载插件**（limiter / 缓存在 `__init__` 里建）。
 - 新增模块 `core/limits.py`（限流 + singleflight）与 `core/vision_cache.py`
   （视觉结果缓存），都在 `core/` 下、不 import astrbot。

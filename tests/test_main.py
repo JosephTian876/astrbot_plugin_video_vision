@@ -661,3 +661,43 @@ def test_diagnose_bypasses_the_vision_cache(monkeypatch, media_tools, tiny_video
 
     assert len(calls) == 2, "两次诊断 = 两次真实调用"
     assert "✅ 准备成功" in first and "✅ 准备成功" in second
+
+
+# --------------------------------------- 0.3.0：删掉废弃的 @register（结构锁）
+#
+# 真框架下的行为验收在 ``tests/test_contract.py``（装了 AstrBot 才跑）。
+# 这里锁的是**源码结构**：没有 @register 之后，"插件能被识别"这件事完全依赖
+# ``Star.__init_subclass__`` 与 metadata.yaml（AUDIT-030 §B.3）。
+
+
+def test_plugin_registers_without_the_register_decorator():
+    import ast
+
+    source = (Path(__file__).resolve().parents[1] / "main.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    # 1) 不许再从 astrbot.api.star 导入 register
+    imported: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (node.module or "") == "astrbot.api.star":
+            imported.update(alias.name for alias in node.names)
+    assert "register" not in imported, f"还在导入 register: {sorted(imported)}"
+    assert "Star" in imported and "Context" in imported, sorted(imported)
+
+    # 2) 类上不许有任何装饰器（``@register(...)`` 就是唯一那个）
+    classes = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef)
+    }
+    plugin = classes["VideoVisionPlugin"]
+    decorators = [ast.unparse(item) for item in plugin.decorator_list]
+    assert decorators == [], f"类上仍有装饰器: {decorators}"
+
+    # 3) 必须仍是 Star 的子类：``__init_subclass__`` 靠这条自动登记
+    bases = [ast.unparse(item) for item in plugin.bases]
+    assert "Star" in bases, bases
+
+    # 4) 文本层面也不许留半截（例如注释掉的 register 调用）
+    assert "@register(" not in source
+    assert "register(" not in source

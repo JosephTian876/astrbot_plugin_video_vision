@@ -29,6 +29,9 @@ def test_version_is_bumped():
     assert "## 0.3.0" in CHANGELOG
     # 历史条目必须保留（用户升级时要能查旧版本改了什么）
     assert "## 0.2.1" in CHANGELOG
+    # README 也要提一次当前版本（用户第一眼看到的地方），且不许还写着旧版本
+    assert "当前版本 **0.3.0**" in README
+    assert "当前版本 **0.2.1**" not in README
 
 
 def test_changelog_030_lists_the_three_changes_and_the_falsified_claim():
@@ -324,3 +327,31 @@ def test_changelog_030_explains_the_vision_cache():
         "连续追问",
     ):
         assert needle in section, needle
+
+
+def test_metadata_yaml_has_the_required_fields():
+    """``@register`` 删掉之后，``metadata.yaml`` 是**唯一**的身份来源。
+
+    AstrBot 的 ``_PluginUpdater.validate_plugin_metadata`` 要求
+    ``name/desc/version/author`` 都是非空字符串（缺了插件直接加载失败），
+    ``load()`` 再用这些字段逐个覆盖 ``star_map`` 里的身份，``repo`` 则是插件
+    更新的唯一来源。这里用行式解析（不引 yaml 依赖）把四要素 + repo + 版本格式锁住。
+    """
+    import re
+
+    fields: dict[str, str] = {}
+    for line in METADATA.splitlines():
+        match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*):\s*(.*)$", line)
+        if match:
+            fields[match.group(1)] = match.group(2).strip()
+
+    for key in ("name", "desc", "version", "author"):
+        assert fields.get(key), f"metadata.yaml 缺少必需字段 {key}"
+        assert fields[key] != "|", f"metadata.yaml 的 {key} 是空的块标量"
+    assert re.fullmatch(r"\d+\.\d+\.\d+", fields["version"]), fields["version"]
+    assert fields["version"] == "0.3.0"
+    assert fields["repo"].startswith("https://"), fields["repo"]
+    assert fields["name"] == "astrbot_plugin_video_vision"
+    # 四个必填字段之外，面板展示用的字段也不许丢
+    for key in ("display_name", "short_desc", "astrbot_version"):
+        assert fields.get(key), f"metadata.yaml 缺少 {key}"
