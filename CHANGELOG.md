@@ -10,7 +10,7 @@
 （建视觉缓存，只在 `openai_compat` 生效）。把它们改成 `0` / `false` / `false`
 并让其余键保持 0.2.1 的原值时，**注入决策与既有日志行为等价**：9 个素材 × 11 组
 配置的 198 条 `prepare_video` + 40 份
-`/videotest` 报告 + 3 次钩子端到端（共 241 条观测）与 0.2.1（`c00f6a2`）逐字段
+`/videotest` 报告 + 3 次钩子端到端（共 241 条观测）与 0.2.1（`14a1fa0`）逐字段
 比较 **0 差异**。**与这三个开关无关的例外共有三处**（详见 §4"其他"）：
 ① 旧键 `max_compress_seconds` 与 `ffmpeg_queue_timeout_sec` 的预算冲突时
 （`30 + 60 >= openai_timeout_sec / 2`）`VideoConfig.normalized()` 多一条
