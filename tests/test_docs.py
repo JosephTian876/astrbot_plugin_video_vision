@@ -23,14 +23,16 @@ def squash(text: str) -> str:
 
 
 def test_version_is_bumped():
-    """0.3.0：六个新配置键 + 两处新行为（限流 / 视觉缓存）+ 删 ``@register``。"""
-    assert "version: 0.3.0" in METADATA
+    """0.3.1：核心自己会传视频时让位（AstrBot PR #10202）；无新配置键。"""
+    assert "version: 0.3.1" in METADATA
     assert CHANGELOG.startswith("# 更新日志")
-    assert "## 0.3.0" in CHANGELOG
+    assert "## 0.3.1" in CHANGELOG
     # 历史条目必须保留（用户升级时要能查旧版本改了什么）
+    assert "## 0.3.0" in CHANGELOG
     assert "## 0.2.1" in CHANGELOG
     # README 也要提一次当前版本（用户第一眼看到的地方），且不许还写着旧版本
-    assert "当前版本 **0.3.0**" in README
+    assert "当前版本 **0.3.1**" in README
+    assert "当前版本 **0.3.0**" not in README
     assert "当前版本 **0.2.1**" not in README
 
 
@@ -413,7 +415,7 @@ def test_metadata_yaml_has_the_required_fields():
         assert fields.get(key), f"metadata.yaml 缺少必需字段 {key}"
         assert fields[key] != "|", f"metadata.yaml 的 {key} 是空的块标量"
     assert re.fullmatch(r"\d+\.\d+\.\d+", fields["version"]), fields["version"]
-    assert fields["version"] == "0.3.0"
+    assert fields["version"] == "0.3.1"
     assert fields["repo"].startswith("https://"), fields["repo"]
     assert fields["name"] == "astrbot_plugin_video_vision"
     # 四个必填字段之外，面板展示用的字段也不许丢
@@ -422,3 +424,61 @@ def test_metadata_yaml_has_the_required_fields():
     # 特性清单要跟着版本走：0.3.0 的两处新行为都得在 description 里露过面
     assert "ffmpeg 并发限流" in METADATA
     assert "视觉理解结果缓存" in METADATA
+
+
+# ------------------------------------------- 0.3.1：核心原生视频输入时让位
+
+
+def test_readme_documents_the_native_yield():
+    """让位：README 必须写清两条判据、4.29.1 上零变化、以及"测不到的那一半"。
+
+    这一版最容易写错的两处：把 ``modalities`` 未配置当成"支持 video"（核心会把
+    ``video_urls`` 清空，让位等于丢视频），以及暗示本仓库验证过"核心真的把视频
+    送到了 provider"（那只能在装了 PR #10202 的环境里看）。
+    """
+    heading = "## 核心自己会传视频时自动让位"
+    assert heading in README
+    section = README.split(heading, 1)[1].split("\n## ", 1)[0]
+    for needle in ('"video"', "video_urls", "modalities", "hide_local_path", "4.29.1"):
+        assert needle in section, needle
+    # 让位与 provider_mode 无关（闸门在 _effective_mode 之前），必须写明，
+    # 否则 openai_compat 用户会以为"视觉服务再也不会被调用"是 bug。
+    assert "provider_mode" in section
+    assert "PR #10202" in README
+    # 不设去重标记这件事必须写在文档里（否则下一个人会"顺手"补上）
+    assert "_DONE_ATTR" in section or "去重标记" in section
+
+
+def test_changelog_031_pins_the_yield_contract():
+    """CHANGELOG 的 0.3.1 段要能独立回答"为什么、判据、代价、怎么验"。"""
+    section = CHANGELOG.split("## 0.3.1", 1)[1].split("## 0.3.0", 1)[0]
+    for needle in (
+        "video_urls",
+        "modalities",
+        "hide_local_path",
+        "_DONE_ATTR",
+        "4.29.1",
+        "675 passed",
+    ):
+        assert needle in section, needle
+
+
+def test_readme_modality_checklist_covers_the_three_modes():
+    """模态勾选表：三种模式各自"需要 / 不要"与原因，缺一行就会重新长出猜测。
+
+    勾错模态不会报错，只会让视频静默消失 —— 这张表是用户唯一能自查的地方，所以
+    三行与三列都要锁住，防止将来悄悄删掉某一行。
+    """
+    heading = "### 三种模式该勾哪些模态"
+    assert heading in README
+    section = README.split(heading, 1)[1].split("\n## ", 1)[0]
+
+    for mode in ("核心原生", "gemini_native", "openai_compat"):
+        assert mode in section, mode
+    for column in ("需要勾选", "不要勾选", "一句话原因"):
+        assert column in section, column
+    # 两个槽位的事实必须写全：audio 是借道，video 是原生
+    assert "`audio`" in section and "`video`" in section
+    # 核对办法指向真实的诊断输出（闸门 ② 就是 modalities 判定）
+    assert "闸门" in section
+

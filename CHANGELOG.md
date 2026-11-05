@@ -1,5 +1,88 @@
 # 更新日志
 
+## 0.3.1
+
+一句话：AstrBot 核心自己已经能把视频交给 provider 时（上游 PR #10202 合并后），
+本插件**自动让位**，不再重复注入。**AstrBot 4.29.1 上让位判据恒假**，所以这一版
+在 4.29.1 上与 0.3.0 的注入决策、日志与配置行为**完全一致**。
+
+### 1. 为什么现在必须做
+
+- 4.29.1 的 `ProviderRequest`（`astrbot/core/provider/entities.py`）**没有**
+  `video_urls` 字段，核心只把视频写成一行
+  `[Video Attachment: name …, path …]` 文本 —— 这正是本插件存在的理由：借
+  `audio_url` 槽把真正的视频块塞进请求。
+- 上游 PR #10202 合并后核心多了一个 `video_urls`，会自己在请求里带上视频。两边
+  同时生效时 provider 收到的是**两份**视频：一份原生的 `video_url` 块、一份借道
+  `audio_url` 的块。而模态清洗只看 `audio` —— 对没有声明 audio 的模型，借道的那
+  一份会被替换成 `[Audio]` 文本。用户看到的结果是"视频又白传了一次"。
+
+### 2. 让位判据：两个条件必须同时成立
+
+| 判据 | 少了它会怎样 |
+|---|---|
+| `getattr(req, "video_urls", None)` 是**非空 list** | 4.29.1 上根本没有这个字段，只能探测；写成 `req.video_urls` 会抛 `AttributeError`，被钩子的兜底记成「注入视频时异常」并吞掉整次注入 |
+| 当前 provider 的 `modalities` 是 **list 且含 `"video"`** | 核心在 `tool_loop_agent_runner._assemble_request_context_for_provider` 里对**未声明** video 的 provider 主动清空 `video_urls`（`modalities` 为 `None` / `[]` 时同样清空），那时核心不会把视频交给模型 —— 只判 `video_urls` 就会在这里让位，等于把视频丢掉 |
+
+**`modalities` 为 `None` / `[]` 不算"支持 video"**：核心的"未配置 = 支持全部"兼容
+约定把 video 显式排除在外（video 必须由模态清单 opt-in）。所以这两个值一律**不
+让位**，走原来的注入路径。
+
+### 3. 让位时具体做什么
+
+- **先改写占位文本，再返回**。核心只 append 一行包含**本机绝对路径**的文本，自己
+  **不**做任何改写（PR #10202 之后也照样原样保留）。不改写的话模型看到路径就会去跑
+  `cv2` 抽帧 / `os.walk` 全盘搜文件名，而视频内容它**已经拿到了** —— 同一故障的实测
+  日志留在 `_neutralize_placeholders` 的 docstring 里。让位复用 `gemini_native` 的
+  文案（"你已经在本次请求中看到了这段视频"），因为核心走的是原生视频块；用
+  `openai_compat` 那句"已交给视觉模型分析"会说谎。
+- **不注入任何内容块、不压缩、不占 ffmpeg 槽**：让位发生在 `build_video_blocks`
+  之前，一次请求的本地开销为零。
+- **与 `provider_mode` 无关**：闸门在 `_effective_mode()` 之前，所以
+  `openai_compat` 模式下同样让位 —— 核心已经把原片交给了主 provider，再调一次
+  视觉服务只是重复付费。
+- **不设置 `_DONE_ATTR`**。那个标记的语义是"本次请求已经注入过"，而让位是"本次
+  请求**不该**由我们注入" —— 两种相反状态共用一个标记，会让之后读它的代码把"让位"
+  当成"已注入"。不设标记还带来两个好处：改写后的文本不再匹配占位符正则，所以让位
+  天然幂等；万一核心重试/降级时又把 `video_urls` 清空，下一次钩子仍有完整机会补注入。
+- **日志**：每个 provider **第一次**让位打一条 INFO（键为 `provider_type:provider_id`），
+  之后降为 DEBUG。让位是**正确且期望**的行为（核心接管了），不是故障，所以不用
+  WARNING；但它同时是"视频理解换了实现"的可观测事实，排障时用户需要看到一次，所以
+  也不能只有 DEBUG。文案不含路径/URL。
+
+### 4. 兼容性
+
+- **AstrBot 4.29.1：判据恒假 → 零行为变化**。`ProviderRequest` 没有 `video_urls`，
+  WebUI 的模态选项里也还没有 `video`（`core/config/default.py` 的 `options` 只有
+  `text / image / audio / tool_use`），所以两个条件在 4.29.1 上都不可能成立。
+- 不新增配置键（`_conf_schema.json` 不变）、不加运行时依赖（`requirements.txt` 仍然
+  全是注释）、不动 `core/`（`core/` 的零框架依赖约束不变，`tests/test_docs.py` 的
+  AST 锁照旧）。
+- 出站文本：新增的日志文案逐字通过 `tests/test_interop.py` 的复核字段守卫
+  （`R_EN` / `R_META` / `R_CTX` / `R_VERDICT` 一条都不命中）。
+- 文档：README 的「为什么需要 audio 模态」下新增「三种模式该勾哪些模态」对照表 ——
+  **核心原生**勾 `video`、**gemini_native** 勾 `audio`、**openai_compat** 两者都不
+  需要，每行都写明"需要勾选 / 不要勾选 / 原因"。模态勾错不会报错，只会让视频静默
+  消失，所以补一条文档守卫锁住三行与两列。
+
+### 5. 测试
+
+- 新增 `tests/test_native_yield.py`，8 条（全部离线，判据在第一个 await 之前就用
+  `SimpleNamespace` 构造，不 import 真框架）：4.29.1 形态照常注入 / 双判据成立时让位 /
+  无 video 模态不让位 / `modalities` 未设不让位 / `modalities` 为空列表不让位 /
+  幂等且无 `_DONE_ATTR` / 每个 provider 只 INFO 一次 / `hide_local_path=false` 时
+  不改写占位文本。
+- 全套：`pytest tests -q -n 4` → **675 passed, 1 skipped**（0.3.0 基线 664 passed，
+  只多了新增的 8 条用例与 3 条文档用例）。
+
+### 6. 已知限制（只能在装了 PR #10202 的环境里验证）
+
+- **"让位后核心真的把视频送到了 provider"无法在本仓库证明**：4.29.1 上判据恒假。
+  本仓库的用例只证明判据形状与让位动作本身。
+- 若核心自己的 media 解析失败（`entities.py` 里该分支只 `logger.warning` 后
+  `continue`），视频会被静默跳过，而占位文本已被我们改写成"已提供" —— 理论上模型
+  可能编造内容。概率低（核心有 strict 与重试），但必须诚实记在这里。
+
 ## 0.3.0
 
 新增 **6 个配置项**与三处变化（ffmpeg 并发限流 + 同一文件并发只转码一次；

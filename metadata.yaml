@@ -20,10 +20,11 @@ description: |
   - ffmpeg 并发限流（默认 2）+ 同一文件并发只转码一次
   - 视觉理解结果缓存（只对完全相同的重复投递命中，TTL 600s / LRU 64 条，纯内存）
   - 注入后抹除占位文本里的本机路径，避免诱导模型自己去解析文件
+  - 核心自己会传视频时自动让位（AstrBot 合并 #10202 之后；4.29.1 上无变化）
   - 全链路失败降级：视频处理出错绝不影响正常文字对话
   - 与「我会永远陪着你」陪伴体系兼容
   - 附带 /videotest 调试指令，可逐步查看处理耗时
-version: 0.3.0
+version: 0.3.1
 author: JosephTian876
 repo: https://github.com/JosephTian876/astrbot_plugin_video_vision
 short_desc: 让模型直接看懂视频（Gemini 原生 / OpenAI 兼容双模式），而非抽帧
