@@ -31,6 +31,7 @@ from .placeholder import (
     VIDEO_SUFFIXES,
     VideoPlaceholder,
     iter_placeholders,
+    iter_ref_placeholders,
     parse_placeholder_text,
 )
 
@@ -50,6 +51,7 @@ __all__ = [
     "file_size_mb",
     "guess_video_mime",
     "iter_placeholders",
+    "iter_ref_placeholders",
     "parse_placeholder_text",
     "prepare_video",
     "probe_duration",

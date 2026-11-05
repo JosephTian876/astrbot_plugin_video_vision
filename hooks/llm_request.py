@@ -42,6 +42,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
+import tempfile
 import time
 from dataclasses import dataclass, replace
 from typing import Any
@@ -52,11 +54,13 @@ from ..core import decide, openai_vision, vision_cache
 from ..core.config import VideoConfig
 from ..core.injector import PrepareOutcome, VideoInjection, prepare_video
 from ..core.limits import NULL_LIMITER, QueueTimeout, format_seconds
-from ..core.media import guess_video_mime
+from ..core.media import MediaToolError, download_ref_to, guess_video_mime
 from ..core.openai_vision import VisionResult, analyze_videos, build_vision_prompt
 from ..core.placeholder import (
+    VideoPlaceholder,
     is_attachment_line,
     iter_placeholders,
+    iter_ref_placeholders,
     parse_placeholder_text,
 )
 
@@ -130,6 +134,16 @@ _DISK_FULL_MARKERS: tuple[str, ...] = (
 LOCAL_IO_DENIED = "local file access was denied"
 LOCAL_DISK_FULL = "the local disk is full"
 
+#: 引用视频物化失败的原因前缀。生产方是 :func:`_materialize_refs`（失败时拼在
+#: 原因最前面），消费方是 :func:`_short_reason` 的前缀分支。与
+#: ``decide.REJECT_REASON_PREFIX`` 同一套路 —— 这类"字符串协议"只留一份定义，
+#: 前缀一改就让兜底分支静默失效。
+REF_MATERIALIZE_PREFIX = "引用视频无法获取"
+
+#: 单次引用视频下载的**墙钟**上限（秒）。签名 CDN URL 的实测量级是 1-3 秒，
+#: 给 30 秒是为了容忍中转站，同时不让一个坏链接拖住整轮请求。
+REF_DOWNLOAD_TIMEOUT_SEC = 30.0
+
 
 def _local_io_failure(reason: str) -> str | None:
     """本地权限 / 磁盘满 -> 准确的短原因；不是这两类时返回 ``None``。
@@ -189,6 +203,17 @@ def _short_reason(reason: str, kind: str = "") -> str:
         if "连接" in reason or "connect" in low:
             return "the vision service is unreachable"
         return "the vision service returned an error"
+    # ---- 引用视频物化（ref 形态）：第三个错误域，同样没有码 ----
+    # 生产方是 _materialize_refs（下游 core.media.download_ref_to）。那一层已经
+    # 保证消息里不含 URL，这里再做一次字形约束：只吐固定短语，绝不转发原文。
+    if reason.startswith(REF_MATERIALIZE_PREFIX):
+        if kind == "timeout" or "超时" in reason:
+            return "the quoted video reference timed out while downloading"
+        if kind == "too_large" or "上限" in reason:
+            return "the quoted video reference is too large to download"
+        if "http(s)" in reason:
+            return "the quoted video reference is not a downloadable address"
+        return "the quoted video reference could not be downloaded"
     # ---- 机器可读分类优先（唯一真相源：core/decide.py）----
     phrase = decide.explain(kind)
     if phrase:
@@ -232,6 +257,28 @@ def _parts_of(req: Any) -> list[Any]:
     """每次重新读取，绝不缓存列表引用。"""
     parts = getattr(req, "extra_user_content_parts", None)
     return parts if isinstance(parts, list) else []
+
+
+def _text_of(part: Any) -> str | None:
+    """取一段内容块的文本；不是文本段时返回 None。
+
+    兼容两种形态：``TextPart`` 对象（生产环境）与裸 ``dict``（兼容性审计里
+    提到过别的插件会替换列表）。两处就地改写（物化 / 抹路径）共用这一个读法。
+    """
+    value = part.get("text") if isinstance(part, dict) else getattr(part, "text", None)
+    return value if isinstance(value, str) else None
+
+
+def _set_text_of(part: Any, text: str) -> bool:
+    """就地改写一段内容块的文本；改不动返回 False（绝不抛异常）。"""
+    try:
+        if isinstance(part, dict):
+            part["text"] = text
+        else:
+            part.text = text
+    except Exception:  # noqa: BLE001 - 不可变 / 只读对象：按失败处理
+        return False
+    return True
 
 
 def _temp_video_part(data_uri: str) -> Any:
@@ -281,6 +328,129 @@ class PreparedVideo:
     index: int
     name: str
     injection: VideoInjection
+
+
+def _ref_path_form(placeholder: VideoPlaceholder, local_path: str) -> str:
+    """把 ref 占位符改写成**等价**的 path 形态。
+
+    只换"引用"字段：``quoted`` 与 ``name`` 原样保留（改写不该重新解释占位符的
+    身份）。写成 path 形态之后 ``iter_placeholders`` 才会把它当候选 —— 反之
+    ref 形态会被它刻意跳过（见 ``core/placeholder.py`` 的说明）。
+    """
+    quoted = " in quoted message" if placeholder.quoted else ""
+    return f"[Video Attachment{quoted}: name {placeholder.name}, path {local_path}]"
+
+
+def _ref_materialization_enabled(config: VideoConfig) -> bool:
+    """ref 形态是否值得物化（``False`` 时下载必然白费）。
+
+    ref **只**出现在引用形态（核心的 ref 分支被 ``if quoted:`` 包着），而
+    ``build_video_blocks`` 的闸门 1' 在 ``handle_quoted_video=false`` 时会丢掉
+    全部引用视频；``max_video_count=0`` 时它更是一个都不处理。两个条件写在这里
+    **只有一处**，预检与物化都读它，避免"闸门改了、下载还照跑"。
+    """
+    return bool(config.handle_quoted_video) and config.max_video_count > 0
+
+
+def _materialize_refs(
+    parts: list[Any], *, config: VideoConfig
+) -> tuple[str, list[str]]:
+    """把 ref 形态占位符物化成本地文件，并就地改写成 path 形态。
+
+    必须在 ``build_video_blocks`` **之前**跑：ref 的 ``path`` 字段里是引用值
+    （URL / 非本地路径），不是可读文件；改写之后既有管线才知道该怎么处理它。
+
+    Returns:
+        ``(临时目录, 失败短原因列表)``。临时目录由调用方删除 —— 它必须活到
+        ``build_video_blocks`` **返回之后**（``prepare_video`` 在 worker 线程里
+        仍要读这些文件，产物要到那时才编码进内存），所以删除点只能是
+        ``_handle`` 的 ``finally``。失败原因已经是 ``_short_reason`` 的短语
+        （与 ``build_video_blocks`` 的 ``failures`` 同口径），可直接并入。
+
+    本函数是**同步阻塞**的（``urllib`` + 磁盘 I/O），调用方负责丢进线程。
+    它**绝不抛异常**（与 ``prepare_video`` 同一契约）：建目录失败 / 下载失败 /
+    本机文件不存在都记成失败短语 —— 否则一次下载故障会让本条消息里**普通**
+    视频也一起不注入。
+
+    两个纯优化（不改变任何可见结果，判定在 ``_ref_materialization_enabled``）：
+    * ``handle_quoted_video=false``：ref 只出现在引用形态，``build_video_blocks``
+      的闸门 1' 会丢掉全部引用视频 —— 直接不下载；
+    * ``max_video_count=0``：``build_video_blocks`` 在该值下不处理任何视频。
+
+    去重：同一条消息里同一个引用**只下载一次**（``resolved`` / ``failed``
+    两个映射）。重复出现的占位符**保持原样不改写**：它会被 ``build_video_blocks``
+    当作重复视频跳过，改写了反而会把一个"请求结束后即被删除的临时路径"留在
+    请求里。刻意**不**用 ``injector.SINGLEFLIGHT``：那个是进程级、为"同一份
+    内容只转码一次"设计的；跨请求共享临时目录里的文件会让第一个请求的
+    ``finally`` 删掉别人还在读的文件。
+    """
+    refs = iter_ref_placeholders(parts)
+    if not refs:
+        return "", []
+    if not _ref_materialization_enabled(config):
+        logger.debug(
+            "[VideoVision] 跳过引用视频物化（handle_quoted_video=%s, "
+            "max_video_count=%d）",
+            config.handle_quoted_video,
+            config.max_video_count,
+        )
+        return "", []
+
+    try:
+        directory = tempfile.mkdtemp(prefix="vv_ref_")
+    except OSError as exc:
+        # 磁盘满 / 权限：一条原因就够（注入侧按 reason 去重），别让整条消息失败
+        logger.warning("[VideoVision] 引用视频临时目录创建失败: %s", exc)
+        return "", [f"{REF_MATERIALIZE_PREFIX}: 临时目录创建失败"]
+
+    reasons: list[str] = []
+    resolved: dict[str, str] = {}
+    failed: dict[str, str] = {}
+
+    def fail(placeholder: VideoPlaceholder, message: str, kind: str = "") -> None:
+        phrase = _short_reason(f"{REF_MATERIALIZE_PREFIX}: {message}", kind)
+        failed[placeholder.path] = phrase
+        reasons.append(phrase)
+        # 日志留原始原因（运维要能归因），注入侧只拿 phrase（不含 URL）
+        logger.warning(
+            "[VideoVision] 引用视频未注入: %s | %s", placeholder.name, message
+        )
+
+    for index, placeholder in refs:
+        ref = placeholder.path
+        # 同一轮里重复出现的同一引用：只下一次，且**不改写**重复的那个占位符。
+        # 它会被 ``build_video_blocks`` 的 ``seen_paths`` 当作重复视频跳过；
+        # 若也改写成 path 形态，它会带着一个"请求结束后就被删掉的临时路径"
+        # 留在请求里（既没被 neutralize，也会诱导模型去读一个不存在的文件）。
+        if ref in failed:
+            reasons.append(failed[ref])
+            continue
+        if ref in resolved:
+            logger.debug(
+                "[VideoVision] 重复引用，复用已下载的文件: %s", placeholder.name
+            )
+            continue
+        try:
+            local = download_ref_to(ref, directory, timeout=REF_DOWNLOAD_TIMEOUT_SEC)
+        except MediaToolError as exc:
+            fail(placeholder, str(exc), exc.kind)
+            continue
+        except Exception as exc:  # noqa: BLE001 - 下载层契约外的异常也不能穿出
+            fail(placeholder, f"未预期异常 {type(exc).__name__}")
+            continue
+        resolved[ref] = local
+        logger.info(
+            "[VideoVision] 引用视频已物化: %s | %.2fMB",
+            placeholder.name,
+            _safe_size(local),
+        )
+        part = parts[index]
+        if _text_of(part) is None or not _set_text_of(
+            part, _ref_path_form(placeholder, local)
+        ):
+            # 文本段被换掉 / 只读：别静默 —— 按失败处理，至少注入一句说明
+            fail(placeholder, "占位文本不可改写")
+    return directory, reasons
 
 
 async def build_video_blocks(
@@ -492,25 +662,22 @@ def _neutralize_placeholders(
         if not (0 <= index < len(parts)):
             continue
         part = parts[index]
-        text = getattr(part, "text", None)
-        is_dict = isinstance(part, dict)
-        if is_dict:
-            text = part.get("text")
-        if not isinstance(text, str):
+        text = _text_of(part)
+        if text is None:
             continue
         placeholder = parse_placeholder_text(text)
         if placeholder is None:
             continue
+        # ref 形态（核心没拿到本地文件、只给了地址）不是"已交付"：它要先被
+        # ``_materialize_refs`` 物化并改写成 path 形态，才可能进入注入路径。
+        # 在让位路径上（核心原生传视频）这条 ref 行并没有被下载，对它写
+        # "你已经在本次请求中看到了这段视频" 会说谎；失败保留下标时也一样。
+        if placeholder.is_ref_kind:
+            continue
         name = placeholder.name or "attachment"
         replacement = template.replace("{name}", name)
-        try:
-            if is_dict:
-                part["text"] = replacement
-            else:
-                part.text = replacement
+        if _set_text_of(part, replacement):
             changed += 1
-        except Exception:  # noqa: BLE001
-            continue
     return changed
 
 
@@ -902,8 +1069,15 @@ async def _handle(plugin: Any, event: Any, req: Any) -> None:
     if getattr(req, _DONE_ATTR, False):
         return
 
-    # 便宜的预检：没有视频占位符就完全不做 await
-    if not iter_placeholders(_parts_of(req)):
+    # 便宜的预检：没有任何附件占位符就完全不做 await。
+    # ref 形态（引用视频在本地取不到、只剩一个地址）也必须在这里放行：它不在
+    # ``iter_placeholders`` 的候选里，而正是下面 `_materialize_refs` 要物化的
+    # 对象。是否值得物化只看 ``_ref_materialization_enabled`` 那一处判定。
+    parts_now = _parts_of(req)
+    wants_refs = _ref_materialization_enabled(config) and bool(
+        iter_ref_placeholders(parts_now)
+    )
+    if not iter_placeholders(parts_now) and not wants_refs:
         return
 
     # ---- 闸门 -1：核心已能原生传视频 -> 让位，不重复注入 ----
@@ -1043,21 +1217,52 @@ async def _handle(plugin: Any, event: Any, req: Any) -> None:
 
     # ---- 准备（探测/压缩在线程池，无独立 await）----
     cache_root = str(getattr(plugin, "cache_root", "") or "")
-    if config.debug_log:
-        logger.info(
-            "[VideoVision][debug] 钩子触发 | umo=%s 模式=%s provider=%s 候选占位符=%d",
-            getattr(event, "unified_msg_origin", "?"),
-            mode,
-            provider_type,
-            len(iter_placeholders(_parts_of(req))),
+    # ---- 物化引用视频（ref 形态）----
+    # 必须发生在 ``build_video_blocks`` **之前**：ref 的 ``path`` 字段是引用值而
+    # 不是可读文件；物化后占位文本被就地改写成 path 形态，既有管线才知道怎么
+    # 处理它（``iter_placeholders`` 刻意跳过 ref 形态）。
+    #
+    # 下载是**阻塞 I/O**，不能直接在事件循环里跑：一个 30 秒的坏链接会把整个
+    # AstrBot 卡住（与 ``prepare_video`` 必须进线程池同因）。这里用
+    # ``asyncio.to_thread`` 而不是 ``slots.submit``：``core.limits`` 的执行器是
+    # **ffmpeg 专属**、大小由 ``ffmpeg_max_concurrency`` 决定，拿它跑网络 I/O
+    # 会把"并发转码数"变成"并发下载数"；下载只占一个线程、单次上限 30 秒，
+    # 真正等待网络时还释放 GIL。
+    ref_dir = ""
+    ref_failures: list[str] = []
+    try:
+        if _ref_materialization_enabled(config) and iter_ref_placeholders(
+            _parts_of(req)
+        ):
+            ref_dir, ref_failures = await asyncio.to_thread(
+                _materialize_refs, _parts_of(req), config=config
+            )
+        if config.debug_log:
+            logger.info(
+                "[VideoVision][debug] 钩子触发 | umo=%s 模式=%s provider=%s "
+                "候选占位符=%d",
+                getattr(event, "unified_msg_origin", "?"),
+                mode,
+                provider_type,
+                len(iter_placeholders(_parts_of(req))),
+            )
+        prepared, consumed, failures = await build_video_blocks(
+            _parts_of(req),
+            config=config,
+            cache_root=cache_root,
+            # 插件实例上的限流器（``ffmpeg_max_concurrency=0`` 时为 None -> 不限流）
+            limiter=getattr(plugin, "limiter", None),
         )
-    prepared, consumed, failures = await build_video_blocks(
-        _parts_of(req),
-        config=config,
-        cache_root=cache_root,
-        # 插件实例上的限流器（``ffmpeg_max_concurrency=0`` 时为 None -> 不限流）
-        limiter=getattr(plugin, "limiter", None),
-    )
+    finally:
+        # ``build_video_blocks`` 返回 = 所有视频的 data URI 都已编码进内存
+        # （``core/injector.py`` 的 finally 注释原文），此后不再需要这些临时文件。
+        # 放在 finally 里：上面任何一步异常 / 提前返回都不会泄漏目录。
+        if ref_dir:
+            shutil.rmtree(ref_dir, ignore_errors=True)
+
+    # 引用视频的失败原因与普通视频的失败原因同口径（都是 _short_reason 短语），
+    # 合并后走同一条「按 reason 去重」的注入路径。
+    failures = [*ref_failures, *failures]
 
     # ---- 模式分支：原生注入 vs 视觉服务理解 ----
     # ``consumed`` = 已成功备好（压缩/编码完成）的占位符下标；

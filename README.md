@@ -1,6 +1,6 @@
 # 基米看得见视频 · astrbot_plugin_video_vision
 
-> 当前版本 **0.3.1**（版本号的唯一来源是 `metadata.yaml`；`main.py` 不再持有副本）。
+> 当前版本 **0.3.2**（版本号的唯一来源是 `metadata.yaml`；`main.py` 不再持有副本）。
 
 让模型真正**看见视频**，而不是抽取关键帧。支持两种模式：
 
@@ -27,6 +27,7 @@
 - **ffmpeg 并发限流**：进程内**全局**上限（默认 2），排队超时降级为 `busy`；
   不再是"最多 6 个 ffmpeg 一起抢 2 个核"（原上限只是默认线程池的 `min(32, cpu+4)`）
 - **视觉结果缓存（仅 `openai_compat`）**：同一视频 + 同一提问 + 同一模型/prompt 的**重复投递**不再重付一次上传 + 推理（TTL 600s / LRU 64 条，纯内存）；`/videotest` **绕过**缓存
+- **引用视频只剩地址时也能理解**：核心只给 `ref`（本地取不到）时按需下载到本次请求的临时目录，失败有降级说明（见下方「引用视频只剩地址时」）
 - **全链路失败降级**：视频处理出错**绝不影响**正常文字对话
 - **不污染对话历史**：注入的视频块标记为非持久化，不会在后续轮次被重发
 - **`/videotest` 诊断指令**：逐步查看处理耗时、体积、provider 与三道闸门
@@ -106,7 +107,7 @@ Responses API（`/responses`）同样实测支持：视频用 `input_image` + da
 | `max_duration_sec` | `60.0` | 最长时长，超出则截断。`0` 表示不限（此时 `oversize_action=truncate` 会退化成压缩，启动会告警） |
 | `oversize_action` | `compress` | `compress` / `reject` / `truncate`。`truncate` 按**体积预算**估算截断时长（见下） |
 | `max_video_count` | `2` | 单条消息最多处理几个视频 |
-| `handle_quoted_video` | `true` | 是否处理引用消息里的视频 |
+| `handle_quoted_video` | `true` | 是否处理引用消息里的视频。引用视频在本地取不到时核心只给一个 `ref` 地址，开启后会按需下载（见下方「引用视频只剩地址时」） |
 | `treat_file_as_video` | `true` | **把视频文件附件也当作视频处理**（见下方「QQ 把视频当文件发」） |
 | `hide_local_path` | `true` | **注入后抹除占位文本中的本机路径**（见下方「别把路径喂给模型」） |
 | `notify_on_failure` | `true` | 失败时追加一句简短说明给模型（`[Video attachment was skipped: …]`；"太长被拒"与"太大被拒"是两个不同的短语，见下） |
@@ -451,6 +452,47 @@ ffmpeg_queue_timeout_sec(30s)+max_compress_seconds(60s) 已吃掉视觉服务超
 普通文件（`.zip` / `.pdf` / `.mp3` 等）不会被误处理，也不会产生任何提示。
 
 关闭 `treat_file_as_video` 可禁用第二条路径。
+
+---
+
+## 引用视频只剩地址时（ref 形态，0.3.2 起）
+
+引用一条视频消息时，核心会先尝试把被引用的视频落到本地。**平台临时文件被清理
+或过期后**这一步会失败，核心于是只写一个引用地址：
+
+```
+[Video Attachment in quoted message: name a1b2.mp4, ref https://cdn.example/v/a1b2.mp4?sign=...]
+```
+
+0.3.1 的解析器硬性要求 `, path `，所以这种行**永远不会被处理**，视频静默不注入。
+0.3.2 在注入之前把它"物化"成本地文件，再交给同一条探测 / 压缩 / 编码管线：
+
+- **只认 `http(s)://`**，用标准库 `urllib`（不引入新运行时依赖）。最多 **5 跳**
+  重定向，单次 socket **30 秒**超时，边下边计字节：超过 **13.5MB**（18MB data URI
+  上限换算回原始体积，与 `max_size_mb` 不是同一个量纲）立刻中断，**不留半成品**。
+- **本机路径**（核心的 `video.path or video.file` 可能仍是裸路径）存在就直接用，
+  **零网络 I/O**；不存在则明确失败，不会把它当 URL 去试。
+- 下载到**本次请求独占**的临时目录；`build_video_blocks` 返回后立刻删除
+  ——那一刻所有视频都已编码进内存里的 data URI，临时文件不再需要。
+- 同一条消息里**同一个 URL 只下载一次**（重复引用不再下载，重复的占位符保持
+  原样 —— 它本来就会被注入侧当作重复视频跳过）。
+- 物化成功后，占位文本照常被改写成"已提供"的说明（`hide_local_path` 生效时
+  连 URL 与本机临时路径一起抹掉）。
+
+**失败时**不注入该视频，并按 `notify_on_failure`（默认开）追加一行既有格式的
+说明，三种短语分别对应"超时 / 超过下载上限 / 不是可下载地址"：
+
+```
+[Video attachment was skipped: the quoted video reference could not be downloaded]
+```
+
+失败时占位文本保持原样（与既有"失败保留路径"口径一致）——注意 ref 行里本来
+就有平台写入的签名 URL，那一条不是本插件新增的泄漏面。`handle_quoted_video=false`
+或 `max_video_count=0` 时**完全不下载**。
+
+> 【需实测】记录在案：签名 CDN 是否要求 `Referer` / Cookie 尚未在真机上逐条核对。
+> 如果要额外鉴权头，下载会走失败降级（视频不被理解，但对话照常），不会静默
+> 假装看到了视频。异常消息与注入文本都不含 URL，避免签名 token 泄漏。
 
 ---
 
@@ -806,6 +848,10 @@ checks = {'title': True, 'verdict_line': True, 'prepare_ok': True, 'mime_line': 
   中转站若提供 File API 可显著放宽（当前实测的中转站没有）。
 - 编码后的 data URI 有 **18MB 硬上限**（对应约 13.5MB 原始体积），超过会直接
   拒绝并给出原因，不会静默截断，也不会把上百 MB 的 base64 塞进请求。
+- **引用视频（ref 形态）的下载同样有上限**：只支持 `http(s)`、最多 5 跳、单次
+  30 秒、原始体积超过 13.5MB 立即中断（半成品会删掉）；平台要求 Cookie / Referer
+  的地址会失败并走降级说明。下载目录是本次请求独占的，`build_video_blocks`
+  返回后即删除。
 - openai_compat 模式：视觉模型必须是**真能看视频**的模型（如 gemini-3.x-flash 系）；
   主模型拿到的是视觉模型的文字理解而非原片。
 - gemini_native 模式：仅支持 **Gemini 系** provider（依赖其按 MIME 构造媒体 Part 的行为），

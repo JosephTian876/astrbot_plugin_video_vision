@@ -23,15 +23,17 @@ def squash(text: str) -> str:
 
 
 def test_version_is_bumped():
-    """0.3.1：核心自己会传视频时让位（AstrBot PR #10202）；无新配置键。"""
-    assert "version: 0.3.1" in METADATA
+    """0.3.2：引用视频（ref 形态）在本地取不到时按需下载并理解。"""
+    assert "version: 0.3.2" in METADATA
     assert CHANGELOG.startswith("# 更新日志")
-    assert "## 0.3.1" in CHANGELOG
+    assert "## 0.3.2" in CHANGELOG
     # 历史条目必须保留（用户升级时要能查旧版本改了什么）
+    assert "## 0.3.1" in CHANGELOG
     assert "## 0.3.0" in CHANGELOG
     assert "## 0.2.1" in CHANGELOG
     # README 也要提一次当前版本（用户第一眼看到的地方），且不许还写着旧版本
-    assert "当前版本 **0.3.1**" in README
+    assert "当前版本 **0.3.2**" in README
+    assert "当前版本 **0.3.1**" not in README
     assert "当前版本 **0.3.0**" not in README
     assert "当前版本 **0.2.1**" not in README
 
@@ -415,15 +417,17 @@ def test_metadata_yaml_has_the_required_fields():
         assert fields.get(key), f"metadata.yaml 缺少必需字段 {key}"
         assert fields[key] != "|", f"metadata.yaml 的 {key} 是空的块标量"
     assert re.fullmatch(r"\d+\.\d+\.\d+", fields["version"]), fields["version"]
-    assert fields["version"] == "0.3.1"
+    assert fields["version"] == "0.3.2"
     assert fields["repo"].startswith("https://"), fields["repo"]
     assert fields["name"] == "astrbot_plugin_video_vision"
     # 四个必填字段之外，面板展示用的字段也不许丢
     for key in ("display_name", "short_desc", "astrbot_version"):
         assert fields.get(key), f"metadata.yaml 缺少 {key}"
-    # 特性清单要跟着版本走：0.3.0 的两处新行为都得在 description 里露过面
+    # 特性清单要跟着版本走：每个对外行为都得在 description 里露过面
     assert "ffmpeg 并发限流" in METADATA
     assert "视觉理解结果缓存" in METADATA
+    # 0.3.2：引用视频（ref 形态）下载
+    assert "ref 形态" in METADATA
 
 
 # ------------------------------------------- 0.3.1：核心原生视频输入时让位

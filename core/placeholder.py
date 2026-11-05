@@ -166,17 +166,47 @@ def iter_placeholders(
     0.2.1 这里还有个 ``include_file_kind`` 形参，但三个调用点从不传 False，
     那个分支等于死代码（ARCH-REVIEW P1-7），已删除。
 
-    ref 形态（``kind == "ref"``）**不返回**：注入路径目前只有"读本地文件"一种
-    物化方式，把 URL 交出去会被 ``prepare_video`` 当成不存在的路径去探测，
-    于是"静默跳过"变成用户可见的「文件不存在」失败。物化（下载）与随之而来的
-    行为变更留给下一个 PR —— 那时 ref 会先被改写成 path 形态，自然进入候选。
+    ref 形态（``kind == "ref"``）**不返回**：它的 ``path`` 字段是待物化的引用
+    （URL / 非本地路径），直接交给 ``prepare_video`` 会被当成不存在的路径去
+    探测，于是"静默跳过"变成用户可见的「文件不存在」失败。物化（下载）在
+    ``hooks.llm_request._materialize_refs`` 里完成：它把占位文本就地改写成
+    path 形态，改写之后这里自然把它当候选。ref 自己的候选出口是
+    :func:`iter_ref_placeholders`。
+    """
+    return _iter_parsed(parts, want_ref=False)
+
+
+def iter_ref_placeholders(
+    parts: Iterable[Any] | None,
+) -> list[tuple[int, VideoPlaceholder]]:
+    """扫描内容块列表，返回**只有 ref、没有本地文件**的 [(下标, 占位符), ...]。
+
+    这种形态只有一个来源：引用消息里的视频在本地取不到时，核心写下
+    ``[Video Attachment in quoted message: name X, ref R]``（``ref`` 分支被
+    ``if quoted:`` 包着，所以 ref **只**出现在引用形态）。
+
+    它的 ``path`` 字段里是**引用值**而不是文件路径，必须先由
+    ``core.media.download_ref_to`` 物化成可读文件，``hooks.llm_request`` 才能
+    把这段占位文本改写成 path 形态交给既有管线。调用方按返回顺序处理即可
+    与请求里的占位符顺序保持一致。
+    """
+    return _iter_parsed(parts, want_ref=True)
+
+
+def _iter_parsed(
+    parts: Iterable[Any] | None, *, want_ref: bool
+) -> list[tuple[int, VideoPlaceholder]]:
+    """``iter_placeholders`` / ``iter_ref_placeholders`` 的**唯一**实现。
+
+    ``want_ref`` 只决定"留哪一类"：``True`` 留 ref 形态，``False`` 留其余
+    （video / file）。扫描顺序就是 ``parts`` 的顺序 —— 物化与注入都依赖它。
     """
     found: list[tuple[int, VideoPlaceholder]] = []
     if not parts:
         return found
     for index, part in enumerate(parts):
         placeholder = parse_placeholder_text(_part_text(part))
-        if placeholder is None or placeholder.is_ref_kind:
+        if placeholder is None or placeholder.is_ref_kind != want_ref:
             continue
         found.append((index, placeholder))
     return found
