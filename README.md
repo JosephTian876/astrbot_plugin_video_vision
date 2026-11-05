@@ -1,6 +1,6 @@
 # 基米看得见视频 · astrbot_plugin_video_vision
 
-> 当前版本 **0.3.0**（版本号的唯一来源是 `metadata.yaml`；`main.py` 不再持有副本）。
+> 当前版本 **0.3.1**（版本号的唯一来源是 `metadata.yaml`；`main.py` 不再持有副本）。
 
 让模型真正**看见视频**，而不是抽取关键帧。支持两种模式：
 
@@ -509,6 +509,67 @@ return types.Part.from_bytes(data=..., mime_type=mime_type)
 **代价**：AstrBot 的模态清洗会把"模型未声明的 audio 块"替换成 `[Audio]` 文本。
 所以目标模型必须勾选**「音频」**模态，否则视频会被清洗掉。
 插件检测到这种情况会打 WARNING 并跳过注入，而不是静默发错内容。
+
+### 三种模式该勾哪些模态
+
+模态勾选同时决定两件事：核心会不会把视频**原样**交给 provider（只有勾了 `video`
+才会），以及插件借道 `audio` 槽的视频块会不会被模态清洗替换成 `[Audio]` 文本。
+三种模式各有一套勾法 —— 勾错不会报错，只会让视频静默消失。
+
+| 模式 | 需要勾选 | 不要勾选 | 一句话原因 |
+|---|---|---|---|
+| **核心原生**（合并上游原生视频 PR 后） | `video` | `audio`（除非这个模型还要接收语音消息） | 核心用原生 `video` 槽把视频交给 provider，插件看到非空 `video_urls` 与 `video` 模态后主动让位；`audio` 是旧版借道的入口，这条路径上不再需要。 |
+| **gemini_native**（借 `audio` 槽，0.3.1 的默认路径） | `audio` | `video` | 视频块借 `audio_url` 传输、类型由 data URI 里的 MIME 决定，模态清洗只认 `audio`：没勾 `audio` 时块会被替换成 `[Audio]` 文本（插件会 WARNING 并跳过注入）。4.29.1 的模态选项里还没有 `video`；在支持 `video` 的核心上勾它等于把请求交给核心原生路径，本模式随即让位。 |
+| **openai_compat**（文字注入） | 无需（`text` 默认已勾） | `audio` / `video` | 视频由插件直接交给配置里的 OpenAI 兼容视觉服务理解，主对话 provider 只收到一段文字；勾上媒体模态只会让"这个模型能收视频"变成假象。 |
+
+勾选位置：WebUI → 服务提供商 → 编辑该 provider → 模态。核对办法：`/videotest`
+报告的「闸门」一节第 ② 行就是当前 provider 的 `modalities` 判定（是否含
+`audio`），与真实请求走的是同一份判据。
+
+---
+
+## 核心自己会传视频时自动让位（AstrBot PR #10202）
+
+AstrBot 4.29.1 的 `ProviderRequest` **没有** `video_urls` 字段，核心只把视频写成
+一行 `[Video Attachment: name …, path …]` 文本 —— 这正是本插件要补的那一环（借
+`audio_url` 槽把视频块塞进请求）。上游 PR #10202 合并后，核心会自己在 `video_urls`
+里带上视频；此时本插件若继续注入，provider 会收到**两份**视频（一份原生
+`video_url` 块 + 一份借道 `audio_url` 的块），而对没有声明 audio 模态的模型，
+借道的那一份还会被模态清洗替换成 `[Audio]` 文本。所以核心接管时本插件**让位**：
+不追加内容块、不压缩、不占 ffmpeg 槽。
+
+### 让位的判据（两个条件同时成立）
+
+1. `req.video_urls` 是**非空 list**。4.29.1 上没有这个字段，插件用 `getattr` 探测，
+   字段不存在时判据恒假。
+2. 当前 provider 的 `modalities` 是 **list 且含 `"video"`**。
+
+第 2 条不能省：核心对**未声明** `video` 模态的 provider 会主动清空 `video_urls`，
+`modalities` 为 `None` 或 `[]` 时同样清空（"未配置 = 支持全部"的兼容约定显式排除了
+video）。那种情况下核心并不会把视频交给模型，让位等于把视频丢掉 —— 比双份注入糟。
+
+### 让位时仍然改写的部分
+
+核心只 append 一行包含**本机绝对路径**的文本，自己不做任何改写，让位路径同样执行
+`hide_local_path`（默认开）：模型仍知道"有个视频、叫什么"，但不会再被路径诱导去跑
+`cv2` 抽帧或 `os.walk` 找文件 —— 视频内容它已经拿到了。把 `hide_local_path` 关掉
+时，两条路径都不改写占位文本。
+
+### 兼容性与行为细节
+
+- **AstrBot 4.29.1 上判据恒假**：`ProviderRequest` 没有 `video_urls`，WebUI 的模态
+  选项里也还没有 `video`。所以本版本在 4.29.1 上**零行为变化**。
+- 让位与 `provider_mode` **无关**：闸门在 `_effective_mode()` 之前，所以
+  `openai_compat` 模式下同样让位 —— 核心已经把原片交给了主 provider，再调一次
+  视觉服务只是重复付费。
+- 让位**不设置**"本次已注入"的去重标记（那个标记的语义相反），因此天然幂等；若核心
+  之后因为重试/降级又把 `video_urls` 清空，插件仍有机会按原路径补注入。
+- 日志：每个 provider 第一次让位打一条 INFO（`provider=` 是其 id 或 type），之后降为
+  DEBUG。这是"视频理解换了实现"的可观测事实，不是故障，所以不是 WARNING。
+
+> ⚠️ **本仓库的测试无法证明"让位后核心真的把视频送到了 provider"**：那需要装了
+> PR #10202 的 AstrBot。本仓库的用例（`tests/test_native_yield.py`）只证明判据形状
+> 与让位动作本身。
 
 ---
 

@@ -77,6 +77,14 @@ _warned_gate: set[str] = set()
 _warned_config: set[str] = set()
 _OPENAI_NOT_READY = "openai_compat_not_ready"
 
+#: 「已让位给核心」的 provider 标识（``provider_type:provider_id``）。
+#:
+#: 只在**第一次**打 INFO，之后降级成 DEBUG。让位是**正确且期望**的行为（核心
+#: 自己把视频交给了 provider），不是故障，所以不能用 WARNING；但它同时是"视频
+#: 理解能力换了实现"的可观测事实，排障时用户需要看到一次，所以也不能只有 DEBUG。
+#: 与 ``_warned_gate`` / ``_warned_modality`` 分开：那两个是"按策略拒绝"的集合。
+_warned_yield: set[str] = set()
+
 #: 「取不到 provider」的原因码。与「闸门拒绝」必须可区分：
 #: 一个是**解析失败**，一个是**策略不允许**，用户要采取的动作完全不同。
 PROVIDER_ERROR_EXCEPTION = "exception"
@@ -857,6 +865,36 @@ def _effective_mode(config: VideoConfig) -> str:
     return mode
 
 
+def _core_serves_video_natively(req: Any, provider_config: dict[str, Any]) -> bool:
+    """核心是否已经能把这条视频**原生**交给 provider（AstrBot PR #10202 之后）。
+
+    两个条件必须**同时**成立，缺一不让位：
+
+    1. ``req.video_urls`` 是非空 list。AstrBot 4.29.1 的 ``ProviderRequest``
+       （``astrbot/core/provider/entities.py``）**没有**这个字段，PR #10202
+       合并后才加上。所以只能 ``getattr`` 探测：直接写 ``req.video_urls`` 会在
+       4.29.1 上抛 ``AttributeError``，而 :func:`handle_llm_request` 的兜底会把
+       它记成「注入视频时异常」并吞掉整次注入 —— 视频静默失效。
+    2. provider 的 ``modalities`` 是 list 且含 ``"video"``。核心在
+       ``tool_loop_agent_runner._assemble_request_context_for_provider`` 里会对
+       **未声明** video 的 provider 主动清空 ``video_urls``（"未配置 = 支持全部"
+       的向后兼容约定显式排除了 video）；那种情况下核心不会把视频交给 provider，
+       让位等于把视频丢掉。
+
+    Args:
+        req: LLM 请求对象（鸭子类型；真实类型是 ``ProviderRequest``）。
+        provider_config: ``provider.provider_config``；取不到时传空 dict。
+
+    Returns:
+        True 表示核心会自己把视频交给 provider，本插件应当让位。
+    """
+    video_urls = getattr(req, "video_urls", None)
+    if not isinstance(video_urls, list) or not video_urls:
+        return False
+    modalities = provider_config.get("modalities")
+    return isinstance(modalities, list) and "video" in modalities
+
+
 async def _handle(plugin: Any, event: Any, req: Any) -> None:
     config: VideoConfig = getattr(plugin, "config", None) or VideoConfig()
     if not config.enable:
@@ -867,6 +905,54 @@ async def _handle(plugin: Any, event: Any, req: Any) -> None:
     # 便宜的预检：没有视频占位符就完全不做 await
     if not iter_placeholders(_parts_of(req)):
         return
+
+    # ---- 闸门 -1：核心已能原生传视频 -> 让位，不重复注入 ----
+    # 两个条件都成立才让位（见 _core_serves_video_natively 的 docstring）。
+    # 位置刻意选在「有无占位符」预检之后：普通对话零 await、零日志；也选在
+    # _effective_mode() 之前：让位是我们主动不做，不该在让位路径上打出那条
+    # 「openai_compat 没配齐，已降级」的告警，否则日志归因会被带偏。
+    video_urls = getattr(req, "video_urls", None)
+    if isinstance(video_urls, list) and video_urls:
+        provider, _provider_error = await resolve_provider(plugin, event)
+        provider_config = getattr(provider, "provider_config", None) or {}
+        if _core_serves_video_natively(req, provider_config):
+            # 让位也必须改写占位文本：核心只 append 一行包含本机绝对路径的
+            # TextPart，自己**不**做任何改写（PR #10202 之后也照样原样保留）。
+            # 不改的话模型看到路径仍会去跑 cv2 抽帧 / os.walk 全盘搜文件名，
+            # 而视频内容它**已经拿到了**（实测记录见 _neutralize_placeholders）。
+            # 传全部下标而不是"逐个验证成功"的 done：这里的语义是"每一个视频
+            # 占位符都已由核心交付"；普通文本块走 parse_placeholder_text 返回
+            # None 的分支，不会被误伤。
+            # 文案固定用 gemini_native 那条：核心走的是原生视频块，模型确实
+            # 「已经看到」，用 openai_compat 的"已交给视觉模型分析"会说谎。
+            if config.hide_local_path:
+                target = _parts_of(req)
+                _neutralize_placeholders(
+                    target, set(range(len(target))), mode="gemini_native"
+                )
+            key = (
+                f"{provider_config.get('type') or ''}:"
+                f"{provider_config.get('id') or ''}"
+            )
+            if key not in _warned_yield:
+                _warned_yield.add(key)
+                logger.info(
+                    "[VideoVision] 核心已原生接收本条视频（provider=%s 声明了 "
+                    "video 模态），本次让位、不重复注入；如需插件接管，"
+                    "请勿给该模型勾选「视频」模态。",
+                    provider_config.get("id")
+                    or provider_config.get("type")
+                    or "(未声明)",
+                )
+            else:
+                logger.debug(
+                    "[VideoVision] 核心已原生接收视频，让位（provider=%s）", key
+                )
+            # 不设 _DONE_ATTR：那个标记的语义是「本次请求已经注入过」，而让位
+            # 是「本次请求不该由我们注入」。用同一个标记表达两种相反状态，会让
+            # 后续读它的代码把"让位"误判成"已注入"；且不设标记时，万一上层
+            # 之后又把 video_urls 清空了，我们天然还有机会重新判定并补注入。
+            return
 
     mode = _effective_mode(config)
     provider_type = "(openai_compat)"
