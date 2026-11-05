@@ -21,3 +21,7 @@ video_vision_cache/
 # 本地私有配置（不应提交）
 config.local.yaml
 .env
+
+# 本地测试临时目录（跑 pytest 时的 --basetemp）
+.tmp-test/
+pytest-tmp/

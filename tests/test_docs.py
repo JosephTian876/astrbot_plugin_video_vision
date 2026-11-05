@@ -23,16 +23,18 @@ def squash(text: str) -> str:
 
 
 def test_version_is_bumped():
-    """0.3.2：引用视频（ref 形态）在本地取不到时按需下载并理解。"""
-    assert "version: 0.3.2" in METADATA
+    """0.4.0：把让位、引用视频（解析 + 下载）与只读状态接口合并为一个正式版本。"""
+    assert "version: 0.4.0" in METADATA
     assert CHANGELOG.startswith("# 更新日志")
+    assert "## 0.4.0" in CHANGELOG
     assert "## 0.3.2" in CHANGELOG
     # 历史条目必须保留（用户升级时要能查旧版本改了什么）
     assert "## 0.3.1" in CHANGELOG
     assert "## 0.3.0" in CHANGELOG
     assert "## 0.2.1" in CHANGELOG
     # README 也要提一次当前版本（用户第一眼看到的地方），且不许还写着旧版本
-    assert "当前版本 **0.3.2**" in README
+    assert "当前版本 **0.4.0**" in README
+    assert "当前版本 **0.3.2**" not in README
     assert "当前版本 **0.3.1**" not in README
     assert "当前版本 **0.3.0**" not in README
     assert "当前版本 **0.2.1**" not in README
@@ -417,7 +419,7 @@ def test_metadata_yaml_has_the_required_fields():
         assert fields.get(key), f"metadata.yaml 缺少必需字段 {key}"
         assert fields[key] != "|", f"metadata.yaml 的 {key} 是空的块标量"
     assert re.fullmatch(r"\d+\.\d+\.\d+", fields["version"]), fields["version"]
-    assert fields["version"] == "0.3.2"
+    assert fields["version"] == "0.4.0"
     assert fields["repo"].startswith("https://"), fields["repo"]
     assert fields["name"] == "astrbot_plugin_video_vision"
     # 四个必填字段之外，面板展示用的字段也不许丢

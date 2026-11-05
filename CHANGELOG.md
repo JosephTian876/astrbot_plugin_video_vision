@@ -1,5 +1,36 @@
 # 更新日志
 
+## 0.4.0
+
+正式发布 0.3.1 与 0.3.2 的内容，并新增「陪伴」宿主可读的只读状态接口。
+三个改动各自独立，可按此顺序合并：
+
+1. **核心自己会传视频时自动让位**（0.3.1）：AstrBot 核心（PR #10202）已经原生
+   接收视频时，本插件不再重复注入。判据是 
+eq.video_urls 非空**且**当前
+   provider 的 modalities 含 "video"；只判前者会丢视频，因为核心对未声明
+   视频模态的 provider 会清空 ideo_urls。让位时仍改写占位文本（hide_local_path），
+   否则模型看到本机路径会自己去抽帧。4.29.1 上该判据恒假，行为零变化。
+2. **引用视频的 
+ef 形态**（0.3.2）：核心取不到本地文件时只写一行
+   [Video Attachment in quoted message: name X, ref https://…]；本插件解析它，
+   http(s) 地址按需下载并物化后再走既有注入管线，本机路径则零网络 I/O。
+   下载上限 13.5MB、5 跳、30 秒，失败不注入且提示文本不含 URL。
+3. **只读状态接口**：xtension_api.companion_v2_status() 返回恰好四个字段
+   （schema / plugin_id / nabled / 
+untime_ready），供「陪伴」宿主的
+   集成目录显示安装与就绪状态。这是鸭子类型约定，不是 AstrBot 官方字段；
+   宿主未在 EXTERNAL_PROVIDERS 登记时不会调用。
+
+README 新增「三种模式该勾哪些模态」对照表：核心原生 / gemini_native /
+openai_compat 各自需要勾选与不要勾选的模态，以及一句话原因。
+
+> 升级提示：合并了核心原生视频 PR 之后，请**只勾选 ideo、取消 udio**，
+> 否则同一段视频会被核心与本插件各送一次。
+
+测试：pytest tests 717 passed / 1 skipped（设计内跳过）；
+uff 0.15.22 全绿。
+
 ## 0.3.2
 
 新增：**引用消息里的视频在本地取不到时，插件会按核心给出的 `ref` 下载它**，

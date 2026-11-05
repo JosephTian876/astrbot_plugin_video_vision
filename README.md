@@ -1,6 +1,6 @@
 # 基米看得见视频 · astrbot_plugin_video_vision
 
-> 当前版本 **0.3.2**（版本号的唯一来源是 `metadata.yaml`；`main.py` 不再持有副本）。
+> 当前版本 **0.4.0**（版本号的唯一来源是 `metadata.yaml`；`main.py` 不再持有副本）。
 
 让模型真正**看见视频**，而不是抽取关键帧。支持两种模式：
 
