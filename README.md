@@ -736,6 +736,46 @@ MIME   : video/mp4（压缩产物，固定为 mp4）
 **互补不冲突**：后者用**抽帧**实现"一起看视频"的网页播放器场景，
 本插件用**原生视频**处理"发我一段视频"的场景，触发路径不同。
 
+### 与「陪伴」宿主的只读状态接口
+
+「陪伴」V2 宿主（`astrbot_plugin_private_companion`）在 `astrbot_host/integration_registry.py:192-219`
+用 `getattr(star.star_cls, "extension_api", None)` 探测第三方插件，
+再调一次 `companion_v2_status()` 读运行状态。**这不是 AstrBot 官方字段**：
+`Star`（`core/star/base.py`）与 `StarMetadata`（`core/star/star.py`）都没有它，
+加载器也没有属性白名单 —— 它纯粹是两个插件之间的**鸭子类型约定**，两边各持一份
+常量，靠各自仓库的用例守住字面量一致。
+
+本插件在 `VideoVisionPlugin.__init__` 的末尾挂上
+`self.extension_api = VideoVisionStatusAPI(self)`。必须是**实例属性**：宿主读的
+`star_cls` 就是插件实例，而 `enabled` 只能来自运行中的配置（类属性拿不到）。
+接口返回**恰好四个标量**：
+
+| 字段 | 类型 | 值 |
+|---|---|---|
+| `schema` | `str` | 固定 `companion.provider-status.v1` |
+| `plugin_id` | `str` | 固定 `astrbot_plugin_video_vision`（裸目录名，不是 `author/name`） |
+| `enabled` | `bool` | 配置项 `enable`（插件总开关） |
+| `runtime_ready` | `bool` | `enabled` 且**生效模式**的依赖满足 —— 即"实际能不能干活"。`openai_compat` 要求三要素齐全；`gemini_native` 依赖宿主当前的 Gemini provider，插件侧没有必需配置项。因此**降级到 `gemini_native` 仍算就绪**：降级只说明用户以为的那条路径没生效，视频理解本身照常工作，不该让宿主显示"等待" |
+
+`runtime_ready` 只读配置、不去问宿主"现在有没有 Gemini provider"：本接口必须
+**同步**返回（`async def` 会被宿主判成"还没有状态适配器"），而 provider 列表属于
+宿主运行状态 —— `resolve_provider` 只能在请求时 `await`，何况查到的结果与真正发
+请求时可能已经不同。所以 `gemini_native` 按"插件侧没有必需配置项"认定为满足；
+真的不满足时，注入路径会按既有 provider / 模态闸门跳过并留下日志，不会假装看见
+视频。
+
+改这个接口前先读三条硬性约束（都是宿主侧的逐字校验）：方法必须**同步**
+（`async def` 会被判成"还没有状态适配器"，显示为 `installed`）；`schema` 与
+`plugin_id` 逐字比较；`enabled` / `runtime_ready` 必须是真 `bool`
+（`1` / `0` / `"true"` 不认）。配置原文、API key、缓存路径、错误文本一律不越过
+这个边界（宿主注释原文：`Only these typed scalar fields can cross into the
+manifest. No raw configuration, private error text, paths, tokens or user data.`）。
+
+**生效前提**：宿主 catalog（`astrbot_host/integration_catalog.py` 的
+`EXTERNAL_PROVIDERS`）里必须先登记 `plugin_id=astrbot_plugin_video_vision`。
+没有那条登记，本接口不会被调用，陪伴小屋（`pages/陪伴小屋`）也不会出现这张卡
+—— 接口就绪 ≠ 页面上看得见。
+
 ---
 
 ## 工作原理
@@ -791,7 +831,8 @@ astrbot_plugin_video_vision/
 │   ├── vision_cache.py     视觉结果缓存（TTL + LRU，纯内存，零 AstrBot）
 │   └── placeholder.py      占位文本解析
 └── hooks/
-    └── llm_request.py      on_llm_request 注入逻辑
+    ├── llm_request.py      on_llm_request 注入逻辑
+    └── status.py           给「陪伴」宿主的只读状态接口（companion_v2_status）
 ```
 
 `core/` 下除 `injector.py` 从 `astrbot.api` 取 `logger` 之外**不依赖** AstrBot 的

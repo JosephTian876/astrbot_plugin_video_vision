@@ -60,6 +60,7 @@ from .hooks.llm_request import (
     mark_degradation_warned,
     resolve_provider,
 )
+from .hooks.status import VideoVisionStatusAPI
 
 PLUGIN_NAME = "astrbot_plugin_video_vision"
 #: 插件的显示名 / 简介 / 版本 / 仓库 / 作者**只在** ``metadata.yaml`` 里维护
@@ -242,6 +243,14 @@ class VideoVisionPlugin(Star):
         if self.config.provider_mode != self.config.effective_provider_mode:
             # 承诺是"只告警一次"：启动这条信息最完整，钩子里不再重复刷
             mark_degradation_warned()
+
+        #: 给「陪伴」宿主（astrbot_plugin_private_companion）的只读状态门面，
+        #: 契约见 ``hooks/status.py`` 的模块说明（鸭子类型约定，不是 AstrBot
+        #: 官方字段）。**必须是实例属性**：宿主读 ``star_cls.extension_api``，
+        #: 而 ``enabled`` / ``runtime_ready`` 只能来自运行中的 ``self.config``。
+        #: 放在 ``__init__`` 最末尾 —— 上面所有字段此时都已就绪，且本对象只读，
+        #: 不参与任何既有路径。
+        self.extension_api = VideoVisionStatusAPI(self)
 
     # ------------------------------------------------------------------ 钩子
     @filter.on_llm_request(priority=HOOK_PRIORITY)

@@ -1015,14 +1015,27 @@ async def handle_llm_request(plugin: Any, event: Any, req: Any) -> None:
         logger.error("[VideoVision] 注入视频时异常，已跳过: %s", exc, exc_info=True)
 
 
+def mode_is_degraded(config: VideoConfig) -> bool:
+    """``provider_mode`` 是不是被降级成了 ``effective_provider_mode``。
+
+    降级的**条件**只有一处定义：``VideoConfig.effective_provider_mode``
+    （``openai_compat`` 三要素没配齐时回落 ``gemini_native``）。这里只把它与用户
+    配置的值比一下，**纯判断、不打日志、无副作用** ——
+    :func:`_effective_mode`（第一次降级时告警一次）与只读状态接口
+    （``hooks/status.py``）都读它，避免"什么算降级"长出第二份副本。
+    """
+    return config.effective_provider_mode != config.provider_mode
+
+
 def _effective_mode(config: VideoConfig) -> str:
     """决定本次请求实际使用的模式，并在降级时告警一次。
 
     降级规则本身在 ``VideoConfig.effective_provider_mode`` 里（纯数据、可单测），
-    这里只负责「第一次降级时提醒用户一句」，避免日志刷屏。
+    这里只负责「第一次降级时提醒用户一句」，避免日志刷屏；判据见
+    :func:`mode_is_degraded`。
     """
     mode = config.effective_provider_mode
-    if mode != config.provider_mode and _OPENAI_NOT_READY not in _warned_config:
+    if mode_is_degraded(config) and _OPENAI_NOT_READY not in _warned_config:
         _warned_config.add(_OPENAI_NOT_READY)
         logger.warning(
             "[VideoVision] provider_mode=openai_compat，但 openai_base_url / "

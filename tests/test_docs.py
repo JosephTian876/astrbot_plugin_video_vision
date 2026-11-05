@@ -486,3 +486,31 @@ def test_readme_modality_checklist_covers_the_three_modes():
     # 核对办法指向真实的诊断输出（闸门 ② 就是 modalities 判定）
     assert "闸门" in section
 
+
+# ------------------------------------ 「陪伴」宿主的只读状态接口（互操作文档）
+
+
+def test_readme_documents_the_companion_status_contract():
+    """接口是**鸭子类型约定**，唯一让别人看到它的地方就是 README。
+
+    这里锁四件事：字面量、四个字段、同步约束，以及最容易漏的那句"宿主 catalog
+    没登记就不会被调用"—— 少了最后一条，读者会以为装上插件页面上就多一张卡。
+    """
+    heading = "### 与「陪伴」宿主的只读状态接口"
+    assert heading in README
+    section = README.split(heading, 1)[1].split("\n## ", 1)[0]
+
+    assert "不是 AstrBot 官方字段" in section
+    assert "companion_v2_status" in section
+    assert "extension_api" in section
+    assert "companion.provider-status.v1" in section
+    assert "astrbot_plugin_video_vision" in section
+    for field in ("schema", "plugin_id", "enabled", "runtime_ready"):
+        assert f"`{field}`" in section, field
+    # 同步 + 降级语义：这两条改了宿主就会显示 installed / waiting
+    assert "同步" in section and "async def" in section
+    assert "降级" in section and "gemini_native" in section
+    # 生效前提：宿主 catalog 必须先登记本插件
+    assert "EXTERNAL_PROVIDERS" in section
+    assert "陪伴小屋" in section
+
