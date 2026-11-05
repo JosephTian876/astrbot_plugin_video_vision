@@ -8,9 +8,9 @@
 本文件锁两件事：
 
 1. **解析**：ref 行能还原出 name / 地址 / quoted，且存在 ``]``、逗号的边界；
-2. **行为不变**：ref 不进 ``iter_placeholders`` 的候选 —— 本 PR 不做物化
-   （下载），把 URL 交给 ``prepare_video`` 只会得到「文件不存在」的用户可见
-   失败，那是下一个 PR 才该引入的行为变更。
+2. **候选边界**：ref 不进 ``iter_placeholders`` 的候选 —— 那是
+   ``iter_ref_placeholders`` 的职责。物化（下载）由
+   ``hooks.llm_request._materialize_refs`` 完成，见 ``tests/test_ref_download.py``。
 """
 
 from __future__ import annotations
@@ -68,8 +68,9 @@ def test_a_comma_inside_the_ref_name_is_kept():
 def test_path_and_ref_forms_are_distinguished():
     """同一批内容块里两种形态都解析出来，且 ``kind`` 不同。
 
-    同时钉住行为边界：ref **不进注入候选**（本 PR 不物化）。这条让"静默跳过"
-    与 0.3.0 完全一致 —— 不会多出一条「文件不存在」的失败提示。
+    同时钉住候选边界：ref **不进** ``iter_placeholders``（物化在 hooks 里、扫描
+    到它之前完成），否则一个 URL 会被 ``prepare_video`` 当成不存在的路径探测，
+    变成用户可见的「文件不存在」失败。
     """
     path_line = (
         r"[Video Attachment in quoted message: name a.mp4, path C:\v\a.mp4]"

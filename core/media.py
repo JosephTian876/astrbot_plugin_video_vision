@@ -15,7 +15,11 @@ import shutil
 import signal
 import subprocess
 import threading
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
+from typing import Any
 
 #: 常见视频容器 -> MIME
 VIDEO_MIME_BY_SUFFIX: dict[str, str] = {
@@ -43,6 +47,12 @@ OUTPUT_MIME = "video/mp4"
 #: 体积闸门 13MB 的量级。再大就会让请求体与内存峰值失控（实测 19.53MB 视频
 #: 的 data URI 峰值内存 269.6MB = 3.67 倍）。超限直接失败，绝不静默发出去。
 MAX_DATA_URI_BYTES = 18 * 1024 * 1024
+
+#: 引用视频（ref 形态）下载的**原始字节**硬上限 = data URI 硬上限换算回原始体积
+#: （18MB * 3/4 = 13.5MB，与 ``core/decide.py`` 的 ``URI_LIMIT_RAW_MB`` 同一个
+#: 换算）。超过它的视频即使下载成功，也必然在 ``read_as_data_uri`` 的编码上限
+#: 处失败；边下边拦，别先写满磁盘再报错。
+MAX_REF_DOWNLOAD_BYTES = MAX_DATA_URI_BYTES * 3 // 4
 
 
 class MediaToolError(RuntimeError):
@@ -216,6 +226,207 @@ def read_as_data_uri(
             kind="too_large",
         )
     return f"data:{resolved_mime};base64,{encoded}"
+
+
+#: 引用视频下载的跳数上限（urllib 的默认值是 10）。签名 CDN URL 实测常见 1 跳，
+#: 给到 5 足够应付中转站；再多只会把"坏链接"拖得更久。
+MAX_REF_REDIRECTS = 5
+
+#: 边下边计的读块大小。**绝不** ``read()`` 整段：一段 500MB 的视频会先吃满内存
+#: 再撞上限，而这一层存在的意义正是"超限即停"。
+_REF_CHUNK_BYTES = 64 * 1024
+
+#: 部分 CDN 拒绝空 User-Agent。刻意不带版本号：这行 UA 不该随 ``metadata.yaml``
+#: 的版本一起漂移。
+_REF_USER_AGENT = "astrbot-plugin-video-vision/ref-download"
+
+
+class _LimitedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """把 urllib 的跳数上限从默认 10 收紧到 :data:`MAX_REF_REDIRECTS`。
+
+    ``urllib`` 的两个计数本来就是类属性：``max_repeats`` 防同一个地址来回跳、
+    ``max_redirections`` 防长链。改类属性比复写 ``redirect_request`` 少抄一份
+    ``urljoin`` 逻辑 —— 那份逻辑一旦与标准库分叉，异常消息里就可能带上 URL。
+    """
+
+    max_repeats = MAX_REF_REDIRECTS
+    max_redirections = MAX_REF_REDIRECTS
+
+
+def _is_http_ref(ref: str) -> bool:
+    """``ref`` 是否是 http(s) 地址（大小写不敏感）。"""
+    return ref.lower().startswith(("http://", "https://"))
+
+
+def _ref_suffix(url: str) -> str:
+    """从 URL 的 path 里取视频后缀；未知 / 没有后缀时回落到 ``.mp4``。
+
+    后缀决定 ``prepare_video`` 里的 MIME 声明与 corrupt 判决，所以只接受
+    :data:`VIDEO_MIME_BY_SUFFIX` 里的已知容器：签名 URL 常以
+    ``/download?id=...`` 结尾，那里的 ``.mp4`` 出现在 query 而不是 path 里。
+    """
+    suffix = suffix_of(urllib.parse.urlsplit(url).path)
+    return suffix if suffix in VIDEO_MIME_BY_SUFFIX else OUTPUT_SUFFIX
+
+
+def _declared_length(response: object) -> int | None:
+    """``Content-Length``（**不可信**，只用来在写入前提前拦一刀）。
+
+    服务端可能不写、也可能写错，所以真正的拦截靠下面边下边计的字节数。
+    """
+    headers = getattr(response, "headers", None)
+    raw = headers.get("Content-Length") if hasattr(headers, "get") else None
+    try:
+        value = int(raw) if raw is not None else 0
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def _discard(path: Path) -> None:
+    """删掉下到一半的产物：任何失败路径都不留垃圾文件。"""
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _open_ref(request: urllib.request.Request, timeout: float) -> Any:
+    """打开引用下载请求（跳数受限）。
+
+    独立成函数是为了让测试能替换**唯一**的网络入口：``build_opener`` 返回的
+    ``OpenerDirector`` 绕过了 ``urllib.request.urlopen``，monkeypatch 后者是
+    拦不住的。生产路径始终走这个函数。
+    """
+    opener = urllib.request.build_opener(_LimitedRedirectHandler)
+    return opener.open(request, timeout=timeout)
+
+
+def _close_quietly(exc: BaseException) -> None:
+    """``HTTPError`` 本身就是一个**未关闭的响应**：不关它等于漏一个 socket。
+
+    失败是常态（403 / 404 / 跳数超限），长跑插件必须自己回收；其它异常没有
+    ``close``，直接跳过。
+    """
+    close = getattr(exc, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:  # noqa: BLE001 - 回收失败也不能盖住真正的原因
+            pass
+
+
+def _describe_download_failure(exc: BaseException) -> tuple[str, str]:
+    """把下载异常翻译成 ``(message, kind)``，**message 里绝不含 URL**。
+
+    签名 query 里的 token 既不该进日志，也不该进注入给模型的文本。所以这里
+    只回异常类型 / HTTP 状态码，不拼 ``ref``，也不转发 ``str(exc)``
+    （``ValueError``、``InvalidURL`` 这类异常的原文里会带地址）。
+    """
+    reason = getattr(exc, "reason", None)
+    if isinstance(exc, TimeoutError) or isinstance(reason, TimeoutError):
+        return "引用视频下载超时", "timeout"
+    if isinstance(exc, urllib.error.HTTPError):
+        return f"引用视频下载失败（HTTP {exc.code}）", "other"
+    if isinstance(exc, urllib.error.URLError):
+        return f"引用视频下载失败（{type(reason or exc).__name__}）", "other"
+    return f"引用视频下载失败（{type(exc).__name__}）", "other"
+
+
+def download_ref_to(
+    ref: str, directory: str | os.PathLike[str], timeout: float = 30.0
+) -> str:
+    """把引用形态（ref）的视频物化成可读的本地路径。
+
+    ``core/placeholder.py`` 的 ref 占位符只给一个引用值 —— 核心的
+    ``video.path or video.url or video.file``（``astr_main_agent.py`` 的 quoted
+    分支）。它可能是三种东西，本函数各有一条明确出口：
+
+    * ``http(s)://`` —— 下载到 ``directory``（调用方给的**本次请求独占**目录）；
+    * 本机路径 / 裸文件名 —— **存在**就原样返回，不做任何网络 I/O；
+    * 其它（不存在且不是 http(s)）—— 明确失败，**绝不**把它当 URL 去试探
+      （把 ``a1b2.mp4`` 当相对路径去读，错的是那条路径，不是"下载失败"）。
+
+    **只用标准库**：``core/`` 受 ``tests/test_docs.py`` 的 AST 锁约束，不许
+    ``import astrbot``；``httpx`` 只是测试依赖（``openai_vision`` 也是惰性、
+    可缺）。``urllib`` 零运行时依赖。
+
+    拦截：跳数上限 :data:`MAX_REF_REDIRECTS`；边下边计字节，超过
+    :data:`MAX_REF_DOWNLOAD_BYTES` 立刻中断并删掉半成品；``timeout`` 是单次
+    socket 操作上限。
+
+    **异常消息绝不含 URL**：只要走到失败分支，消息里只有异常类型 / HTTP 状态码
+    （:func:`_describe_download_failure`）或一句固定的中文说明。
+
+    Args:
+        ref: 引用值（可能是 URL，也可能是本机路径）。
+        directory: 下载目录（调用方负责清理；不存在时会被创建）。
+        timeout: 单次 socket 操作上限（秒）。
+
+    Returns:
+        本地路径：URL 时是 ``directory`` 下的新文件，本机路径时原样返回。
+
+    Raises:
+        MediaToolError: 引用为空、不是 http(s) 且本机不存在、超时、体积超限、
+            HTTP 错误或其它下载失败。``kind`` 取
+            ``MediaToolError.KINDS`` 里的 ``timeout`` / ``too_large`` / ``empty``
+            / ``other``。
+    """
+    text = (ref or "").strip()
+    if not text:
+        raise MediaToolError("引用视频地址为空，无法物化", kind="other")
+    if not _is_http_ref(text):
+        if os.path.isfile(text):
+            return text
+        raise MediaToolError(
+            "引用视频不是 http(s) 地址，且本机不存在该文件", kind="other"
+        )
+
+    # 落盘名字用引用的摘要：同一 URL 重试写同一个文件（不会堆垃圾），
+    # 且文件名里不出现 URL 的任何片段（日志 / 目录列表里都不会泄漏签名）。
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+    target = Path(directory) / f"ref-{digest}{_ref_suffix(text)}"
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError as exc:
+        raise MediaToolError(
+            f"引用视频下载目录不可用（{type(exc).__name__}）", kind="other"
+        ) from exc
+
+    request = urllib.request.Request(text, headers={"User-Agent": _REF_USER_AGENT})
+    limit_mb = MAX_REF_DOWNLOAD_BYTES / 1024 / 1024
+    written = 0
+    try:
+        with _open_ref(request, timeout) as response:
+            declared = _declared_length(response)
+            if declared is not None and declared > MAX_REF_DOWNLOAD_BYTES:
+                raise MediaToolError(
+                    f"引用视频超过下载上限 {limit_mb:.1f}MB", kind="too_large"
+                )
+            with open(target, "wb") as sink:
+                while True:
+                    chunk = response.read(_REF_CHUNK_BYTES)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if written > MAX_REF_DOWNLOAD_BYTES:
+                        raise MediaToolError(
+                            f"引用视频超过下载上限 {limit_mb:.1f}MB",
+                            kind="too_large",
+                        )
+                    sink.write(chunk)
+    except MediaToolError:
+        _discard(target)
+        raise
+    except Exception as exc:  # noqa: BLE001 - 全部翻译成"不带 URL"的 MediaToolError
+        _discard(target)
+        _close_quietly(exc)
+        message, kind = _describe_download_failure(exc)
+        raise MediaToolError(message, kind=kind) from exc
+    if written <= 0:
+        _discard(target)
+        raise MediaToolError("引用视频下载到 0 字节", kind="empty")
+    return str(target)
 
 
 #: 超时后等待子进程回收的上限（秒）。孙进程可能仍持有管道，不能无限等。
