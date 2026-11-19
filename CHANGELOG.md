@@ -1,35 +1,45 @@
 # 更新日志
 
+## 0.4.1
+
+围绕真机高频边界集中加固，涵盖纯附件提问识别、视觉服务端点与响应容错、单轮切模兼容性、引用视频 SSRF 防护与配额收敛、预占槽 singleflight 去重，以及 `.ts` 误识别与幂等标记修复：
+
+1. **纯附件 `<attachment>` 占位词过滤与视觉服务容错脱敏**：`_extract_question` 剔除 AstrBot 在纯附件无文字时写入的 `<attachment>` 占位词（避免误触发问答模板）；`_resolve_endpoint` 保留已有查询参数（如 `?api-version=...`）并支持裸域名自动补全 `/v1/chat/completions`；`_parse_response` 支持多模态 `content` 列表并过滤思考/推理段；`_short_reason` 与 `_classify_error` 识别 `504 Gateway Time-out`（`time-out`）；`openai_base_url` 与 `openai_api_key` 增加格式校验（拦截非 http(s) 与误填 URL 的密钥），错误摘要统一经过 `_redact_secret` 脱敏，空白 `openai_model` 回退默认模型；`hooks/status.py` 自动沿用更严格的就绪判定。
+2. **单轮临时切模 `selected_provider` 优先解析**：`resolve_provider` 先读取 `event.get_extra("selected_provider")` 并经由 `context.get_provider_by_id(...)` 查找，未命中时再回退 `get_using_provider_async`，与 AstrBot 核心选模链路对齐。
+3. **引用视频（`ref` 形态）安全防护与配额前置**：
+   - 下载前由 `_select_ref_candidates` 按 `handle_quoted_video` / `max_video_count` / 视频候选规则筛选并计入非 ref 视频占用配额，避免超配额引用触发无效网络下载；
+   - `_ref_download_limit` 在 `oversize_action` 为 `compress`/`truncate` 且 `ffmpeg`/`ffprobe` 均就绪时将远端下载上限放宽至 100MB；
+   - `download_ref_to` 新增 SSRF 防护：拦截 `file://`、`localhost`、私网 / 回环 / 元数据 IP 与混淆 IPv4 字面量，对直连及重定向目标校验 DNS 解析（兼容 `198.18.0.0/15` 透明代理网段），非 URL 本机路径仅放行授权视频格式或临时目录内无后缀文件；
+   - `_dedup_ref_placeholders` 在注入末尾剥除同 URL 重复 `ref` 占位符里的原始带签名地址。
+4. **预占槽 `AsyncSingleFlight` 与总体超时保护**：新增 `AsyncSingleFlight` 并在 `build_video_blocks` 中通过 `PREPARE_FLIGHTS` 于 `SlotLimiter.slot()` 之前对同内容同参数视频合并并发，避免 follower 占满并发槽位与线程池；`SingleFlight.run` 与 `AsyncSingleFlight.run` 补充总体等待超时保护，杜绝无限挂起。
+5. **`.ts` 误识别剔除、重复探测消除与 `_DONE_ATTR` 后置**：从 `VIDEO_SUFFIXES` 与 `VIDEO_MIME_BY_SUFFIX` 移除 `.ts`（防止 TypeScript 源码被当成视频）；`compress_video(..., duration=...)` 复用已探测时长省去重复 `ffprobe`；`_DONE_ATTR` 移至 `_handle` 完成注入后写入，避免异常中断后误标完成。
+
 ## 0.4.0
 
 正式发布 0.3.1 与 0.3.2 的内容，并新增「陪伴」宿主可读的只读状态接口。
 三个改动各自独立，可按此顺序合并：
 
 1. **核心自己会传视频时自动让位**（0.3.1）：AstrBot 核心（PR #10202）已经原生
-   接收视频时，本插件不再重复注入。判据是 
-eq.video_urls 非空**且**当前
-   provider 的 modalities 含 "video"；只判前者会丢视频，因为核心对未声明
-   视频模态的 provider 会清空 ideo_urls。让位时仍改写占位文本（hide_local_path），
+   接收视频时，本插件不再重复注入。判据是 `req.video_urls` 非空**且**当前
+   provider 的 `modalities` 含 "video"；只判前者会丢视频，因为核心对未声明
+   视频模态的 provider 会清空 `video_urls`。让位时仍改写占位文本（`hide_local_path`），
    否则模型看到本机路径会自己去抽帧。4.29.1 上该判据恒假，行为零变化。
-2. **引用视频的 
-ef 形态**（0.3.2）：核心取不到本地文件时只写一行
-   [Video Attachment in quoted message: name X, ref https://…]；本插件解析它，
+2. **引用视频的 `ref` 形态**（0.3.2）：核心取不到本地文件时只写一行
+   `[Video Attachment in quoted message: name X, ref https://…]`；本插件解析它，
    http(s) 地址按需下载并物化后再走既有注入管线，本机路径则零网络 I/O。
    下载上限 13.5MB、5 跳、30 秒，失败不注入且提示文本不含 URL。
-3. **只读状态接口**：xtension_api.companion_v2_status() 返回恰好四个字段
-   （schema / plugin_id / nabled / 
-untime_ready），供「陪伴」宿主的
+3. **只读状态接口**：`extension_api.companion_v2_status()` 返回恰好四个字段
+   （`schema` / `plugin_id` / `enabled` / `runtime_ready`），供「陪伴」宿主的
    集成目录显示安装与就绪状态。这是鸭子类型约定，不是 AstrBot 官方字段；
-   宿主未在 EXTERNAL_PROVIDERS 登记时不会调用。
+   宿主未在 `EXTERNAL_PROVIDERS` 登记时不会调用。
 
-README 新增「三种模式该勾哪些模态」对照表：核心原生 / gemini_native /
-openai_compat 各自需要勾选与不要勾选的模态，以及一句话原因。
+README 新增「三种模式该勾哪些模态」对照表：核心原生 / `gemini_native` /
+`openai_compat` 各自需要勾选与不要勾选的模态，以及一句话原因。
 
-> 升级提示：合并了核心原生视频 PR 之后，请**只勾选 ideo、取消 udio**，
+> 升级提示：合并了核心原生视频 PR 之后，请**只勾选 `video`、取消 `audio`**，
 > 否则同一段视频会被核心与本插件各送一次。
 
-测试：pytest tests 717 passed / 1 skipped（设计内跳过）；
-uff 0.15.22 全绿。
+测试：`pytest tests` 717 passed / 1 skipped（设计内跳过）；`ruff` 0.15.22 全绿。
 
 ## 0.3.2
 

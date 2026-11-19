@@ -1,6 +1,6 @@
 # 基米看得见视频 · astrbot_plugin_video_vision
 
-> 当前版本 **0.4.0**（版本号的唯一来源是 `metadata.yaml`；`main.py` 不再持有副本）。
+> 当前版本 **0.4.1**（版本号的唯一来源是 `metadata.yaml`；`main.py` 不再持有副本）。
 
 让模型真正**看见视频**，而不是抽取关键帧。支持两种模式：
 
@@ -89,8 +89,8 @@ Responses API（`/responses`）同样实测支持：视频用 `input_image` + da
 |---|---|---|
 | `enable` | `true` | 总开关 |
 | `provider_mode` | `openai_compat` | `openai_compat`（默认）/ `gemini_native`。视觉服务三项没配齐时**自动降级为 `gemini_native`**，因此老配置直接升级不会失效 |
-| `openai_base_url` | `""` | 视觉服务**完整接口地址**，写全到 `/chat/completions` 或 `/responses`（按结尾自动选协议）；只填到 `/v1` 兜底前者 |
-| `openai_api_key` | `""` | 视觉服务密钥。面板里是**密码框**（schema `secret: true`），日志只打后 4 位 |
+| `openai_base_url` | `""` | 视觉服务**完整接口地址**，写全到 `/chat/completions` 或 `/responses`（按结尾自动选协议）；保留已有查询参数，只填域名或 `/v1` 自动补全 `/v1/chat/completions` |
+| `openai_api_key` | `""` | 视觉服务密钥（校验非 URL 格式）。面板里是**密码框**（schema `secret: true`），日志与异常摘要自动脱敏 |
 | `openai_model` | `gemini-3.8-flash-high` | 视觉模型，须支持视频 |
 | `openai_timeout_sec` | `180` | 视觉服务超时（上传约 7-9s/MB）。既是单阶段超时，也是单个视频的整体硬上限 |
 | `openai_max_tokens` | `2048` | 视觉回答 token 上限 |
@@ -467,15 +467,11 @@ ffmpeg_queue_timeout_sec(30s)+max_compress_seconds(60s) 已吃掉视觉服务超
 0.3.1 的解析器硬性要求 `, path `，所以这种行**永远不会被处理**，视频静默不注入。
 0.3.2 在注入之前把它"物化"成本地文件，再交给同一条探测 / 压缩 / 编码管线：
 
-- **只认 `http(s)://`**，用标准库 `urllib`（不引入新运行时依赖）。最多 **5 跳**
-  重定向，单次 socket **30 秒**超时，边下边计字节：超过 **13.5MB**（18MB data URI
-  上限换算回原始体积，与 `max_size_mb` 不是同一个量纲）立刻中断，**不留半成品**。
-- **本机路径**（核心的 `video.path or video.file` 可能仍是裸路径）存在就直接用，
-  **零网络 I/O**；不存在则明确失败，不会把它当 URL 去试。
+- **仅限公网 `http(s)://`（防 SSRF）**，用标准库 `urllib`（不引入新运行时依赖），拦截 `file://`、`localhost`、私网 / 回环 / 云元数据 IP 及混淆 IPv4 字面量，并对直连域名与重定向目标校验 DNS 解析（兼容代理 `198.18.0.0/15` 网段）。最多 **5 跳**重定向，单次 socket **30 秒**超时，边下边计字节：默认超过 **13.5MB**（18MB data URI 上限换算回原始体积，与 `max_size_mb` 不是同一个量纲）立刻中断，**不留半成品**；当 `oversize_action` 为 `compress`/`truncate` 且 `ffmpeg`/`ffprobe` 均可用时，下载上限放宽到 **100MB** 以便下载后再压缩/截断。
+- **本机路径**（核心的 `video.path or video.file` 可能仍是裸路径）仅放行**已存在的授权视频格式文件或临时目录无后缀媒体**，**零网络 I/O**；不存在或非媒体路径直接失败，不会当作 URL 试探。
+- **配额前置与去重脱敏**：`build_video_blocks` 前已按 `max_video_count` / `handle_quoted_video` / 视频候选规则筛选 `ref`，超配额的引用视频根本不会联网下载；同一条消息里**同一个 URL 只下载一次**，且同 URL 重复出现的 `ref` 占位符在 `hide_local_path` 生效或请求结束时一并剥除原始 URL 签名参数。
 - 下载到**本次请求独占**的临时目录；`build_video_blocks` 返回后立刻删除
   ——那一刻所有视频都已编码进内存里的 data URI，临时文件不再需要。
-- 同一条消息里**同一个 URL 只下载一次**（重复引用不再下载，重复的占位符保持
-  原样 —— 它本来就会被注入侧当作重复视频跳过）。
 - 物化成功后，占位文本照常被改写成"已提供"的说明（`hide_local_path` 生效时
   连 URL 与本机临时路径一起抹掉）。
 
@@ -889,10 +885,8 @@ checks = {'title': True, 'verdict_line': True, 'prepare_ok': True, 'mime_line': 
   中转站若提供 File API 可显著放宽（当前实测的中转站没有）。
 - 编码后的 data URI 有 **18MB 硬上限**（对应约 13.5MB 原始体积），超过会直接
   拒绝并给出原因，不会静默截断，也不会把上百 MB 的 base64 塞进请求。
-- **引用视频（ref 形态）的下载同样有上限**：只支持 `http(s)`、最多 5 跳、单次
-  30 秒、原始体积超过 13.5MB 立即中断（半成品会删掉）；平台要求 Cookie / Referer
-  的地址会失败并走降级说明。下载目录是本次请求独占的，`build_video_blocks`
-  返回后即删除。
+- **引用视频（ref 形态）的下载同样有上限**：仅放行公网 `http(s)`（拦截 `file://` 与内网/回环 IP）或授权本地视频文件、最多 5 跳、单次 30 秒、默认原始体积超过 13.5MB 立即中断（开启 `compress`/`truncate` 且 ffmpeg 可用时放宽至 100MB，半成品会删掉）；平台要求 Cookie / Referer 的地址会失败并走降级说明。下载目录是本次请求独占的，`build_video_blocks` 返回后即删除。
+- `File Attachment` 视频兼容**不包含 `.ts`**，避免把 TypeScript 源码附件误判为 MPEG-TS 视频。
 - openai_compat 模式：视觉模型必须是**真能看视频**的模型（如 gemini-3.x-flash 系）；
   主模型拿到的是视觉模型的文字理解而非原片。
 - gemini_native 模式：仅支持 **Gemini 系** provider（依赖其按 MIME 构造媒体 Part 的行为），
