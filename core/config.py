@@ -7,9 +7,38 @@ from __future__ import annotations
 
 import json
 import math
+import urllib.parse
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields, replace
 from typing import Any
+
+#: ``openai_model`` 的默认值（空字符串与纯空白输入统一回落到这里）
+DEFAULT_OPENAI_MODEL = "gemini-3.8-flash-high"
+
+
+def is_valid_openai_base_url(value: Any) -> bool:
+    """校验 OpenAI 兼容视觉服务地址是否为合法的 ``http(s)://`` URL。"""
+    text = str(value or "").strip()
+    if not text or any(ch.isspace() or ord(ch) < 32 for ch in text):
+        return False
+    try:
+        parsed = urllib.parse.urlsplit(text)
+        _ = parsed.port
+    except ValueError:
+        return False
+    return (
+        (parsed.scheme or "").lower() in {"http", "https"}
+        and bool(parsed.netloc)
+        and bool(parsed.hostname)
+    )
+
+
+def is_valid_openai_api_key(value: Any) -> bool:
+    """校验 OpenAI 兼容视觉服务密钥：非空、不含空白/控制字符且不是 URL 错填。"""
+    text = str(value or "").strip()
+    if not text or any(ch.isspace() or ord(ch) < 32 for ch in text):
+        return False
+    return not text.lower().startswith(("http://", "https://"))
 
 #: 实测经中转站上传约 7-9 秒/MB（原始体积）。13MB 对应约 60-90 秒，
 #: 需留在 provider timeout（默认 120s，本机已调至 180s）之内。
@@ -528,7 +557,7 @@ class VideoConfig:
     provider_mode: str = "openai_compat"
     openai_base_url: str = ""
     openai_api_key: str = ""
-    openai_model: str = "gemini-3.8-flash-high"
+    openai_model: str = DEFAULT_OPENAI_MODEL
     openai_timeout_sec: float = 180.0
     openai_max_tokens: int = 2048
     vision_with_question: bool = True
@@ -538,9 +567,11 @@ class VideoConfig:
 
     @property
     def openai_service_ready(self) -> bool:
-        """OpenAI 兼容视觉服务三要素是否齐全。"""
+        """OpenAI 兼容视觉服务三要素是否齐全且格式合法。"""
         return bool(
-            self.openai_base_url and self.openai_api_key and self.openai_model
+            is_valid_openai_base_url(self.openai_base_url)
+            and is_valid_openai_api_key(self.openai_api_key)
+            and str(self.openai_model or "").strip()
         )
 
     @property
@@ -684,9 +715,9 @@ class VideoConfig:
             .strip()
             .rstrip("/"),
             openai_api_key=str(data.get("openai_api_key") or "").strip(),
-            openai_model=str(
-                data.get("openai_model") or "gemini-3.8-flash-high"
-            ).strip(),
+            openai_model=(
+                str(data.get("openai_model") or "").strip() or DEFAULT_OPENAI_MODEL
+            ),
             openai_timeout_sec=_as_float(
                 data.get("openai_timeout_sec"),
                 180.0,

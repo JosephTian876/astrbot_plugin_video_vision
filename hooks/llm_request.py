@@ -41,6 +41,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import shutil
 import tempfile
@@ -52,9 +53,29 @@ from astrbot.api import logger
 
 from ..core import decide, openai_vision, vision_cache
 from ..core.config import VideoConfig
-from ..core.injector import PrepareOutcome, VideoInjection, prepare_video
-from ..core.limits import NULL_LIMITER, QueueTimeout, format_seconds
-from ..core.media import MediaToolError, download_ref_to, guess_video_mime
+from ..core.injector import (
+    PrepareOutcome,
+    VideoInjection,
+    content_hash_from_text,
+    prepare_video,
+)
+from ..core.limits import (
+    DETERMINISTIC_FAILURE_KINDS,
+    NULL_LIMITER,
+    AsyncSingleFlight,
+    QueueTimeout,
+    format_seconds,
+)
+from ..core.media import (
+    MAX_REF_COMPRESS_DOWNLOAD_BYTES,
+    MAX_REF_DOWNLOAD_BYTES,
+    MediaToolError,
+    content_hash,
+    download_ref_to,
+    guess_video_mime,
+    resolve_ffmpeg_tools,
+    suffix_of,
+)
 from ..core.openai_vision import VisionResult, analyze_videos, build_vision_prompt
 from ..core.placeholder import (
     VideoPlaceholder,
@@ -198,7 +219,13 @@ def _short_reason(reason: str, kind: str = "") -> str:
     if "视觉服务" in reason:
         if "ssl" in low or "证书" in reason:
             return "vision service SSL certificate check failed"
-        if "超时" in reason or "timeout" in low or "timed out" in low:
+        if (
+            "超时" in reason
+            or "timeout" in low
+            or "timed out" in low
+            or "time-out" in low
+            or "http 504" in low
+        ):
             return "the vision service timed out"
         if "连接" in reason or "connect" in low:
             return "the vision service is unreachable"
@@ -352,10 +379,91 @@ def _ref_materialization_enabled(config: VideoConfig) -> bool:
     return bool(config.handle_quoted_video) and config.max_video_count > 0
 
 
+def _is_video_candidate(placeholder: VideoPlaceholder, config: VideoConfig) -> bool:
+    """闸门 0：``File`` 类型附件按 ``treat_file_as_video`` 与扩展名筛选。"""
+    if not placeholder.is_file_kind:
+        return True
+    return bool(config.treat_file_as_video) and placeholder.looks_like_video()
+
+
+def _select_ref_candidates(
+    parts: list[Any], config: VideoConfig
+) -> list[tuple[int, VideoPlaceholder]]:
+    """按配额与策略（Gate 0 / Gate 1 / ``max_video_count``）筛选待物化的 ref。
+
+    非 ref 的合格候选（``Video`` / 合格 ``File``）同样计入配额；已被同轮
+    前面见过的重复 ``ref`` 不重复占位也不重复下载，确保配额外的引用视频既不
+    发起网络请求、也不会把错误注入给模型。
+    """
+    if not _ref_materialization_enabled(config):
+        return []
+    limit = config.max_video_count
+    if limit <= 0:
+        return []
+
+    used_slots = 0
+    seen_refs: set[str] = set()
+    selected: list[tuple[int, VideoPlaceholder]] = []
+    for index, part in enumerate(parts):
+        placeholder = parse_placeholder_text(_text_of(part))
+        if placeholder is None:
+            continue
+        if not _is_video_candidate(placeholder, config):
+            continue
+        if placeholder.quoted and not config.handle_quoted_video:
+            continue
+        if placeholder.is_ref_kind:
+            if placeholder.path in seen_refs:
+                continue
+            if used_slots >= limit:
+                continue
+            seen_refs.add(placeholder.path)
+            used_slots += 1
+            selected.append((index, placeholder))
+        else:
+            used_slots += 1
+    return selected
+
+
+def _ref_download_limit(config: VideoConfig) -> int:
+    """决定引用视频远端下载字节上限。
+
+    直通 / ``reject`` / 无 ffmpeg 时沿用 13.5MB 硬上限；开启压缩或截断且
+    ``ffmpeg`` / ``ffprobe`` 均可用时，放宽到 100MB 安全帽，再交由 ``ffmpeg``
+    压进 18MB data URI 上限以内。
+    """
+    if config.oversize_action in {"compress", "truncate"}:
+        ffmpeg, ffprobe = resolve_ffmpeg_tools(config.ffmpeg_path)
+        if ffmpeg and ffprobe:
+            return MAX_REF_COMPRESS_DOWNLOAD_BYTES
+    return MAX_REF_DOWNLOAD_BYTES
+
+
+def _call_download_ref(ref: str, directory: str, max_bytes: int) -> str:
+    """兼容测试里只收三参的 ``download_ref_to`` 替身。"""
+    if max_bytes != MAX_REF_DOWNLOAD_BYTES:
+        try:
+            sig = inspect.signature(download_ref_to)
+            accepts_max_bytes = "max_bytes" in sig.parameters or any(
+                param.kind == inspect.Parameter.VAR_KEYWORD
+                for param in sig.parameters.values()
+            )
+        except (TypeError, ValueError):
+            accepts_max_bytes = False
+        if accepts_max_bytes:
+            return download_ref_to(
+                ref,
+                directory,
+                timeout=REF_DOWNLOAD_TIMEOUT_SEC,
+                max_bytes=max_bytes,
+            )
+    return download_ref_to(ref, directory, timeout=REF_DOWNLOAD_TIMEOUT_SEC)
+
+
 def _materialize_refs(
     parts: list[Any], *, config: VideoConfig
 ) -> tuple[str, list[str]]:
-    """把 ref 形态占位符物化成本地文件，并就地改写成 path 形态。
+    """把配额内的 ref 形态占位符物化成本地文件，并就地改写成 path 形态。
 
     必须在 ``build_video_blocks`` **之前**跑：ref 的 ``path`` 字段里是引用值
     （URL / 非本地路径），不是可读文件；改写之后既有管线才知道该怎么处理它。
@@ -366,26 +474,8 @@ def _materialize_refs(
         仍要读这些文件，产物要到那时才编码进内存），所以删除点只能是
         ``_handle`` 的 ``finally``。失败原因已经是 ``_short_reason`` 的短语
         （与 ``build_video_blocks`` 的 ``failures`` 同口径），可直接并入。
-
-    本函数是**同步阻塞**的（``urllib`` + 磁盘 I/O），调用方负责丢进线程。
-    它**绝不抛异常**（与 ``prepare_video`` 同一契约）：建目录失败 / 下载失败 /
-    本机文件不存在都记成失败短语 —— 否则一次下载故障会让本条消息里**普通**
-    视频也一起不注入。
-
-    两个纯优化（不改变任何可见结果，判定在 ``_ref_materialization_enabled``）：
-    * ``handle_quoted_video=false``：ref 只出现在引用形态，``build_video_blocks``
-      的闸门 1' 会丢掉全部引用视频 —— 直接不下载；
-    * ``max_video_count=0``：``build_video_blocks`` 在该值下不处理任何视频。
-
-    去重：同一条消息里同一个引用**只下载一次**（``resolved`` / ``failed``
-    两个映射）。重复出现的占位符**保持原样不改写**：它会被 ``build_video_blocks``
-    当作重复视频跳过，改写了反而会把一个"请求结束后即被删除的临时路径"留在
-    请求里。刻意**不**用 ``injector.SINGLEFLIGHT``：那个是进程级、为"同一份
-    内容只转码一次"设计的；跨请求共享临时目录里的文件会让第一个请求的
-    ``finally`` 删掉别人还在读的文件。
     """
-    refs = iter_ref_placeholders(parts)
-    if not refs:
+    if not iter_ref_placeholders(parts):
         return "", []
     if not _ref_materialization_enabled(config):
         logger.debug(
@@ -396,6 +486,13 @@ def _materialize_refs(
         )
         return "", []
 
+    selected_refs = _select_ref_candidates(parts, config)
+    if not selected_refs:
+        logger.debug(
+            "[VideoVision] 全部引用视频均超出配额或已在前序占位符去重，跳过下载"
+        )
+        return "", []
+
     try:
         directory = tempfile.mkdtemp(prefix="vv_ref_")
     except OSError as exc:
@@ -403,6 +500,7 @@ def _materialize_refs(
         logger.warning("[VideoVision] 引用视频临时目录创建失败: %s", exc)
         return "", [f"{REF_MATERIALIZE_PREFIX}: 临时目录创建失败"]
 
+    max_bytes = _ref_download_limit(config)
     reasons: list[str] = []
     resolved: dict[str, str] = {}
     failed: dict[str, str] = {}
@@ -416,12 +514,8 @@ def _materialize_refs(
             "[VideoVision] 引用视频未注入: %s | %s", placeholder.name, message
         )
 
-    for index, placeholder in refs:
+    for index, placeholder in selected_refs:
         ref = placeholder.path
-        # 同一轮里重复出现的同一引用：只下一次，且**不改写**重复的那个占位符。
-        # 它会被 ``build_video_blocks`` 的 ``seen_paths`` 当作重复视频跳过；
-        # 若也改写成 path 形态，它会带着一个"请求结束后就被删掉的临时路径"
-        # 留在请求里（既没被 neutralize，也会诱导模型去读一个不存在的文件）。
         if ref in failed:
             reasons.append(failed[ref])
             continue
@@ -431,7 +525,7 @@ def _materialize_refs(
             )
             continue
         try:
-            local = download_ref_to(ref, directory, timeout=REF_DOWNLOAD_TIMEOUT_SEC)
+            local = _call_download_ref(ref, directory, max_bytes)
         except MediaToolError as exc:
             fail(placeholder, str(exc), exc.kind)
             continue
@@ -453,6 +547,72 @@ def _materialize_refs(
     return directory, reasons
 
 
+#: 事件循环侧的同视频准备去重器（在 SlotLimiter 取槽之前拦截重复并发）
+PREPARE_FLIGHTS = AsyncSingleFlight()
+
+
+def _can_share_prepare_outcome(outcome: PrepareOutcome) -> bool:
+    """成功结果或确定性失败可跨并发复用；瞬时失败让等待者自行接管一次。"""
+    if outcome.ok and outcome.injection is not None:
+        return True
+    kind = str(getattr(outcome, "kind", "") or "")
+    return kind in DETERMINISTIC_FAILURE_KINDS or kind.startswith("rejected")
+
+
+def _build_prepare_flight_key(
+    source: str, config: VideoConfig, cache_root: str
+) -> str:
+    """为同一视频 + 同组处理参数生成稳定的异步 singleflight 去重键。"""
+    try:
+        source_hash = content_hash(source)
+    except Exception:  # noqa: BLE001 - 算不出来时 fail-open，退回直接进槽
+        return ""
+    if not source_hash:
+        return ""
+    return content_hash_from_text(
+        "|".join(
+            (
+                source_hash,
+                suffix_of(source),
+                str(config.max_size_mb),
+                str(config.compress_max_mb),
+                str(config.compress_crf),
+                str(config.compress_preset),
+                str(config.max_duration_sec),
+                str(config.oversize_action),
+                str(config.ffmpeg_path),
+                str(cache_root),
+                str(config.effective_provider_mode),
+                str(config.vision_cache_enabled),
+            )
+        )
+    )
+
+
+def _adapt_shared_outcome(
+    outcome: PrepareOutcome, source_path: str
+) -> PrepareOutcome:
+    """把 leader 的共享产物适配到 follower 自己的源路径（保留内存中的 data URI）。"""
+    if not outcome.ok or outcome.injection is None:
+        return outcome
+    inj = outcome.injection
+    if inj.source_path == source_path:
+        return outcome
+    if inj.used_path == inj.source_path:
+        return PrepareOutcome(
+            True,
+            replace(inj, source_path=source_path, used_path=source_path),
+            outcome.reason,
+            outcome.kind,
+        )
+    return PrepareOutcome(
+        True,
+        replace(inj, source_path=source_path),
+        outcome.reason,
+        outcome.kind,
+    )
+
+
 async def build_video_blocks(
     parts: list[Any],
     *,
@@ -467,14 +627,9 @@ async def build_video_blocks(
     ``max_compress_seconds``（默认 45 秒）的压缩会把整个 AstrBot 卡住 ——
     期间所有会话的消息都不被处理。
 
-    ``limiter``（``core.limits.SlotLimiter``）的排队发生在**事件循环侧**，
-    阻塞工作体由 ``limiter.submit`` 交给 ffmpeg 的**专属**执行器
-    （``max_workers == limit``，``main.terminate`` 里收掉）。**不要**再写
-    ``asyncio.to_thread(prepare_video, ...)``：那排的是**全进程共享**的默认
-    执行器（2 核只有 ``min(32, cpu+4) = 6`` 个线程，核心的 media / TTS / ASR
-    都在里面），池满时任务会在池队列里无限期排队，而槽位已经被取走
-    （VERIFY-VV-R9 P1-1：20 线程池占满时视频请求 >=6.0s 未完成）。
-    传 ``None`` 等价于不限流（用 ``NULL_LIMITER``，不建队列、不等待，仍用默认池）。
+    ``ffmpeg_singleflight`` + ``cache_enabled`` 就绪时，同内容视频在事件循环侧
+    （``PREPARE_FLIGHTS``）**先于** ``SlotLimiter`` 取槽合并，避免多个相同请求的
+    followers 占满并发槽位与 ``vv-ffmpeg`` 线程。
 
     返回形状固定为 **3 元组**，所有提前返回分支也必须凑满三个元素
     （0.1.3 修过一次漏了第三项的 bug：调用方解包会抛
@@ -493,19 +648,14 @@ async def build_video_blocks(
     # 实测：QQ/NapCat 把用户发的视频当作 File 组件投递，核心于是产出
     # [File Attachment: ...] 而非 [Video Attachment: ...]。必须兼容，
     # 否则插件在真实 QQ 环境下永不触发。
-    def _is_video_candidate(ph: Any) -> bool:
-        if not ph.is_file_kind:
-            return True  # Video 组件来的，无条件处理
-        return bool(config.treat_file_as_video) and ph.looks_like_video()
-
-    rejected = [(i, p) for i, p in found if not _is_video_candidate(p)]
+    rejected = [(i, p) for i, p in found if not _is_video_candidate(p, config)]
     if rejected:
         logger.debug(
             "[VideoVision] 跳过 %d 个非视频附件: %s",
             len(rejected),
             [p.name for _, p in rejected][:5],
         )
-    found = [(i, p) for i, p in found if _is_video_candidate(p)]
+    found = [(i, p) for i, p in found if _is_video_candidate(p, config)]
     if not found:
         return [], set(), []
 
@@ -544,6 +694,16 @@ async def build_video_blocks(
     seen_paths: set[str] = set()
     #: 限流关掉时用空实现：``async with`` 立即返回，不建队列、不打日志
     slots = limiter if limiter is not None else NULL_LIMITER
+    can_preflight = bool(
+        config.ffmpeg_singleflight and config.cache_enabled and cache_root
+    )
+    limiter_enabled = bool(getattr(slots, "enabled", False))
+    queue_budget = (
+        float(getattr(slots, "queue_timeout", 30.0) or 30.0)
+        if limiter_enabled
+        else 0.0
+    )
+    flight_wait_timeout = max(10.0, queue_budget + config.max_compress_seconds + 35.0)
 
     for index, placeholder in selected:
         # 同一文件出现多次（例如既引用又重发）时只送一次，省带宽与 token
@@ -553,49 +713,69 @@ async def build_video_blocks(
             continue
         seen_paths.add(key)
 
-        #: 本地处理耗时（取到槽之后才算；排队超时时保持 0，且那条走 WARNING 分支）
-        prepare_elapsed = 0.0
-        try:
-            # 槽位只包住**这一次** prepare（不许嵌套取槽）；等待全部在事件
-            # 循环侧，worker 线程里没有任何 Semaphore。
-            # 还槽绑定到 worker **真正**结束：外层被取消时 ffmpeg 线程还在跑，
-            # 当场还槽会让真实并发 > limit（VERIFY-A P2-1）。
-            # 提交用 ``slots.submit``（专属执行器），不是 ``asyncio.to_thread``
-            # —— 后者的池被核心占满时本请求会无限挂起（VERIFY-VV-R9 P1-1）。
-            async with slots.slot(name=placeholder.name) as slot:
-                # 只计**取到槽之后**的本地处理：排队等待有自己的日志（>=1s 一条），
-                # 两个数字混在一起会让"为什么慢"反而查不清（ARCH-VV-C2 P2-4）。
-                prepare_started = time.monotonic()
-                outcome = await slot.wait_for_worker(
-                    slots.submit(
-                        prepare_video,
-                        placeholder,
-                        config=config,
-                        cache_root=cache_root,
-                        logger=logger,
-                        debug=config.debug_log,
+        async def _run_in_slot(
+            target_placeholder: VideoPlaceholder = placeholder,
+        ) -> tuple[PrepareOutcome, float]:
+            try:
+                async with slots.slot(name=target_placeholder.name) as slot:
+                    prepare_started = time.monotonic()
+                    res = await slot.wait_for_worker(
+                        slots.submit(
+                            prepare_video,
+                            target_placeholder,
+                            config=config,
+                            cache_root=cache_root,
+                            logger=logger,
+                            debug=config.debug_log,
+                        )
                     )
+                    return res, time.monotonic() - prepare_started
+            except QueueTimeout as exc:
+                return (
+                    PrepareOutcome(
+                        False,
+                        reason=exc.short_reason(),
+                        kind="busy",
+                    ),
+                    0.0,
                 )
-                prepare_elapsed = time.monotonic() - prepare_started
-        except QueueTimeout as exc:
-            # 排队超时是**独立的失败分类**：不复用 timeout（那句会把用户引向
-            # max_compress_seconds，归因错误）。
-            outcome = PrepareOutcome(
-                False,
-                # 文案只有一份真相（``QueueTimeout.short_reason``）：
-                # ``queue_timeout<0.5s`` 时不能渲染成"超过 0s"（VERIFY-A P3-2）。
-                reason=exc.short_reason(),
-                kind="busy",
+
+        #: 本地处理耗时（取到槽之后才算；排队超时或复用共享结果时为 0）
+        prepare_elapsed = 0.0
+        shared_outcome = False
+        flight_key = ""
+        if can_preflight and placeholder.path and os.path.isfile(placeholder.path):
+            flight_key = await asyncio.to_thread(
+                _build_prepare_flight_key, placeholder.path, config, cache_root
             )
+
+        if flight_key:
+            try:
+                (outcome, prepare_elapsed), shared_outcome = await PREPARE_FLIGHTS.run(
+                    flight_key,
+                    _run_in_slot,
+                    wait_timeout=flight_wait_timeout,
+                    can_share=lambda pair: _can_share_prepare_outcome(pair[0]),
+                )
+            except (asyncio.TimeoutError, TimeoutError):
+                outcome = PrepareOutcome(
+                    False,
+                    reason=f"等待同一视频转码超时（>{format_seconds(flight_wait_timeout)}）",
+                    kind="timeout",
+                )
+                prepare_elapsed = 0.0
+            else:
+                if shared_outcome:
+                    outcome = _adapt_shared_outcome(outcome, placeholder.path)
+                    prepare_elapsed = 0.0
+        else:
+            outcome, prepare_elapsed = await _run_in_slot()
+
         if outcome.ok and outcome.injection is not None:
             inj = outcome.injection
             prepared.append(PreparedVideo(index, placeholder.name, inj))
             consumed.add(index)
             logger.info(
-                # 两个数字必须各自标清含义：``时长`` 是**视频本身**多长，
-                # ``本地处理`` 是这条消息为了它花的本地时间（压缩/编码，不含排队）。
-                # 0.3.0 之前只有一个 ``%.1fs`` —— 那是视频时长，于是"为什么慢"在
-                # 没有排队时完全查不到（ARCH-VV-C2 P2-4）。
                 "[VideoVision] 视频已备好: %s | %s | %.2fMB -> %.2fMB"
                 " | 时长 %.1fs | 本地处理 %s | %s%s",
                 placeholder.name,
@@ -681,6 +861,48 @@ def _neutralize_placeholders(
     return changed
 
 
+def _dedup_ref_placeholders(
+    parts: list[Any],
+    ref_groups: dict[str, list[int]],
+    done: set[int],
+    *,
+    mode: str = "gemini_native",
+    hide_path: bool = True,
+) -> int:
+    """清理同一批消息里重复出现的 ``ref`` 占位符，避免原始带签名 URL 继续泄漏。
+
+    ``_materialize_refs`` 对同一 URL 只下载并改写首个 ``ref``，其余同 URL 占位符
+    仍保留着原始 ``ref https://...?sig=...``；在 ``_handle`` 末尾一并剥除 URL。
+    """
+    if not ref_groups:
+        return 0
+    template = _NEUTRALIZE_TEXT.get(mode, _NEUTRALIZE_TEXT["gemini_native"])
+    changed = 0
+    for indices in ref_groups.values():
+        if len(indices) <= 1:
+            continue
+        primary = indices[0]
+        primary_delivered = primary in done
+        for dup_idx in indices[1:]:
+            if not (0 <= dup_idx < len(parts)):
+                continue
+            part = parts[dup_idx]
+            text = _text_of(part)
+            if text is None:
+                continue
+            placeholder = parse_placeholder_text(text)
+            if placeholder is None or not placeholder.is_ref_kind:
+                continue
+            name = placeholder.name or "attachment"
+            if primary_delivered and hide_path:
+                replacement = template.replace("{name}", name)
+            else:
+                replacement = f"[视频 {name}（重复引用已省略）]"
+            if _set_text_of(part, replacement):
+                changed += 1
+    return changed
+
+
 def _safe_size(path: str) -> float:
     try:
         return os.path.getsize(path) / 1024 / 1024
@@ -688,21 +910,57 @@ def _safe_size(path: str) -> float:
         return 0.0
 
 
+def _selected_provider_id(event: Any) -> str:
+    """从事件中读取单轮临时切换的 provider ID（与核心 ``selected_provider`` 契约一致）。"""
+    get_extra = getattr(event, "get_extra", None)
+    if not callable(get_extra):
+        return ""
+    try:
+        selected = get_extra("selected_provider")
+    except Exception:  # noqa: BLE001
+        return ""
+    return selected.strip() if isinstance(selected, str) else ""
+
+
 async def resolve_provider(plugin: Any, event: Any) -> tuple[Any, str]:
     """取当前 provider，并把**失败原因**一起返回。
 
-    框架的 ``Context.get_using_provider_async`` 签名是 ``-> Provider | None``
-    （``astrbot/core/star/context.py``），返回 None 是**正常返回值**，不是异常
-    边角。0.2.0 只兜异常，然后把「provider 类型 '(未知)' 不是 Gemini 系」打进
-    用户可见的 WARNING —— 取不到 provider、返回 None、真的用了非 Gemini
-    provider 这三种互不相干的原因产出**字面完全相同**的告警，且都建议用户
-    "去 additional_provider_types 里放行 ''"，这条建议永远不可能生效。
+    优先检查单轮临时切模 ``event.get_extra("selected_provider")`` 并从
+    ``context.get_provider_by_id(...)`` 解析，未命中时再回退到
+    ``context.get_using_provider_async(umo=...)``（与 AstrBot 核心
+    ``astr_main_agent.py:283-304`` 对齐）。
 
     Returns:
         (provider 或 None, 失败原因)。成功时原因为空串；失败时为
         ``no-context`` / ``none`` / ``exception:<类型>: <详情>``。
     """
     context = getattr(plugin, "context", None)
+    if context is None:
+        return None, PROVIDER_ERROR_NO_CONTEXT
+
+    selected_id = _selected_provider_id(event)
+    if selected_id:
+        by_id = getattr(context, "get_provider_by_id", None)
+        if callable(by_id):
+            try:
+                provider = by_id(selected_id)
+                if inspect.isawaitable(provider):
+                    provider = await provider
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "[VideoVision] 按 selected_provider=%s 获取 provider 失败: %s",
+                    selected_id,
+                    exc,
+                )
+                provider = None
+            if provider is not None:
+                return provider, ""
+            logger.debug(
+                "[VideoVision] selected_provider=%s 未找到对应 provider，"
+                "回退到 get_using_provider_async",
+                selected_id,
+            )
+
     getter = getattr(context, "get_using_provider_async", None)
     if not callable(getter):
         return None, PROVIDER_ERROR_NO_CONTEXT
@@ -736,10 +994,19 @@ def mark_degradation_warned() -> None:
 #: 0.2.0 的 ``req.contexts`` 回退会把它整段拼进"用户问题"发给第三方端点。
 _LOCAL_PATH_MARKERS = ("original path",)
 
+#: AstrBot 核心在纯附件无文字时写入的占位 prompt（``astr_main_agent.py:1840``），
+#: 并非用户提问，必须视为无提问以便回落通用描述提示词。
+_PLACEHOLDER_PROMPTS = frozenset({"<attachment>"})
+
 
 def _has_local_path(text: str) -> bool:
     low = text.lower()
     return any(marker in low for marker in _LOCAL_PATH_MARKERS)
+
+
+def _is_blank_or_placeholder_prompt(text: str) -> bool:
+    stripped = text.strip()
+    return not stripped or stripped in _PLACEHOLDER_PROMPTS
 
 
 def _extract_question(event: Any, req: Any) -> str:
@@ -747,18 +1014,16 @@ def _extract_question(event: Any, req: Any) -> str:
 
     依次尝试：``event.get_message_str()`` -> ``event.message_str`` -> ``req.prompt``。
 
-    0.2.0 还会回落到 ``req.contexts`` 的最后一条 user 消息 —— 那是**历史轮次**
-    的上下文：上一轮的 ``[Image 1: original path C:\\Users\\me\\secret.png]``
-    会被当作用户问题发给外部视觉服务（实测返回
-    ``'[Image 1: original path C:\\Users\\me\\secret.png] 这图好看吗'``）。
-    现在只认当前轮文本，并且**任何含 ``original path`` 的段落一律剔除**。
+    纯发附件无文字时 AstrBot 会在 ``req.prompt`` 写入 ``"<attachment>"``
+    （``astr_main_agent.py:1840``），这里会剔除该占位词，避免误触发
+    ``vision_qa_prompt``；任何含 ``original path`` 与附件占位符的段落也一并剔除。
 
     Args:
         event: 消息事件（鸭子类型，不 import AstrBot 具体类）。
-        req: LLM 请求对象，仅在没有任何事件文本时用 ``prompt`` 兜底。
+        req: LLM 请求对象，仅在没有任何有效事件文本时用 ``prompt`` 兜底。
 
     Returns:
-        去掉附件占位符与本机路径段落后的用户问题（最多 600 字符）。
+        去掉附件占位符、``<attachment>`` 与本机路径段落后的用户问题（最多 600 字符）。
     """
     text = ""
     getter = getattr(event, "get_message_str", None)
@@ -767,9 +1032,9 @@ def _extract_question(event: Any, req: Any) -> str:
             text = str(getter() or "")
         except Exception:  # noqa: BLE001
             text = ""
-    if not text:
+    if _is_blank_or_placeholder_prompt(text):
         text = str(getattr(event, "message_str", "") or "")
-    if not text:
+    if _is_blank_or_placeholder_prompt(text):
         prompt = getattr(req, "prompt", None)
         if isinstance(prompt, str):
             text = prompt
@@ -778,7 +1043,9 @@ def _extract_question(event: Any, req: Any) -> str:
         for line in text.splitlines()
         # 占位符前缀只有一份定义：core.placeholder._PREFIXES
         # （唯一出口 is_attachment_line）。
-        if not is_attachment_line(line) and not _has_local_path(line)
+        if not is_attachment_line(line)
+        and not _has_local_path(line)
+        and line.strip() not in _PLACEHOLDER_PROMPTS
     ]
     return "\n".join(lines).strip()[:600]
 
@@ -1039,8 +1306,8 @@ def _effective_mode(config: VideoConfig) -> str:
         _warned_config.add(_OPENAI_NOT_READY)
         logger.warning(
             "[VideoVision] provider_mode=openai_compat，但 openai_base_url / "
-            "openai_api_key / openai_model 未配齐，本次降级为 gemini_native。"
-            "要使用 OpenAI 兼容视觉服务，请把这三项补齐。"
+            "openai_api_key / openai_model 未配齐或格式无效，本次降级为 gemini_native。"
+            "要使用 OpenAI 兼容视觉服务，请检查并补齐这三项。"
         )
     return mode
 
@@ -1226,27 +1493,19 @@ async def _handle(plugin: Any, event: Any, req: Any) -> None:
         # 保留判断是为了防御后续改动让它变成静默发错内容。
         return
 
-    setattr(req, _DONE_ATTR, True)
-
     # ---- 准备（探测/压缩在线程池，无独立 await）----
     cache_root = str(getattr(plugin, "cache_root", "") or "")
+    # 在物化前记录全部 ref 的出现下标（同一 URL 出现多次时，物化只改写首个，
+    # 其余重复 ref 必须在最终注入后一并剥除 URL / 去重，避免签名参数泄漏）。
+    ref_groups: dict[str, list[int]] = {}
+    for ref_idx, ref_ph in iter_ref_placeholders(_parts_of(req)):
+        ref_groups.setdefault(ref_ph.path, []).append(ref_idx)
+
     # ---- 物化引用视频（ref 形态）----
-    # 必须发生在 ``build_video_blocks`` **之前**：ref 的 ``path`` 字段是引用值而
-    # 不是可读文件；物化后占位文本被就地改写成 path 形态，既有管线才知道怎么
-    # 处理它（``iter_placeholders`` 刻意跳过 ref 形态）。
-    #
-    # 下载是**阻塞 I/O**，不能直接在事件循环里跑：一个 30 秒的坏链接会把整个
-    # AstrBot 卡住（与 ``prepare_video`` 必须进线程池同因）。这里用
-    # ``asyncio.to_thread`` 而不是 ``slots.submit``：``core.limits`` 的执行器是
-    # **ffmpeg 专属**、大小由 ``ffmpeg_max_concurrency`` 决定，拿它跑网络 I/O
-    # 会把"并发转码数"变成"并发下载数"；下载只占一个线程、单次上限 30 秒，
-    # 真正等待网络时还释放 GIL。
     ref_dir = ""
     ref_failures: list[str] = []
     try:
-        if _ref_materialization_enabled(config) and iter_ref_placeholders(
-            _parts_of(req)
-        ):
+        if _select_ref_candidates(_parts_of(req), config):
             ref_dir, ref_failures = await asyncio.to_thread(
                 _materialize_refs, _parts_of(req), config=config
             )
@@ -1324,19 +1583,32 @@ async def _handle(plugin: Any, event: Any, req: Any) -> None:
     # ---- 重新读取后再写入，避免期间列表被替换 ----
     target = _parts_of(req)
     if blocks:
-        # 处理成功后抹掉占位文本里的本机路径，避免诱导模型自己去跑 Python/cv2
+        # 处理成功后抹掉占位文本里的本机路径（含重复 path 占位符），避免诱导模型自己去跑 Python/cv2
         if config.hide_local_path:
-            changed = _neutralize_placeholders(target, done, mode=mode)
+            delivered_keys = {
+                _path_key(item.injection.source_path)
+                for item in prepared
+                if item.index in done
+            }
+            extra_dups = {
+                idx
+                for idx, ph in iter_placeholders(target)
+                if idx not in done and _path_key(ph.path) in delivered_keys
+            }
+            changed = _neutralize_placeholders(target, done | extra_dups, mode=mode)
             if changed and config.debug_log:
                 logger.info(
                     "[VideoVision][debug] 已抹除 %d 处占位文本中的本机路径", changed
                 )
         target.extend(blocks)
+    _dedup_ref_placeholders(target, ref_groups, done, mode=mode, hide_path=config.hide_local_path)
     if failures and config.notify_on_failure:
         for reason in dict.fromkeys(failures):
             target.append(
                 _temp_text_part(f"[Video attachment was skipped: {reason}]")
             )
+    # 确认注入/确定性流程完整结束后再置 _DONE_ATTR，避免异常/取消误标记
+    setattr(req, _DONE_ATTR, True)
     if config.debug_log:
         logger.info(
             "[VideoVision][debug] 注入完成 | 成功=%d 失败=%d 列表长度=%d",

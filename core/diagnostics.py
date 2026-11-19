@@ -24,7 +24,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from .config import VideoConfig
+from .config import VideoConfig, is_valid_openai_api_key, is_valid_openai_base_url
 from .decide import (
     ACTION_LABELS,
     URI_LIMIT_MB,
@@ -145,13 +145,17 @@ class VisionReport:
 
 
 def missing_credentials(cfg: VideoConfig) -> list[str]:
-    """视觉服务三要素里缺哪几项（凭据齐全性诊断用）。"""
+    """视觉服务三要素里缺失或格式无效的项（凭据齐全性诊断用）。"""
     missing: list[str] = []
     if not cfg.openai_base_url:
         missing.append("openai_base_url")
+    elif not is_valid_openai_base_url(cfg.openai_base_url):
+        missing.append("openai_base_url(格式无效，须为 http(s):// 地址)")
     if not cfg.openai_api_key:
         missing.append("openai_api_key")
-    if not cfg.openai_model:
+    elif not is_valid_openai_api_key(cfg.openai_api_key):
+        missing.append("openai_api_key(格式无效，不可为 URL)")
+    if not str(cfg.openai_model or "").strip():
         missing.append("openai_model")
     return missing
 
@@ -544,9 +548,9 @@ def startup_lines(
                 "warning",
                 (
                     "[VideoVision] provider_mode=openai_compat 但 openai_base_url / "
-                    "openai_api_key / openai_model 未配齐，已降级为 gemini_native "
+                    "openai_api_key / openai_model 未配齐或格式无效，已降级为 gemini_native "
                     "（老配置零改动仍可继续用）。要使用 OpenAI 兼容视觉服务，"
-                    "请把这三项补齐。"
+                    "请检查并补齐这三项。"
                 ),
             )
         )

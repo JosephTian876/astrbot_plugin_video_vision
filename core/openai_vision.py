@@ -32,11 +32,13 @@ Responses 协议，以 ``/chat/completions`` 结尾走 Chat Completions，
 from __future__ import annotations
 
 import asyncio
+import re
 import time
+import urllib.parse
 from dataclasses import dataclass
 from typing import Any
 
-from .config import VideoConfig
+from .config import DEFAULT_OPENAI_MODEL, VideoConfig
 
 
 @dataclass(frozen=True)
@@ -108,13 +110,35 @@ def build_vision_prompt(
 
 
 def _resolve_endpoint(base_url: str) -> tuple[str, str]:
-    """按用户填写的地址结尾决定协议与最终 URL。
+    """按用户填写的地址路径决定协议与最终 URL（保留 query 参数）。
 
-    - 以 ``/responses`` 结尾 -> Responses API
-    - 以 ``/chat/completions`` 结尾 -> Chat Completions
-    - 其他（如只填到 ``/v1``）-> 兜底补 ``/chat/completions``
+    - 路径以 ``/responses`` 结尾 -> Responses API
+    - 路径以 ``/chat/completions`` 结尾 -> Chat Completions
+    - 裸域（无路径或仅 ``/``）-> 补全 ``/v1/chat/completions``
+    - 其它已有路径（如 ``/v1`` / ``/custom/v2``）-> 补 ``/chat/completions``
     """
-    url = (base_url or "").strip().rstrip("/")
+    raw = (base_url or "").strip()
+    if not raw:
+        return "chat", "/chat/completions"
+    try:
+        parts = urllib.parse.urlsplit(raw)
+    except ValueError:
+        parts = None
+    if parts is not None and parts.scheme and parts.netloc:
+        path = parts.path.rstrip("/")
+        if path.endswith("/responses"):
+            proto, target_path = "responses", path
+        elif path.endswith("/chat/completions"):
+            proto, target_path = "chat", path
+        elif not path:
+            proto, target_path = "chat", "/v1/chat/completions"
+        else:
+            proto, target_path = "chat", f"{path}/chat/completions"
+        rebuilt = urllib.parse.urlunsplit(
+            (parts.scheme, parts.netloc, target_path, parts.query, "")
+        )
+        return proto, rebuilt
+    url = raw.rstrip("/")
     if url.endswith("/responses"):
         return "responses", url
     if url.endswith("/chat/completions"):
@@ -125,11 +149,12 @@ def _resolve_endpoint(base_url: str) -> tuple[str, str]:
 def _build_payload(
     kind: str, prompt: str, data_uri: str, config: VideoConfig
 ) -> dict:
+    model = str(config.openai_model or "").strip() or DEFAULT_OPENAI_MODEL
     if kind == "responses":
         # Responses API。视频借道 input_image + data URI（实测唯一有效形态，
         # input_file 会被静默丢弃）。
         return {
-            "model": config.openai_model,
+            "model": model,
             "input": [
                 {
                     "role": "user",
@@ -142,7 +167,7 @@ def _build_payload(
             "max_output_tokens": config.openai_max_tokens,
         }
     return {
-        "model": config.openai_model,
+        "model": model,
         "messages": [
             {
                 "role": "user",
@@ -158,60 +183,126 @@ def _build_payload(
     }
 
 
-def _parse_response(kind: str, data: dict) -> tuple[str, int, int]:
+def _safe_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _extract_content_text(content: Any) -> str:
+    """从字符串或多模态列表形态的 content 安全提取纯文本（忽略思维链与非 dict 项）。"""
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    texts: list[str] = []
+    for item in content:
+        if isinstance(item, str):
+            if item:
+                texts.append(item)
+            continue
+        if not isinstance(item, dict):
+            continue
+        if item.get("thought") is True:
+            continue
+        item_type = str(item.get("type") or "").strip().lower()
+        if item_type in {"thought", "thinking", "reasoning"}:
+            continue
+        if item_type in {"", "text", "output_text"}:
+            raw_text = item.get("text")
+            if isinstance(raw_text, str) and raw_text:
+                texts.append(raw_text)
+            elif isinstance(raw_text, dict) and isinstance(raw_text.get("value"), str):
+                if raw_text["value"]:
+                    texts.append(raw_text["value"])
+            elif isinstance(item.get("content"), str) and item["content"]:
+                texts.append(item["content"])
+    return "\n".join(texts).strip()
+
+
+def _parse_response(kind: str, data: Any) -> tuple[str, int, int]:
     """返回 (analysis, prompt_tokens, completion_tokens)，两种协议归一。"""
+    if not isinstance(data, dict):
+        raise ValueError("响应 JSON 不是对象")
+    raw_usage = data.get("usage")
+    usage = raw_usage if isinstance(raw_usage, dict) else {}
     if kind == "responses":
-        text = str(data.get("output_text") or "").strip()
+        raw_out = data.get("output_text")
+        text = (
+            raw_out.strip()
+            if isinstance(raw_out, str)
+            else _extract_content_text(raw_out)
+        )
         if not text:
-            texts = []
-            for item in data.get("output") or []:
-                for part in (item.get("content") or []):
-                    if isinstance(part, dict) and part.get("type") == "output_text":
-                        texts.append(str(part.get("text") or ""))
-            text = "\n".join(s for s in texts if s).strip()
-        usage = data.get("usage") or {}
+            texts: list[str] = []
+            raw_output = data.get("output")
+            if isinstance(raw_output, list):
+                for item in raw_output:
+                    if not isinstance(item, dict):
+                        continue
+                    extracted = _extract_content_text(item.get("content"))
+                    if extracted:
+                        texts.append(extracted)
+            text = "\n".join(texts).strip()
         return (
             text,
-            int(usage.get("input_tokens") or 0),
-            int(usage.get("output_tokens") or 0),
+            _safe_int(usage.get("input_tokens")),
+            _safe_int(usage.get("output_tokens")),
         )
     choices = data.get("choices")
     if not isinstance(choices, list) or not choices:
         # ``choices: []``（或干脆没有该字段）不是"解析失败"，是"服务返回空内容"。
         # 0.2.0 直接 data["choices"][0] -> IndexError -> 报"响应解析失败"，
         # 把一次服务端空回答伪装成了客户端解析 bug。
-        usage = data.get("usage") or {}
         return (
             "",
-            int(usage.get("prompt_tokens") or 0),
-            int(usage.get("completion_tokens") or 0),
+            _safe_int(usage.get("prompt_tokens")),
+            _safe_int(usage.get("completion_tokens")),
         )
     first = choices[0] if isinstance(choices[0], dict) else {}
-    message = first.get("message") or {}
-    analysis = (message.get("content") or "").strip()
-    usage = data.get("usage") or {}
+    raw_message = first.get("message")
+    message = raw_message if isinstance(raw_message, dict) else {}
+    analysis = _extract_content_text(message.get("content"))
     return (
         analysis,
-        int(usage.get("prompt_tokens") or 0),
-        int(usage.get("completion_tokens") or 0),
+        _safe_int(usage.get("prompt_tokens")),
+        _safe_int(usage.get("completion_tokens")),
     )
 
 
-def _classify_error(exc: Exception) -> str:
+_BEARER_RE = re.compile(r"(?i)(Bearer\s+)[^\s,;\"']+")
+_QUERY_KEY_RE = re.compile(r"(?i)([?&](?:key|api_key|token|access_token)=)[^&\s\"']+")
+_SK_TOKEN_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")
+
+
+def _redact_secret(text: str, api_key: str = "") -> str:
+    """抹除错误摘要中的 API key 与常见凭据模式，避免在日志或提示里泄漏。"""
+    cleaned = str(text or "")
+    secret = str(api_key or "").strip()
+    if len(secret) >= 4 and secret in cleaned:
+        cleaned = cleaned.replace(secret, "***")
+    cleaned = _BEARER_RE.sub(r"\1***", cleaned)
+    cleaned = _QUERY_KEY_RE.sub(r"\1***", cleaned)
+    cleaned = _SK_TOKEN_RE.sub("sk-***", cleaned)
+    return cleaned
+
+
+def _classify_error(exc: Exception, *, api_key: str = "") -> str:
     """把异常翻译成一条不含敏感信息的短原因（写日志/注入给模型都用它）。
 
     返回值统一以「视觉服务」开头。``hooks/llm_request._short_reason`` 依赖这个
     前缀把这批原因**整体前置判定** —— 否则「可调小体积闸门」里的「闸门」二字
     会让一次超时被归类成「体积超限」，模型收到的说明就是错的。
     """
-    text = f"{type(exc).__name__}: {exc}"
+    text = _redact_secret(f"{type(exc).__name__}: {exc}", api_key)
     low = text.lower()
     if "certificate" in low or "ssl" in low:
         return (
             "视觉服务 SSL 证书校验失败（自查证书是否过期；"
             "确认信任该端点后可在插件配置里关闭 vision_verify_ssl）"
         )
-    if "timeout" in low or "timed out" in low:
+    if "timeout" in low or "timed out" in low or "time-out" in low:
         return "视觉服务请求超时（可调大 openai_timeout_sec 或调小体积闸门）"
     # 注意别用裸的 "name" 做匹配：KeyError('name') 这类无关异常会被误判成连接问题。
     if (
@@ -272,12 +363,12 @@ async def analyze_video(
         return VisionResult(
             False,
             name,
-            reason=_classify_error(exc),
+            reason=_classify_error(exc, api_key=config.openai_api_key),
             elapsed_sec=time.monotonic() - started,
         )
 
     if resp.status_code != 200:
-        snippet = resp.text[:300] if resp.text else ""
+        snippet = _redact_secret(resp.text[:300], config.openai_api_key) if resp.text else ""
         return VisionResult(
             False,
             name,
@@ -290,7 +381,10 @@ async def analyze_video(
         analysis, prompt_tok, completion_tok = _parse_response(kind, data)
     except Exception as exc:  # noqa: BLE001
         return VisionResult(
-            False, name, reason=f"视觉服务响应解析失败: {exc}", elapsed_sec=elapsed
+            False,
+            name,
+            reason=f"视觉服务响应解析失败: {_redact_secret(str(exc), config.openai_api_key)}",
+            elapsed_sec=elapsed,
         )
 
     if not analysis:
@@ -353,6 +447,10 @@ async def analyze_videos(
             out.append(result)
         else:  # gather 捕到的漏网异常
             out.append(
-                VisionResult(False, name, reason=_classify_error(result))
+                VisionResult(
+                    False,
+                    name,
+                    reason=_classify_error(result, api_key=config.openai_api_key),
+                )
             )
     return out

@@ -78,7 +78,8 @@ def mode_is_usable(config: Any) -> bool:
     挂在"尚未就绪"，可真实请求却每次成功。
 
     - ``openai_compat``：依赖全在插件自己的配置里（``base_url`` / ``api_key`` /
-      ``model``），直接读 ``VideoConfig.openai_service_ready``；
+      ``model``），直接读 ``VideoConfig.openai_service_ready``（已包含 URL 协议与
+      ``api_key`` 非 URL 格式校验，写错时不会谎报就绪）；
     - ``gemini_native``：唯一的依赖是**宿主当前的 Gemini provider**。那是宿主
       运行状态，钩子与状态接口都读不到（``resolve_provider`` 只能在请求时
       ``await``），所以这里按"插件侧没有必需配置项"认定为满足。真正不满足时，

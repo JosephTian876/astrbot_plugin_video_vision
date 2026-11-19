@@ -23,7 +23,7 @@
     "description": "视觉服务接口地址（写全路径）",
     "type": "string",
     "default": "",
-    "hint": "填到完整端点：以 /chat/completions 结尾走 Chat Completions 协议，以 /responses 结尾走 Responses 协议（插件自动按结尾选择）。只填到 /v1 时兜底按 /chat/completions 处理。两种协议下视频都以 image_url/input_image + data:video/*;base64 发送（实测唯一有效形态）。"
+    "hint": "填到完整端点：以 /chat/completions 结尾走 Chat Completions 协议，以 /responses 结尾走 Responses 协议（插件自动按结尾选择）；保留已有查询参数（如 ?api-version=...），只填域名或 /v1 时自动补全 /v1/chat/completions。两种协议下视频都以 image_url/input_image + data:video/*;base64 发送（实测唯一有效形态）。"
   },
   "openai_api_key": {
     "description": "视觉服务 API Key",
@@ -31,7 +31,7 @@
     "default": "",
     "secret": true,
     "obvious_hint": true,
-    "hint": "视觉服务的密钥。仅 openai_compat 模式使用。面板里默认以密码框显示；插件日志只打后 4 位。"
+    "hint": "视觉服务的密钥。仅 openai_compat 模式使用（不可误填成 http(s) URL）。面板里默认以密码框显示；插件日志与异常摘要均会脱敏，只打后 4 位。"
   },
   "openai_model": {
     "description": "视觉模型",
@@ -160,7 +160,7 @@
     "description": "处理引用消息中的视频",
     "type": "bool",
     "default": true,
-    "hint": "开启后，回复一条含视频的消息也会让模型看到该视频。引用视频在本地取不到时核心只给一个 `ref` 地址，插件会按需下载它：只认 http(s)、最多 5 跳、单次 30 秒、原始体积超过 13.5MB 立即中断；失败时按 `notify_on_failure` 注入一行说明，不会假装看到了视频。"
+    "hint": "开启后，回复一条含视频的消息也会让模型看到该视频。引用视频在本地取不到时核心只给一个 `ref` 地址，插件仅向公网 http(s) 拉取（拦截 file:// 与内网/回环/元数据 IP，仅放行授权本地视频文件）：最多 5 跳、单次 30 秒，默认原始体积超过 13.5MB 立即中断；若开启 compress/truncate 且 ffmpeg 可用，下载上限放宽至 100MB 以便压缩后再注入；失败时按 `notify_on_failure` 注入一行说明，不会假装看到了视频。"
   },
   "treat_file_as_video": {
     "description": "把视频文件附件也当作视频处理",

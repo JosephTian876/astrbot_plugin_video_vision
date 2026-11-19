@@ -548,6 +548,7 @@ class SingleFlight:
         *,
         probe: Callable[[], Any] | None = None,
         wait_timeout: float = 60.0,
+        overall_timeout: float | None = None,
         on_join: Callable[[], None] | None = None,
         on_takeover: Callable[[BaseException | None], None] | None = None,
         on_overdue: Callable[[], None] | None = None,
@@ -562,15 +563,26 @@ class SingleFlight:
             wait_timeout: 单轮等待 leader 的秒数。**不是**"等这么久就接管"：
                 超时只结束**这一轮**等待，随后继续等同一个 leader（契约要求同 key
                 并发恒为 1）。``<=0`` 表示不设预算 —— 一直等到 leader 结束。
+            overall_timeout: 等待同一 leader 的**总**上限（秒）；``None`` 或
+                ``<=0`` 表示不设总上限。超时抛 ``TimeoutError``（绝不删除仍在跑
+                的 leader 登记），防止极端卡死时永久死等。
             on_join: 第一次加入别人的 flight 时回调（日志用）。
             on_takeover: leader 瞬时失败后本调用改为自行转码时回调（日志用）。
             on_overdue: leader 超过 ``wait_timeout`` 仍未结束时回调**一次**
-                （leader 可能卡住；本调用仍会继续等）。
+                （leader 可能卡住；本调用在总上限内继续等）。
 
         Returns:
             ``work()`` 的返回值，或 leader 发布到共享位置的产物。
         """
         timeout = max(0.0, float(wait_timeout))
+        total_budget = (
+            float(overall_timeout)
+            if overall_timeout is not None and float(overall_timeout) > 0
+            else None
+        )
+        deadline = (
+            time.monotonic() + total_budget if total_budget is not None else None
+        )
         attempts = 0
         announced = False
         overdue = False
@@ -582,9 +594,21 @@ class SingleFlight:
             if on_join is not None and not announced:
                 announced = True
                 on_join()
-            finished = flight.event.wait(timeout if timeout > 0 else None)
+            wait_sec: float | None = timeout if timeout > 0 else None
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"等待同一文件转码超过总上限 {format_seconds(total_budget or 0.0)}"
+                    )
+                wait_sec = remaining if wait_sec is None else min(wait_sec, remaining)
+            finished = flight.event.wait(wait_sec)
 
             if not finished:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"等待同一文件转码超过总上限 {format_seconds(total_budget or 0.0)}"
+                    )
                 # 等待超时：**不动登记表**（P2-1 的唯一根因就是这里删了）。
                 # 删掉正在跑的 leader 的登记 -> 下一轮 ``_enter`` 自己当 leader ->
                 # 同一个 key 两份并发。这里改成继续等同一个 leader：并发恒为 1，
@@ -646,10 +670,120 @@ class SingleFlight:
                 del self._flights[key]
 
 
+_ASYNC_MISSING = object()
+
+
+@dataclass
+class _AsyncFlight:
+    """一次在飞的异步共享准备任务（event loop 级）。"""
+
+    loop: asyncio.AbstractEventLoop
+    event: asyncio.Event
+    value: Any = _ASYNC_MISSING
+    error: BaseException | None = None
+    shareable: bool = False
+
+
+class AsyncSingleFlight:
+    """同 key 的异步并发准备只让 leader 取槽并占用线程池，其余在事件循环侧等待。
+
+    与 :class:`SingleFlight` 互补：后者运行在 worker 线程内部；本类位于
+    :class:`SlotLimiter` 取槽**之前**，避免 N 个相同视频请求同时进来时，
+    followers 占满并发槽位与 ``vv-ffmpeg`` 线程把其它不同视频堵死。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._flights: dict[Hashable, _AsyncFlight] = {}
+
+    @property
+    def pending(self) -> int:
+        with self._lock:
+            return len(self._flights)
+
+    async def run(
+        self,
+        key: Hashable,
+        work: Callable[[], Awaitable[Any]],
+        *,
+        wait_timeout: float | None = None,
+        can_share: Callable[[Any], bool] | None = None,
+        on_join: Callable[[], None] | None = None,
+    ) -> tuple[Any, bool]:
+        """执行 ``work``（同 key 仅 leader 取槽）；返回 ``(结果, 是否复用)``。"""
+        if not key:
+            return await work(), False
+
+        loop = asyncio.get_running_loop()
+        with self._lock:
+            flight = self._flights.get(key)
+            if flight is not None and flight.loop is not loop:
+                flight = None
+            is_leader = flight is None
+            if is_leader:
+                flight = _AsyncFlight(loop=loop, event=asyncio.Event())
+                self._flights[key] = flight
+
+        if not is_leader:
+            if on_join is not None:
+                on_join()
+            timeout = (
+                float(wait_timeout)
+                if wait_timeout is not None and float(wait_timeout) > 0
+                else None
+            )
+            try:
+                await asyncio.wait_for(flight.event.wait(), timeout=timeout)
+            except (asyncio.TimeoutError, TimeoutError) as exc:
+                raise TimeoutError(
+                    f"等待同一视频准备超过 {format_seconds(timeout or 0.0)}"
+                ) from exc
+            if flight.error is not None:
+                raise flight.error
+            if flight.shareable and flight.value is not _ASYNC_MISSING:
+                return flight.value, True
+            return await work(), False
+
+        try:
+            value = await work()
+        except asyncio.CancelledError:
+            self._settle(key, flight)
+            raise
+        except BaseException as exc:  # noqa: BLE001 - 失败必须原样向等待者传播
+            self._settle(key, flight, error=exc)
+            raise
+        shareable = True if can_share is None else bool(can_share(value))
+        self._settle(
+            key,
+            flight,
+            value=value if shareable else _ASYNC_MISSING,
+            shareable=shareable,
+        )
+        return value, False
+
+    def _settle(
+        self,
+        key: Hashable,
+        flight: _AsyncFlight,
+        *,
+        value: Any = _ASYNC_MISSING,
+        error: BaseException | None = None,
+        shareable: bool = False,
+    ) -> None:
+        flight.value = value
+        flight.error = error
+        flight.shareable = shareable
+        with self._lock:
+            if self._flights.get(key) is flight:
+                del self._flights[key]
+        flight.event.set()
+
+
 __all__ = [
     "DETERMINISTIC_FAILURE_KINDS",
     "NULL_LIMITER",
     "QUEUE_LOG_THRESHOLD_SEC",
+    "AsyncSingleFlight",
     "LimiterStats",
     "QueueTimeout",
     "SingleFlight",

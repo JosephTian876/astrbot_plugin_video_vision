@@ -431,6 +431,7 @@ def _prepare_video(
             ffmpeg=ffmpeg,
             ffprobe=ffprobe,
             timeout=config.max_compress_seconds,
+            duration=duration,
         )
         if cache is not None and cache_key:
             return cache.put(cache_key, produced)
@@ -473,12 +474,15 @@ def _prepare_video(
                     _compress_once,
                     probe=_cached_artifact,
                     wait_timeout=config.max_compress_seconds + 5.0,
+                    overall_timeout=max(60.0, config.max_compress_seconds * 2 + 35.0),
                     on_join=lambda: dbg("加入同一文件的转码 %s", cache_key),
                     on_takeover=_on_takeover,
                     on_overdue=_on_overdue,
                 )
             else:
                 final_path = _compress_once()
+        except TimeoutError as exc:
+            return PrepareOutcome(False, reason=f"压缩超时: {exc}", kind="timeout")
         except MediaToolError as exc:
             return PrepareOutcome(
                 False, reason=f"压缩失败: {exc}", kind=exc.kind
