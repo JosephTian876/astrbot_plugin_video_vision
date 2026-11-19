@@ -70,11 +70,12 @@ def is_attachment_line(line: str) -> bool:
     return line.strip().startswith(_PREFIXES)
 
 
-#: 判定「这个 File 附件其实是视频」用的扩展名集合
+#: 判定「这个 File 附件其实是视频」用的扩展名集合（刻意不含 ``.ts``：避免群聊发送
+#: TypeScript 源码文件在 ``treat_file_as_video=true`` 时被误判为损坏视频）
 VIDEO_SUFFIXES: frozenset[str] = frozenset(
     {
         ".mp4", ".m4v", ".mov", ".webm", ".mkv", ".avi", ".flv",
-        ".wmv", ".mpeg", ".mpg", ".3gp", ".ts", ".ogv",
+        ".wmv", ".mpeg", ".mpg", ".3gp", ".ogv",
     }
 )
 

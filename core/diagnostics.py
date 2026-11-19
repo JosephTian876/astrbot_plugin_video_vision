@@ -24,7 +24,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from .config import VideoConfig
+from .config import VideoConfig, is_valid_openai_api_key, is_valid_openai_base_url
 from .decide import (
     ACTION_LABELS,
     URI_LIMIT_MB,
@@ -35,7 +35,7 @@ from .decide import (
 )
 from .injector import PrepareOutcome
 from .limits import format_seconds
-from .media import OUTPUT_MIME, guess_video_mime, suffix_of
+from .media import OUTPUT_MIME, guess_video_mime, sniff_video_mime, suffix_of
 from .openai_vision import build_vision_prompt
 from .placeholder import VIDEO_SUFFIXES
 
@@ -145,13 +145,17 @@ class VisionReport:
 
 
 def missing_credentials(cfg: VideoConfig) -> list[str]:
-    """视觉服务三要素里缺哪几项（凭据齐全性诊断用）。"""
+    """视觉服务三要素里缺失或格式无效的项（凭据齐全性诊断用）。"""
     missing: list[str] = []
     if not cfg.openai_base_url:
         missing.append("openai_base_url")
+    elif not is_valid_openai_base_url(cfg.openai_base_url):
+        missing.append("openai_base_url(格式无效，须为 http(s):// 地址)")
     if not cfg.openai_api_key:
         missing.append("openai_api_key")
-    if not cfg.openai_model:
+    elif not is_valid_openai_api_key(cfg.openai_api_key):
+        missing.append("openai_api_key(格式无效，不可为 URL)")
+    if not str(cfg.openai_model or "").strip():
         missing.append("openai_model")
     return missing
 
@@ -176,7 +180,7 @@ def container_note(path: str) -> str:
     这里只把事实写进报告，**不改任何行为**：正常消息流仍由闸门 ⓪ 负责筛选。
     """
     suffix = suffix_of(path)
-    if suffix in VIDEO_SUFFIXES:
+    if suffix in VIDEO_SUFFIXES or sniff_video_mime(path):
         return ""
     return (
         f"⚠️ 扩展名 {suffix or '（无）'} 不在已知视频容器内：显式路径不校验扩展名，"
@@ -184,17 +188,22 @@ def container_note(path: str) -> str:
     )
 
 
-def mime_line(path: str, action: str) -> str:
+def mime_line(path: str, action: str, *, mime: str = "") -> str:
     """``MIME   :`` 行：报告实际声明给 provider 的 MIME。
 
     - 压缩/截断产物一定是 ffmpeg 产出的 ``.mp4``，MIME 是确定的；
-    - 直接送时 MIME 由源文件后缀决定；后缀不在已知容器里就只能回落到
-      ``video/mp4``，这一行必须标 ``(推断)``，不能和真实探测结果混为一谈。
+    - 直接送时优先用魔数嗅探结果，其次按已知视频后缀决定；
+      后缀不在已知容器里且未能识别魔数时回落到 ``video/mp4`` 并标 ``(推断)``。
     """
     if action != "as-is":
         return f"MIME   : {OUTPUT_MIME}（压缩产物，固定为 mp4）"
+    sniffed = sniff_video_mime(path)
+    if sniffed:
+        return f"MIME   : {sniffed}"
     if suffix_of(path) in VIDEO_SUFFIXES:
-        return f"MIME   : {guess_video_mime(path)}"
+        return f"MIME   : {mime or guess_video_mime(path)}"
+    if mime and mime != OUTPUT_MIME:
+        return f"MIME   : {mime}"
     return f"MIME   : {OUTPUT_MIME} (推断)"
 
 
@@ -433,7 +442,9 @@ def render_report(
     lines.append(f"编码: data URI {uri_mb:.2f} MB")
     # 声明给 provider 的 MIME：未知后缀回落 video/mp4 时标 (推断)，
     # 免得"✅ 准备成功 + video/mp4"被读成"这个 gif 真的会以视频发出去"。
-    lines.append(mime_line(inj.used_path, inj.action))
+    lines.append(
+        mime_line(inj.used_path, inj.action, mime=getattr(inj, "mime_type", ""))
+    )
     if inj.note:
         lines.append(f"说明: {inj.note}")
     lines.append("")
@@ -544,9 +555,9 @@ def startup_lines(
                 "warning",
                 (
                     "[VideoVision] provider_mode=openai_compat 但 openai_base_url / "
-                    "openai_api_key / openai_model 未配齐，已降级为 gemini_native "
+                    "openai_api_key / openai_model 未配齐或格式无效，已降级为 gemini_native "
                     "（老配置零改动仍可继续用）。要使用 OpenAI 兼容视觉服务，"
-                    "请把这三项补齐。"
+                    "请检查并补齐这三项。"
                 ),
             )
         )

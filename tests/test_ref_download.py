@@ -108,10 +108,17 @@ class _QuietServer(ThreadingHTTPServer):
 def server_base() -> Iterator[str]:
     server = _QuietServer(("127.0.0.1", 0), _Handler)
     server.daemon_threads = True
+    server_port = server.server_address[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        yield f"http://127.0.0.1:{server.server_address[1]}"
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                media,
+                "_is_allowed_test_ref_host",
+                lambda host, port, p=server_port: host == "127.0.0.1" and port == p,
+            )
+            yield f"http://127.0.0.1:{server_port}"
     finally:
         server.shutdown()
         server.server_close()

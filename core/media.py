@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import ipaddress
 import os
 import shutil
 import signal
+import socket
 import subprocess
+import tempfile
 import threading
 import urllib.error
 import urllib.parse
@@ -21,7 +24,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-#: 常见视频容器 -> MIME
+#: 常见视频容器 -> MIME（不含 ``.ts``，避免 TypeScript 文件在 File 形态被误认成视频）
 VIDEO_MIME_BY_SUFFIX: dict[str, str] = {
     ".mp4": "video/mp4",
     ".m4v": "video/mp4",
@@ -34,7 +37,6 @@ VIDEO_MIME_BY_SUFFIX: dict[str, str] = {
     ".mpeg": "video/mpeg",
     ".mpg": "video/mpeg",
     ".3gp": "video/3gpp",
-    ".ts": "video/mp2t",
     ".ogv": "video/ogg",
 }
 
@@ -50,9 +52,12 @@ MAX_DATA_URI_BYTES = 18 * 1024 * 1024
 
 #: 引用视频（ref 形态）下载的**原始字节**硬上限 = data URI 硬上限换算回原始体积
 #: （18MB * 3/4 = 13.5MB，与 ``core/decide.py`` 的 ``URI_LIMIT_RAW_MB`` 同一个
-#: 换算）。超过它的视频即使下载成功，也必然在 ``read_as_data_uri`` 的编码上限
-#: 处失败；边下边拦，别先写满磁盘再报错。
+#: 换算）。直通（无 ffmpeg / reject 模式）时超过它的视频即使下载成功，也必然在
+#: ``read_as_data_uri`` 的编码上限处失败；边下边拦，别先写满磁盘再报错。
 MAX_REF_DOWNLOAD_BYTES = MAX_DATA_URI_BYTES * 3 // 4
+
+#: 允许进入 ffmpeg 压缩/截断时的引用视频下载安全上限（防止恶意大文件 DoS）。
+MAX_REF_COMPRESS_DOWNLOAD_BYTES = 100 * 1024 * 1024
 
 
 class MediaToolError(RuntimeError):
@@ -107,8 +112,105 @@ def suffix_of(path: str | os.PathLike[str] | None) -> str:
     return os.path.splitext(text)[1].lower()
 
 
+#: 魔数嗅探读取的最大文件头字节数（覆盖 ISO BMFF / EBML DocType / Ogg Theora 页头）。
+_SNIFF_HEADER_BYTES = 4096
+
+_EBML_MAGIC = b"\x1a\x45\xdf\xa3"
+_EBML_SEGMENT_ID = b"\x18\x53\x80\x67"
+_EBML_DOCTYPE_ID = b"\x42\x82"
+_ASF_HEADER_MAGIC = b"\x30\x26\xb2\x75\x8e\x66\xcf\x11\xa6\xd9\x00\xaa\x00\x62\xce\x6c"
+_NON_VIDEO_FTYP_BRANDS = frozenset(
+    {
+        b"heic", b"heix", b"hevc", b"hevx",
+        b"avif", b"avis", b"mif1", b"msf1",
+        b"m4a ", b"m4b ", b"m4p ",
+    }
+)
+
+
+def sniff_video_mime_bytes(
+    header: bytes | bytearray | memoryview, *, suffix: str = ""
+) -> str | None:
+    """从文件头魔数识别常见视频容器 MIME；无法确认时返回 ``None``。
+
+    重点解决 QQ/NapCat 将 Matroska EBML（``\\x1a\\x45\\xdf\\xa3``）或 WebM 字节流
+    以 ``media_video_*.mp4`` 落盘时，仅凭 ``.mp4`` 扩展名误声明为 ``video/mp4`` 的问题。
+    """
+    data = bytes(header[:_SNIFF_HEADER_BYTES])
+    if len(data) < 4:
+        return None
+
+    if data.startswith(_EBML_MAGIC):
+        ebml_head = data.split(_EBML_SEGMENT_ID, 1)[0]
+        doc_idx = ebml_head.find(_EBML_DOCTYPE_ID, 4)
+        if doc_idx != -1 and doc_idx + 3 <= len(ebml_head):
+            size_byte = ebml_head[doc_idx + 2]
+            if size_byte & 0x80:
+                doc_len = size_byte & 0x7F
+                doctype = (
+                    ebml_head[doc_idx + 3 : doc_idx + 3 + doc_len]
+                    .rstrip(b"\x00")
+                    .strip()
+                    .lower()
+                )
+                if doctype == b"webm":
+                    return "video/webm"
+                if doctype == b"matroska":
+                    return "video/x-matroska"
+        low_head = ebml_head.lower()
+        if b"webm" in low_head:
+            return "video/webm"
+        if b"matroska" in low_head:
+            return "video/x-matroska"
+        return "video/webm" if suffix.lower() == ".webm" else "video/x-matroska"
+
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        brand = data[8:12].lower()
+        if brand in _NON_VIDEO_FTYP_BRANDS:
+            return None
+        if brand == b"qt  ":
+            return "video/quicktime"
+        if brand[:3] in (b"3gp", b"3g2"):
+            return "video/3gpp"
+        return "video/mp4"
+
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"AVI ":
+        return "video/x-msvideo"
+
+    if data[:3] == b"FLV" and data[3] <= 5:
+        return "video/x-flv"
+
+    if data.startswith(_ASF_HEADER_MAGIC):
+        return "video/x-ms-wmv"
+
+    if data.startswith(b"OggS") and (
+        b"theora" in data.lower() or suffix.lower() == ".ogv"
+    ):
+        return "video/ogg"
+
+    if data[:4] in (b"\x00\x00\x01\xba", b"\x00\x00\x01\xb3"):
+        return "video/mpeg"
+
+    return None
+
+
+def sniff_video_mime(path: str | os.PathLike[str] | None) -> str | None:
+    """读取文件头魔数并推断视频 MIME；文件不存在、不可读或未命中已知容器返回 ``None``。"""
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as handle:
+            header = handle.read(_SNIFF_HEADER_BYTES)
+    except OSError:
+        return None
+    return sniff_video_mime_bytes(header, suffix=suffix_of(path))
+
+
 def guess_video_mime(path: str | os.PathLike[str]) -> str:
-    """按扩展名猜 MIME；未知则回落到 video/mp4。"""
+    """优先按容器魔数识别 MIME；读不到或未命中魔数时按扩展名回落到 video/mp4。"""
+    sniffed = sniff_video_mime(path)
+    if sniffed:
+        return sniffed
     return VIDEO_MIME_BY_SUFFIX.get(suffix_of(path), OUTPUT_MIME)
 
 
@@ -191,7 +293,7 @@ def read_as_data_uri(
 
     Args:
         path: 本地文件路径。
-        mime: 声明用的 MIME；留空则按扩展名猜。
+        mime: 声明用的 MIME；留空则按容器魔数与扩展名推断。
 
     Returns:
         ``data:<mime>;base64,<payload>`` 形式的字符串。
@@ -200,7 +302,6 @@ def read_as_data_uri(
         MediaToolError: 文件不可读、为 0 字节，或编码后超过
             :data:`MAX_DATA_URI_BYTES`（``kind="too_large"``）。
     """
-    resolved_mime = mime or guess_video_mime(path)
     try:
         size = os.path.getsize(path)
     except OSError as exc:
@@ -225,6 +326,11 @@ def read_as_data_uri(
             "（请调小 max_size_mb / compress_max_mb，或缩短视频）",
             kind="too_large",
         )
+    resolved_mime = (
+        mime
+        or sniff_video_mime_bytes(payload[:_SNIFF_HEADER_BYTES], suffix=suffix_of(path))
+        or VIDEO_MIME_BY_SUFFIX.get(suffix_of(path), OUTPUT_MIME)
+    )
     return f"data:{resolved_mime};base64,{encoded}"
 
 
@@ -241,16 +347,153 @@ _REF_CHUNK_BYTES = 64 * 1024
 _REF_USER_AGENT = "astrbot-plugin-video-vision/ref-download"
 
 
-class _LimitedRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """把 urllib 的跳数上限从默认 10 收紧到 :data:`MAX_REF_REDIRECTS`。
+#: Clash/mihomo 透明代理（fake-ip 模式）会为普通域名返回 RFC 2544 网段的假地址，
+#: 真实流量仍由代理按原域名出站；仅对**域名解析结果**放行该网段，字面量地址仍拒绝。
+_FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
 
-    ``urllib`` 的两个计数本来就是类属性：``max_repeats`` 防同一个地址来回跳、
-    ``max_redirections`` 防长链。改类属性比复写 ``redirect_request`` 少抄一份
-    ``urljoin`` 逻辑 —— 那份逻辑一旦与标准库分叉，异常消息里就可能带上 URL。
-    """
+
+def _is_allowed_test_ref_host(host: str, port: int | None) -> bool:
+    """仅供离线本地假服务器测试按精确 (host, port) 替换；生产恒返回 False。"""
+    del host, port
+    return False
+
+
+def _is_safe_ip(address_text: str, *, allow_fake_ip: bool) -> bool:
+    """判断解析出的 IP 是否为允许访问的公网地址（拦截内网/回环/元数据链路）。"""
+    clean = address_text.split("%", 1)[0]
+    addr = ipaddress.ip_address(clean)
+    if addr.version == 6 and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    return bool(addr.is_global or (allow_fake_ip and addr in _FAKE_IP_NETWORK))
+
+
+def _looks_like_obfuscated_ip(host: str) -> bool:
+    """拦截十进制整数 / 八进制 / 十六进制等绕过标准 ip_address 解析的 IPv4 写法。"""
+    if not host:
+        return True
+    parts = host.split(".")
+    if len(parts) not in {1, 2, 3, 4}:
+        return False
+    for part in parts:
+        if not part:
+            return False
+        if part.isdigit():
+            continue
+        if part.lower().startswith("0x") and len(part) > 2 and all(
+            ch in "0123456789abcdefABCDEF" for ch in part[2:]
+        ):
+            continue
+        return False
+    return True
+
+
+def _validate_http_ref_url(url: str, *, resolve_dns: bool = False) -> None:
+    """校验引用下载 URL 的安全性（防 SSRF），失败抛不带 URL 的 MediaToolError。"""
+    if not url or any(ch.isspace() or ord(ch) < 32 for ch in url):
+        raise MediaToolError("引用视频地址无效", kind="other")
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        port = parsed.port
+    except ValueError as exc:
+        raise MediaToolError("引用视频地址无效", kind="other") from exc
+
+    scheme = (parsed.scheme or "").lower()
+    host = (parsed.hostname or "").rstrip(".")
+    if (
+        scheme not in {"http", "https"}
+        or not host
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise MediaToolError("引用视频地址无效", kind="other")
+
+    if _is_allowed_test_ref_host(host, port):
+        return
+
+    low_host = host.lower()
+    if low_host in {"localhost", "localhost.localdomain"} or low_host.endswith(
+        (".localhost", ".local", ".internal")
+    ):
+        raise MediaToolError("引用视频地址指向受限内网主机", kind="other")
+
+    try:
+        _ = ipaddress.ip_address(host)
+    except ValueError:
+        if ":" in host or _looks_like_obfuscated_ip(host):
+            raise MediaToolError("引用视频地址无效", kind="other") from None
+    else:
+        if not _is_safe_ip(host, allow_fake_ip=False):
+            raise MediaToolError("引用视频地址指向受限内网 IP", kind="other")
+        return
+
+    if not resolve_dns:
+        return
+
+    target_port = port or (443 if scheme == "https" else 80)
+    try:
+        infos = socket.getaddrinfo(host, target_port, type=socket.SOCK_STREAM)
+    except OSError:
+        # DNS 解析失败（或走代理环境由代理侧解析）交由后续请求阶段统一报告。
+        return
+    for info in infos:
+        sockaddr = info[4]
+        if not sockaddr:
+            continue
+        ip_text = str(sockaddr[0])
+        try:
+            safe = _is_safe_ip(ip_text, allow_fake_ip=True)
+        except ValueError:
+            safe = False
+        if not safe:
+            raise MediaToolError("引用视频地址解析到受限内网 IP", kind="other")
+
+
+def _is_authorized_local_ref(
+    path_text: str, download_dir: str | os.PathLike[str]
+) -> bool:
+    """非 http(s) 的本地路径仅放行已知视频格式或临时目录内的无后缀媒体文件。"""
+    low = path_text.lower()
+    if low.startswith("file:") or "://" in path_text:
+        return False
+    if not os.path.isfile(path_text):
+        return False
+    suffix = suffix_of(path_text)
+    if suffix in VIDEO_MIME_BY_SUFFIX:
+        return True
+    if suffix:
+        return False
+    try:
+        resolved = Path(path_text).resolve()
+        allowed_roots = (
+            Path(tempfile.gettempdir()).resolve(),
+            Path(download_dir).resolve(),
+        )
+        return any(
+            resolved == root or root in resolved.parents for root in allowed_roots
+        )
+    except OSError:
+        return False
+
+
+class _LimitedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """把 urllib 的跳数上限从默认 10 收紧到 :data:`MAX_REF_REDIRECTS`，并重检跳转目标。"""
 
     max_repeats = MAX_REF_REDIRECTS
     max_redirections = MAX_REF_REDIRECTS
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        next_req = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if next_req is not None:
+            _validate_http_ref_url(next_req.full_url, resolve_dns=True)
+        return next_req
 
 
 def _is_http_ref(ref: str) -> bool:
@@ -292,12 +535,13 @@ def _discard(path: Path) -> None:
 
 
 def _open_ref(request: urllib.request.Request, timeout: float) -> Any:
-    """打开引用下载请求（跳数受限）。
+    """打开引用下载请求（跳数受限且带 DNS/IP SSRF 校验）。
 
     独立成函数是为了让测试能替换**唯一**的网络入口：``build_opener`` 返回的
     ``OpenerDirector`` 绕过了 ``urllib.request.urlopen``，monkeypatch 后者是
     拦不住的。生产路径始终走这个函数。
     """
+    _validate_http_ref_url(request.full_url, resolve_dns=True)
     opener = urllib.request.build_opener(_LimitedRedirectHandler)
     return opener.open(request, timeout=timeout)
 
@@ -334,7 +578,11 @@ def _describe_download_failure(exc: BaseException) -> tuple[str, str]:
 
 
 def download_ref_to(
-    ref: str, directory: str | os.PathLike[str], timeout: float = 30.0
+    ref: str,
+    directory: str | os.PathLike[str],
+    timeout: float = 30.0,
+    *,
+    max_bytes: int | None = None,
 ) -> str:
     """把引用形态（ref）的视频物化成可读的本地路径。
 
@@ -343,16 +591,17 @@ def download_ref_to(
     分支）。它可能是三种东西，本函数各有一条明确出口：
 
     * ``http(s)://`` —— 下载到 ``directory``（调用方给的**本次请求独占**目录）；
-    * 本机路径 / 裸文件名 —— **存在**就原样返回，不做任何网络 I/O；
-    * 其它（不存在且不是 http(s)）—— 明确失败，**绝不**把它当 URL 去试探
-      （把 ``a1b2.mp4`` 当相对路径去读，错的是那条路径，不是"下载失败"）。
+    * 合法本地视频/临时路径 —— **存在**就原样返回，不做任何网络 I/O；
+    * 其它（非公网地址、``file://``、不存在或非视频本地路径）—— 明确失败，
+      **绝不**把它当 URL 去试探。
 
     **只用标准库**：``core/`` 受 ``tests/test_docs.py`` 的 AST 锁约束，不许
     ``import astrbot``；``httpx`` 只是测试依赖（``openai_vision`` 也是惰性、
     可缺）。``urllib`` 零运行时依赖。
 
-    拦截：跳数上限 :data:`MAX_REF_REDIRECTS`；边下边计字节，超过
-    :data:`MAX_REF_DOWNLOAD_BYTES` 立刻中断并删掉半成品；``timeout`` 是单次
+    拦截：仅放行公网 http(s) 地址与合法重定向（防 SSRF）；跳数上限
+    :data:`MAX_REF_REDIRECTS`；边下边计字节，超过 ``max_bytes``（默认
+    :data:`MAX_REF_DOWNLOAD_BYTES`）立刻中断并删掉半成品；``timeout`` 是单次
     socket 操作上限。
 
     **异常消息绝不含 URL**：只要走到失败分支，消息里只有异常类型 / HTTP 状态码
@@ -362,13 +611,15 @@ def download_ref_to(
         ref: 引用值（可能是 URL，也可能是本机路径）。
         directory: 下载目录（调用方负责清理；不存在时会被创建）。
         timeout: 单次 socket 操作上限（秒）。
+        max_bytes: 允许下载的最大原始字节数；``None`` 时使用
+            :data:`MAX_REF_DOWNLOAD_BYTES`。
 
     Returns:
         本地路径：URL 时是 ``directory`` 下的新文件，本机路径时原样返回。
 
     Raises:
-        MediaToolError: 引用为空、不是 http(s) 且本机不存在、超时、体积超限、
-            HTTP 错误或其它下载失败。``kind`` 取
+        MediaToolError: 引用为空、SSRF 拦截、不是 http(s) 且本机不存在、超时、
+            体积超限、HTTP 错误或其它下载失败。``kind`` 取
             ``MediaToolError.KINDS`` 里的 ``timeout`` / ``too_large`` / ``empty``
             / ``other``。
     """
@@ -376,11 +627,13 @@ def download_ref_to(
     if not text:
         raise MediaToolError("引用视频地址为空，无法物化", kind="other")
     if not _is_http_ref(text):
-        if os.path.isfile(text):
+        if _is_authorized_local_ref(text, directory):
             return text
         raise MediaToolError(
             "引用视频不是 http(s) 地址，且本机不存在该文件", kind="other"
         )
+
+    _validate_http_ref_url(text, resolve_dns=False)
 
     # 落盘名字用引用的摘要：同一 URL 重试写同一个文件（不会堆垃圾），
     # 且文件名里不出现 URL 的任何片段（日志 / 目录列表里都不会泄漏签名）。
@@ -393,13 +646,16 @@ def download_ref_to(
             f"引用视频下载目录不可用（{type(exc).__name__}）", kind="other"
         ) from exc
 
+    effective_limit = (
+        MAX_REF_DOWNLOAD_BYTES if max_bytes is None else max(1, int(max_bytes))
+    )
     request = urllib.request.Request(text, headers={"User-Agent": _REF_USER_AGENT})
-    limit_mb = MAX_REF_DOWNLOAD_BYTES / 1024 / 1024
+    limit_mb = effective_limit / 1024 / 1024
     written = 0
     try:
         with _open_ref(request, timeout) as response:
             declared = _declared_length(response)
-            if declared is not None and declared > MAX_REF_DOWNLOAD_BYTES:
+            if declared is not None and declared > effective_limit:
                 raise MediaToolError(
                     f"引用视频超过下载上限 {limit_mb:.1f}MB", kind="too_large"
                 )
@@ -409,7 +665,7 @@ def download_ref_to(
                     if not chunk:
                         break
                     written += len(chunk)
-                    if written > MAX_REF_DOWNLOAD_BYTES:
+                    if written > effective_limit:
                         raise MediaToolError(
                             f"引用视频超过下载上限 {limit_mb:.1f}MB",
                             kind="too_large",
@@ -578,6 +834,7 @@ def compress_video(
     ffmpeg: str | None,
     ffprobe: str | None,
     timeout: float = 45.0,
+    duration: float | None = None,
 ) -> str:
     """压缩（可选截断）视频，体积受 ``max_mb`` 约束。
 
@@ -603,6 +860,8 @@ def compress_video(
         max_duration_sec: 截断到前 N 秒；0 表示不限（仅在源时长超过它时生效）。
         ffmpeg / ffprobe: 可执行文件路径。
         timeout: 墙钟上限（秒）。
+        duration: 调用方已探测好的源时长（秒）；传入时直接复用，避免重复调
+            ``ffprobe``。``None`` 时现场调用 :func:`probe_duration`。
 
     Returns:
         输出文件路径。
@@ -613,15 +872,17 @@ def compress_video(
     if not ffmpeg:
         raise MediaToolError("未找到 ffmpeg，无法压缩", kind="not_found")
 
-    duration = probe_duration(source, ffprobe)
-    if duration <= 0:
+    resolved_duration = (
+        float(duration) if duration is not None else probe_duration(source, ffprobe)
+    )
+    if resolved_duration <= 0:
         raise MediaToolError(
             "无法读取视频时长，拒绝盲压缩（文件可能已损坏）", kind="duration"
         )
 
-    effective_duration = duration
+    effective_duration = resolved_duration
     if max_duration_sec and max_duration_sec > 0:
-        effective_duration = min(duration, max_duration_sec)
+        effective_duration = min(resolved_duration, max_duration_sec)
 
     # 体积上限 -> 码率上限（kbps）。留 8% 余量给容器与音频开销。
     budget_kbits = max(1.0, max_mb) * 8192 * 0.92
@@ -634,7 +895,7 @@ def compress_video(
     hard_limit_bytes = max(1024, int(float(max_mb) * 1024 * 1024))
 
     args = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(source)]
-    if will_truncate(duration, max_duration_sec):
+    if will_truncate(resolved_duration, max_duration_sec):
         args += ["-t", f"{max_duration_sec:.3f}"]
     args += [
         "-c:v", "libx264",
