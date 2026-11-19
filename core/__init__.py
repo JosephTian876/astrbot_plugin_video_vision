@@ -19,6 +19,8 @@ from .media import (
     probe_duration,
     read_as_data_uri,
     resolve_ffmpeg_tools,
+    sniff_video_mime,
+    sniff_video_mime_bytes,
     suffix_of,
 )
 from .openai_vision import (
@@ -57,5 +59,7 @@ __all__ = [
     "probe_duration",
     "read_as_data_uri",
     "resolve_ffmpeg_tools",
+    "sniff_video_mime",
+    "sniff_video_mime_bytes",
     "suffix_of",
 ]

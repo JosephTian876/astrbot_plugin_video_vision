@@ -13,6 +13,7 @@
    - `_dedup_ref_placeholders` 在注入末尾剥除同 URL 重复 `ref` 占位符里的原始带签名地址。
 4. **预占槽 `AsyncSingleFlight` 与总体超时保护**：新增 `AsyncSingleFlight` 并在 `build_video_blocks` 中通过 `PREPARE_FLIGHTS` 于 `SlotLimiter.slot()` 之前对同内容同参数视频合并并发，避免 follower 占满并发槽位与线程池；`SingleFlight.run` 与 `AsyncSingleFlight.run` 补充总体等待超时保护，杜绝无限挂起。
 5. **`.ts` 误识别剔除、重复探测消除与 `_DONE_ATTR` 后置**：从 `VIDEO_SUFFIXES` 与 `VIDEO_MIME_BY_SUFFIX` 移除 `.ts`（防止 TypeScript 源码被当成视频）；`compress_video(..., duration=...)` 复用已探测时长省去重复 `ffprobe`；`_DONE_ATTR` 移至 `_handle` 完成注入后写入，避免异常中断后误标完成。
+6. **容器魔数嗅探（修复 `.mkv`/`.webm` 伪装成 `.mp4` 误声明 MIME）**：`core/media.py` 新增 `sniff_video_mime_bytes` / `sniff_video_mime`，在 `guess_video_mime` 与 `read_as_data_uri` 编码前按容器魔数识别 Matroska EBML（`\x1a\x45\xdf\xa3` + `DocType` 区分 `video/x-matroska` 与 `video/webm`）、ISO BMFF `ftyp`（`video/mp4` / `video/quicktime` / `video/3gpp`，排除 HEIC/AVIF/M4A）、AVI、FLV、WMV、Ogg Theora 与 MPEG-PS；`VideoInjection.mime_type` 保留实际编码 MIME，确保直通发送、`/videotest` 报告与 `vision_cache_key`（含清理后的 `ref` 临时文件）均不因 `.mp4` 扩展名而误报 `video/mp4`。
 
 ## 0.4.0
 

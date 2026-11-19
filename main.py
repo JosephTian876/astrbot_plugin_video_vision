@@ -50,6 +50,7 @@ from .core.media import (
     file_size_mb,
     probe_duration,
     resolve_ffmpeg_tools,
+    sniff_video_mime,
     suffix_of,
 )
 from .core.openai_vision import analyze_video, build_vision_prompt
@@ -488,7 +489,7 @@ class VideoVisionPlugin(Star):
             size_mb=size_mb,
             duration_sec=duration,
             config=cfg,
-            mime_or_suffix=suffix_of(target),
+            mime_or_suffix=sniff_video_mime(target) or suffix_of(target),
             has_ffmpeg=bool(self.ffmpeg),
             has_ffprobe=bool(self.ffprobe),
         )

@@ -112,8 +112,105 @@ def suffix_of(path: str | os.PathLike[str] | None) -> str:
     return os.path.splitext(text)[1].lower()
 
 
+#: 魔数嗅探读取的最大文件头字节数（覆盖 ISO BMFF / EBML DocType / Ogg Theora 页头）。
+_SNIFF_HEADER_BYTES = 4096
+
+_EBML_MAGIC = b"\x1a\x45\xdf\xa3"
+_EBML_SEGMENT_ID = b"\x18\x53\x80\x67"
+_EBML_DOCTYPE_ID = b"\x42\x82"
+_ASF_HEADER_MAGIC = b"\x30\x26\xb2\x75\x8e\x66\xcf\x11\xa6\xd9\x00\xaa\x00\x62\xce\x6c"
+_NON_VIDEO_FTYP_BRANDS = frozenset(
+    {
+        b"heic", b"heix", b"hevc", b"hevx",
+        b"avif", b"avis", b"mif1", b"msf1",
+        b"m4a ", b"m4b ", b"m4p ",
+    }
+)
+
+
+def sniff_video_mime_bytes(
+    header: bytes | bytearray | memoryview, *, suffix: str = ""
+) -> str | None:
+    """从文件头魔数识别常见视频容器 MIME；无法确认时返回 ``None``。
+
+    重点解决 QQ/NapCat 将 Matroska EBML（``\\x1a\\x45\\xdf\\xa3``）或 WebM 字节流
+    以 ``media_video_*.mp4`` 落盘时，仅凭 ``.mp4`` 扩展名误声明为 ``video/mp4`` 的问题。
+    """
+    data = bytes(header[:_SNIFF_HEADER_BYTES])
+    if len(data) < 4:
+        return None
+
+    if data.startswith(_EBML_MAGIC):
+        ebml_head = data.split(_EBML_SEGMENT_ID, 1)[0]
+        doc_idx = ebml_head.find(_EBML_DOCTYPE_ID, 4)
+        if doc_idx != -1 and doc_idx + 3 <= len(ebml_head):
+            size_byte = ebml_head[doc_idx + 2]
+            if size_byte & 0x80:
+                doc_len = size_byte & 0x7F
+                doctype = (
+                    ebml_head[doc_idx + 3 : doc_idx + 3 + doc_len]
+                    .rstrip(b"\x00")
+                    .strip()
+                    .lower()
+                )
+                if doctype == b"webm":
+                    return "video/webm"
+                if doctype == b"matroska":
+                    return "video/x-matroska"
+        low_head = ebml_head.lower()
+        if b"webm" in low_head:
+            return "video/webm"
+        if b"matroska" in low_head:
+            return "video/x-matroska"
+        return "video/webm" if suffix.lower() == ".webm" else "video/x-matroska"
+
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        brand = data[8:12].lower()
+        if brand in _NON_VIDEO_FTYP_BRANDS:
+            return None
+        if brand == b"qt  ":
+            return "video/quicktime"
+        if brand[:3] in (b"3gp", b"3g2"):
+            return "video/3gpp"
+        return "video/mp4"
+
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"AVI ":
+        return "video/x-msvideo"
+
+    if data[:3] == b"FLV" and data[3] <= 5:
+        return "video/x-flv"
+
+    if data.startswith(_ASF_HEADER_MAGIC):
+        return "video/x-ms-wmv"
+
+    if data.startswith(b"OggS") and (
+        b"theora" in data.lower() or suffix.lower() == ".ogv"
+    ):
+        return "video/ogg"
+
+    if data[:4] in (b"\x00\x00\x01\xba", b"\x00\x00\x01\xb3"):
+        return "video/mpeg"
+
+    return None
+
+
+def sniff_video_mime(path: str | os.PathLike[str] | None) -> str | None:
+    """读取文件头魔数并推断视频 MIME；文件不存在、不可读或未命中已知容器返回 ``None``。"""
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as handle:
+            header = handle.read(_SNIFF_HEADER_BYTES)
+    except OSError:
+        return None
+    return sniff_video_mime_bytes(header, suffix=suffix_of(path))
+
+
 def guess_video_mime(path: str | os.PathLike[str]) -> str:
-    """按扩展名猜 MIME；未知则回落到 video/mp4。"""
+    """优先按容器魔数识别 MIME；读不到或未命中魔数时按扩展名回落到 video/mp4。"""
+    sniffed = sniff_video_mime(path)
+    if sniffed:
+        return sniffed
     return VIDEO_MIME_BY_SUFFIX.get(suffix_of(path), OUTPUT_MIME)
 
 
@@ -196,7 +293,7 @@ def read_as_data_uri(
 
     Args:
         path: 本地文件路径。
-        mime: 声明用的 MIME；留空则按扩展名猜。
+        mime: 声明用的 MIME；留空则按容器魔数与扩展名推断。
 
     Returns:
         ``data:<mime>;base64,<payload>`` 形式的字符串。
@@ -205,7 +302,6 @@ def read_as_data_uri(
         MediaToolError: 文件不可读、为 0 字节，或编码后超过
             :data:`MAX_DATA_URI_BYTES`（``kind="too_large"``）。
     """
-    resolved_mime = mime or guess_video_mime(path)
     try:
         size = os.path.getsize(path)
     except OSError as exc:
@@ -230,6 +326,11 @@ def read_as_data_uri(
             "（请调小 max_size_mb / compress_max_mb，或缩短视频）",
             kind="too_large",
         )
+    resolved_mime = (
+        mime
+        or sniff_video_mime_bytes(payload[:_SNIFF_HEADER_BYTES], suffix=suffix_of(path))
+        or VIDEO_MIME_BY_SUFFIX.get(suffix_of(path), OUTPUT_MIME)
+    )
     return f"data:{resolved_mime};base64,{encoded}"
 
 

@@ -1094,8 +1094,8 @@ def vision_cache_key(
     proto, url = openai_vision._resolve_endpoint(config.openai_base_url)
     return vision_cache.cache_key(
         video=content_key,
-        # 同一份字节换个后缀 = 换一个声明 MIME = 一次新的语义（§2.2）
-        mime=guess_video_mime(injection.used_path),
+        # 优先取注入块实际编码的声明 MIME（支持魔数嗅探与已清理的 ref 临时文件）
+        mime=getattr(injection, "mime_type", "") or guess_video_mime(injection.used_path),
         prompt=prompt,
         proto=proto,
         url=url,

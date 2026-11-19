@@ -48,6 +48,8 @@ from .media import (
     probe_duration,
     read_as_data_uri,
     resolve_ffmpeg_tools,
+    sniff_video_mime,
+    suffix_of,
 )
 from .placeholder import VideoPlaceholder
 
@@ -84,11 +86,21 @@ class VideoInjection:
     #: 可缓存的文本结果，也不该为此白读一遍文件）。算不出来（文件已被删等）时是
     #: 空串 —— 钩子看到空串就**跳过缓存**，绝不因此阻断主流程。
     content_key: str = ""
+    #: 实际编码进 data URI 的容器 MIME（优先容器魔数，回落扩展名）。
+    mime_type: str = ""
 
     @property
     def data_uri(self) -> str:
         """供上层构造媒体 Part 的 data URI。"""
         return self.block["audio_url"]["url"]
+
+
+def _data_uri_mime(uri: str) -> str:
+    """从 ``data:<mime>;base64,...`` 中提取声明的 MIME；非 data URI 返回空串。"""
+    if not isinstance(uri, str) or not uri.startswith("data:"):
+        return ""
+    head, sep, _ = uri[5:].partition(";")
+    return head.strip().lower() if sep else ""
 
 
 @dataclass(frozen=True)
@@ -271,7 +283,7 @@ def _prepare_video(
         size_mb=size_mb,
         duration_sec=duration,
         config=config,
-        mime_or_suffix=Path(source).suffix,
+        mime_or_suffix=sniff_video_mime(source) or suffix_of(source),
         has_ffmpeg=bool(ffmpeg),
         has_ffprobe=bool(ffprobe),
     )
@@ -321,6 +333,7 @@ def _prepare_video(
                     source_digest() if vision_key_enabled else "",
                     plan.outcome_action,
                 ),
+                mime_type=_data_uri_mime(block["audio_url"]["url"]),
             ),
         )
 
@@ -381,6 +394,7 @@ def _prepare_video(
                         # 与实时压缩同一条标识：产物字节不可复现，能复现的只有
                         # "源 + 参数"（也就是这个 cache_key 本身）
                         content_key=content_key_for(signature, plan.outcome_action),
+                        mime_type=_data_uri_mime(block["audio_url"]["url"]),
                     ),
                 )
         except Exception as exc:  # noqa: BLE001
@@ -541,6 +555,7 @@ def _prepare_video(
                 # 标识取"源 + 参数"（= cache_key），**不**取产物字节：后者每次
                 # 都不一样，取它就等于让视觉缓存永不命中（ARCH-VV-C2 P1-1）
                 content_key=content_key_for(signature, plan.outcome_action),
+                mime_type=_data_uri_mime(block["audio_url"]["url"]),
             ),
         )
     finally:

@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import socket
+import subprocess
 import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -35,6 +36,7 @@ from vv_plugin.core.config import (
 )
 from vv_plugin.core.injector import prepare_video
 from vv_plugin.core.limits import AsyncSingleFlight, SingleFlight, SlotLimiter
+from vv_plugin.core.vision_cache import VisionCache
 from vv_plugin.hooks import llm_request as hooks
 from vv_plugin.hooks.status import VideoVisionStatusAPI, mode_is_usable
 
@@ -825,3 +827,247 @@ class TestTsExclusionSingleProbeAndDoneAttr:
         asyncio.run(hooks._handle(plugin, _event(), req))
         assert getattr(req, hooks._DONE_ATTR, False) is True
         assert any("恢复后的视频理解" in getattr(p, "text", "") for p in req.extra_user_content_parts)
+
+
+# ======================== 7. 容器魔数嗅探（.mkv / .webm 伪装为 .mp4 等）
+
+
+class TestContainerMagicSniffing:
+    def test_sniff_video_mime_bytes_distinguishes_containers_and_ignores_non_video(
+        self,
+    ) -> None:
+        # 真实 QQ media_video_*.mp4 常见 Matroska EBML 头
+        ebml_mkv = (
+            b"\x1a\x45\xdf\xa3\xa3\x42\x86\x81\x01\x42\xf7\x81\x01"
+            b"\x42\xf2\x81\x04\x42\xf3\x81\x08\x42\x82\x88matroska"
+            b"\x42\x87\x81\x04\x42\x85\x81\x02\x18\x53\x80\x67"
+        )
+        ebml_webm = (
+            b"\x1a\x45\xdf\xa3\x9f\x42\x86\x81\x01\x42\xf7\x81\x01"
+            b"\x42\xf2\x81\x04\x42\xf3\x81\x08\x42\x82\x84webm"
+            b"\x42\x87\x81\x02\x42\x85\x81\x02\x18\x53\x80\x67"
+        )
+        assert media.sniff_video_mime_bytes(ebml_mkv) == "video/x-matroska"
+        assert media.sniff_video_mime_bytes(ebml_webm) == "video/webm"
+        assert media.sniff_video_mime_bytes(b"\x1a\x45\xdf\xa3\x00\x00") == "video/x-matroska"
+        assert media.sniff_video_mime_bytes(b"\x00\x00\x00\x18ftypmp42") == "video/mp4"
+        assert media.sniff_video_mime_bytes(b"\x00\x00\x00\x14ftypqt  ") == "video/quicktime"
+        assert media.sniff_video_mime_bytes(b"\x00\x00\x00\x14ftyp3gp5") == "video/3gpp"
+        assert media.sniff_video_mime_bytes(b"RIFF\x00\x00\x00\x00AVI ") == "video/x-msvideo"
+        assert media.sniff_video_mime_bytes(b"FLV\x01\x05\x00\x00\x00\x09") == "video/x-flv"
+        assert media.sniff_video_mime_bytes(b"OggS\x00\x02\x00theora") == "video/ogg"
+        assert media.sniff_video_mime_bytes(b"\x00\x00\x01\xba\x44\x00") == "video/mpeg"
+
+        # 非视频 ISO BMFF（HEIC/AVIF/M4A）与音频 Ogg Opus 不应被误认成视频容器
+        assert media.sniff_video_mime_bytes(b"\x00\x00\x00\x18ftypheic") is None
+        assert media.sniff_video_mime_bytes(b"\x00\x00\x00\x18ftypavif") is None
+        assert media.sniff_video_mime_bytes(b"\x00\x00\x00\x18ftypM4A ") is None
+        assert media.sniff_video_mime_bytes(b"OggS\x00\x02\x00OpusHead") is None
+        assert media.sniff_video_mime_bytes(b"GIF89a\x01\x00\x01\x00") is None
+
+    def test_matroska_and_webm_saved_as_mp4_are_sniffed_before_as_is_or_transcode(
+        self,
+        media_tools: tuple[str, str],
+        tiny_video: str,
+        tmp_path: Path,
+    ) -> None:
+        ffmpeg, ffprobe = media_tools
+        mkv_as_mp4 = tmp_path / "media_video_ebml.mp4"
+        webm_as_mp4 = tmp_path / "media_video_webm.mp4"
+        mov_as_mp4 = tmp_path / "media_video_mov.mp4"
+
+        # 用真实 ffmpeg 构造 Matroska / WebM / QuickTime 容器，但按 QQ 落盘习惯命名为 .mp4
+        subprocess.run(
+            [
+                ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                "-i", tiny_video, "-c", "copy", "-f", "matroska", str(mkv_as_mp4),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=60,
+        )
+        subprocess.run(
+            [
+                ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "testsrc2=s=96x72:d=1:r=10",
+                "-c:v", "libvpx", "-f", "webm", str(webm_as_mp4),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=60,
+        )
+        subprocess.run(
+            [
+                ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                "-i", tiny_video, "-c", "copy", "-f", "mov", str(mov_as_mp4),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=60,
+        )
+
+        assert mkv_as_mp4.read_bytes().startswith(b"\x1a\x45\xdf\xa3")
+        assert webm_as_mp4.read_bytes().startswith(b"\x1a\x45\xdf\xa3")
+        assert mov_as_mp4.read_bytes()[4:12] == b"ftypqt  "
+
+        assert media.guess_video_mime(mkv_as_mp4) == "video/x-matroska"
+        assert media.guess_video_mime(webm_as_mp4) == "video/webm"
+        assert media.guess_video_mime(mov_as_mp4) == "video/quicktime"
+        assert media.guess_video_mime(tiny_video) == "video/mp4"
+
+        assert media.read_as_data_uri(mkv_as_mp4).startswith(
+            "data:video/x-matroska;base64,"
+        )
+        assert media.read_as_data_uri(webm_as_mp4).startswith(
+            "data:video/webm;base64,"
+        )
+        assert media.read_as_data_uri(mov_as_mp4).startswith(
+            "data:video/quicktime;base64,"
+        )
+
+        # 直通（as-is）路径：绝不能谎报成 data:video/mp4
+        cfg_asis = _cfg(
+            ffmpeg_path=str(Path(ffmpeg).parent),
+            max_size_mb=13.0,
+            cache_enabled=False,
+        )
+        as_is_outcome = prepare_video(
+            placeholder.VideoPlaceholder(name=mkv_as_mp4.name, path=str(mkv_as_mp4)),
+            config=cfg_asis,
+            cache_root=None,
+        )
+        assert as_is_outcome.ok is True, as_is_outcome.reason
+        assert as_is_outcome.injection is not None
+        assert as_is_outcome.injection.action == "as-is"
+        assert as_is_outcome.injection.mime_type == "video/x-matroska"
+        assert as_is_outcome.injection.data_uri.startswith(
+            "data:video/x-matroska;base64,"
+        )
+        assert diagnostics.mime_line(
+            str(mkv_as_mp4), "as-is", mime=as_is_outcome.injection.mime_type
+        ) == "MIME   : video/x-matroska"
+
+        # 触发压缩路径：ffmpeg 转码后产物是真 MP4（video/mp4）
+        cfg_compress = _cfg(
+            ffmpeg_path=str(Path(ffmpeg).parent),
+            max_size_mb=0.001,
+            compress_max_mb=0.0005,
+            cache_enabled=False,
+        )
+        comp_outcome = prepare_video(
+            placeholder.VideoPlaceholder(name=mkv_as_mp4.name, path=str(mkv_as_mp4)),
+            config=cfg_compress,
+            cache_root=None,
+        )
+        assert comp_outcome.ok is True, comp_outcome.reason
+        assert comp_outcome.injection is not None
+        assert comp_outcome.injection.action == "compressed"
+        assert comp_outcome.injection.mime_type == "video/mp4"
+        assert comp_outcome.injection.data_uri.startswith("data:video/mp4;base64,")
+        assert media.probe_duration(mkv_as_mp4, ffprobe) > 0.0
+
+    def test_hook_uses_sniffed_matroska_mime_and_cache_key_even_for_cleaned_ref(
+        self,
+        media_tools: tuple[str, str],
+        tiny_video: str,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        ffmpeg, _ = media_tools
+        mkv_src = tmp_path / "source.mkv"
+        subprocess.run(
+            [
+                ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
+                "-i", tiny_video, "-c", "copy", "-f", "matroska", str(mkv_src),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=60,
+        )
+        mkv_bytes = mkv_src.read_bytes()
+        mp4_bytes = Path(tiny_video).read_bytes()
+
+        seen_uris: list[str] = []
+
+        async def fake_analyze_videos(
+            videos: list[tuple[str, str]],
+            question: str,
+            *,
+            config: VideoConfig,
+            logger: Any = None,
+        ) -> list[openai_vision.VisionResult]:
+            del question, config, logger
+            seen_uris.extend(uri for _, uri in videos)
+            return [
+                openai_vision.VisionResult(
+                    ok=True, name=name, analysis=f"ok-{len(seen_uris)}"
+                )
+                for name, _ in videos
+            ]
+
+        payloads = {
+            "https://cdn.example/clip1.mp4": mkv_bytes,
+            "https://cdn.example/clip2.mp4": mp4_bytes,
+        }
+
+        def fake_download(ref: str, directory: str, **_kwargs: Any) -> str:
+            target = Path(directory) / "ref-downloaded.mp4"
+            target.write_bytes(payloads[ref])
+            return str(target)
+
+        monkeypatch.setattr(hooks, "analyze_videos", fake_analyze_videos)
+        monkeypatch.setattr(hooks, "download_ref_to", fake_download)
+
+        cache = VisionCache(ttl_sec=600.0, max_entries=8)
+        cfg = _cfg(
+            provider_mode="openai_compat",
+            ffmpeg_path=str(Path(ffmpeg).parent),
+            vision_cache_enabled=True,
+        )
+        plugin = SimpleNamespace(
+            config=cfg,
+            cache_root=str(tmp_path / "cache"),
+            limiter=None,
+            vision_cache=cache,
+            context=None,
+        )
+
+        # 第一次：ref 下载落盘为 .mp4，但实际字节是 Matroska EBML（且 ref_dir 在调用视觉前即被清理）
+        req1 = _req(
+            [
+                _part(
+                    "[Video Attachment in quoted message: name media_video_1.mp4, "
+                    "ref https://cdn.example/clip1.mp4]"
+                )
+            ]
+        )
+        asyncio.run(hooks._handle(plugin, _event(message_str="看看"), req1))
+        assert len(seen_uris) == 1
+        assert seen_uris[0].startswith("data:video/x-matroska;base64,")
+        assert cache.stats.stores == 1
+
+        # 同一份 MKV 再次投递命中缓存
+        req1_dup = _req(
+            [
+                _part(
+                    "[Video Attachment in quoted message: name media_video_1.mp4, "
+                    "ref https://cdn.example/clip1.mp4]"
+                )
+            ]
+        )
+        asyncio.run(hooks._handle(plugin, _event(message_str="看看"), req1_dup))
+        assert len(seen_uris) == 1
+        assert cache.stats.hits == 1
+
+        # 第二份是真正的 ISO BMFF MP4：绝不能命中上面 MKV 的缓存，且声明 video/mp4
+        req2 = _req(
+            [
+                _part(
+                    "[Video Attachment in quoted message: name media_video_2.mp4, "
+                    "ref https://cdn.example/clip2.mp4]"
+                )
+            ]
+        )
+        asyncio.run(hooks._handle(plugin, _event(message_str="看看"), req2))
+        assert len(seen_uris) == 2
+        assert seen_uris[1].startswith("data:video/mp4;base64,")
